@@ -2,8 +2,8 @@ meta:
   environment: python
   toolchain:
     name: pip
-    version: 3.11
-build:
-  requirementsPath: requirements.txt
+    version: "3.11"
+
 run:
-  command: python main.py
+  script: python main.py
+  persistenceMount: /data
