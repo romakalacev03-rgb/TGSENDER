@@ -885,12 +885,11 @@ async def main():
     # 2) Состояние
     STATE = load_state()
 
-    # 3) Юзербот (файловая сессия)
+       # 3) Юзербот (файловая сессия)
     user_client = Client(
         name=SESSION_USER,
         api_id=CFG["api_id"],
         api_hash=CFG["api_hash"],
-        workdir=None,
     )
 
     # 4) Управляющий бот
@@ -899,7 +898,6 @@ async def main():
         api_id=CFG["api_id"],
         api_hash=CFG["api_hash"],
         bot_token=CFG["bot_token"],
-        workdir=None,
     )
     register_handlers(bot_client)
 
