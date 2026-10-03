@@ -1,14 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Автопостер по группам Telegram с управляющим ботом.
-Работает на хостингах без интерактивной консоли (Amvera и др.).
-
-- Конфиг берётся из переменных окружения, с fallback на config.json.
-- Авторизация юзербота — через управляющего бота в Telegram (/login).
-- Сессия юзербота хранится как файл (userbot.session) в /data.
-
-Установка:
-    pip install -U pyrogram tgcrypto
+Работает на Amvera. Сессия юзербота — файл /data/userbot.session.
 """
 
 import asyncio
@@ -22,17 +15,9 @@ from datetime import datetime, timedelta
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import (
-    FloodWait,
-    ChatWriteForbidden,
-    ChatAdminRequired,
-    UserBannedInChannel,
-    PeerIdInvalid,
-    UserIsBlocked,
-    ChannelPrivate,
-    SessionPasswordNeeded,
-    PhoneCodeInvalid,
-    PhoneCodeExpired,
-    PasswordHashInvalid,
+    FloodWait, ChatWriteForbidden, ChatAdminRequired, UserBannedInChannel,
+    PeerIdInvalid, UserIsBlocked, ChannelPrivate,
+    SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, PasswordHashInvalid,
 )
 
 # ---------------------------------------------------------------------------
@@ -80,9 +65,8 @@ USERBOT_READY: bool = False
 authed: set = set()
 pending: dict = {}
 
-
 # ---------------------------------------------------------------------------
-# JSON-хелперы
+# JSON
 # ---------------------------------------------------------------------------
 
 def load_json(path: str, default):
@@ -101,7 +85,6 @@ def save_json(path: str, data) -> None:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log.error(f"Ошибка записи {path}: {e}")
-
 
 # ---------------------------------------------------------------------------
 # Конфиг
@@ -125,7 +108,7 @@ def load_cfg() -> dict:
         try:
             cfg[key] = typ(v)
         except Exception:
-            log.warning(f"Некорректное значение переменной {env}={v!r}")
+            log.warning(f"Некорректное значение {env}={v!r}")
     return cfg
 
 
@@ -144,10 +127,7 @@ def default_state() -> dict:
         "delay_max": 15,
         "groups": [],
         "running": False,
-        "stats": {
-            "sent": 0, "errors": 0, "rounds": 0,
-            "last_round": None, "next_round": None,
-        },
+        "stats": {"sent": 0, "errors": 0, "rounds": 0, "last_round": None, "next_round": None},
     }
 
 
@@ -158,7 +138,6 @@ def load_state() -> dict:
     if not isinstance(st.get("stats"), dict):
         st["stats"] = default_state()["stats"]
     return st
-
 
 # ---------------------------------------------------------------------------
 # Парсинг ссылок
@@ -182,19 +161,17 @@ def parse_chat_ref(text: str):
     except ValueError:
         return "@" + s
 
-
 # ---------------------------------------------------------------------------
-# Отправка сообщения
+# Отправка
 # ---------------------------------------------------------------------------
 
 async def send_post(chat_id: int) -> None:
     if not USERBOT_READY:
-        raise RuntimeError("Юзербот не авторизован. Сделайте /login.")
+        raise RuntimeError("Юзербот не авторизован.")
     text = STATE.get("text")
     media_path = STATE.get("media_path")
     media_type = STATE.get("media_type")
     caption = STATE.get("caption") or ""
-
     if media_path and media_type == "photo" and os.path.exists(media_path):
         await user_client.send_photo(chat_id=chat_id, photo=media_path, caption=caption)
     elif media_path and media_type == "video" and os.path.exists(media_path):
@@ -202,11 +179,10 @@ async def send_post(chat_id: int) -> None:
     elif text:
         await user_client.send_message(chat_id=chat_id, text=text)
     else:
-        raise ValueError("Не задан текст или медиа для рассылки")
-
+        raise ValueError("Не задан текст или медиа")
 
 # ---------------------------------------------------------------------------
-# Автоскан
+# Скан
 # ---------------------------------------------------------------------------
 
 async def scan_groups() -> list:
@@ -227,12 +203,11 @@ async def scan_groups() -> list:
                 "manual": False,
             })
     except FloodWait as e:
-        log.warning(f"FloodWait при сканировании: {e.value}s")
+        log.warning(f"FloodWait: {e.value}s")
         await asyncio.sleep(e.value + 2)
     except Exception as e:
-        log.exception(f"Ошибка при сканировании: {e}")
+        log.exception(f"Ошибка скана: {e}")
     return found
-
 
 # ---------------------------------------------------------------------------
 # Цикл рассылки
@@ -243,10 +218,8 @@ async def mailing_loop():
     while STATE.get("running"):
         groups = list(STATE.get("groups") or [])
         if not groups:
-            log.warning("Нет групп — ждём 60 сек.")
             await asyncio.sleep(60)
             continue
-
         sent = errors = 0
         for g in groups:
             if not STATE.get("running"):
@@ -259,12 +232,10 @@ async def mailing_loop():
                 STATE["stats"]["sent"] += 1
                 log.info(f"[OK] {title} ({gid})")
             except FloodWait as fw:
-                log.warning(f"[FLOOD] {fw.value}s на {title}")
+                log.warning(f"[FLOOD] {fw.value}s {title}")
                 try:
-                    await bot_client.send_message(
-                        CFG["admin_id"],
-                        f"⚠️ FloodWait {fw.value} сек (группа: {title})."
-                    )
+                    await bot_client.send_message(CFG["admin_id"],
+                        f"⚠️ FloodWait {fw.value} сек ({title})")
                 except Exception:
                     pass
                 await asyncio.sleep(fw.value + 2)
@@ -272,21 +243,17 @@ async def mailing_loop():
                     await send_post(gid)
                     sent += 1
                     STATE["stats"]["sent"] += 1
-                    log.info(f"[OK/retry] {title}")
-                except Exception as e:
+                except Exception:
                     errors += 1
                     STATE["stats"]["errors"] += 1
-                    log.warning(f"[ERR/retry] {title}: {e}")
             except (ChatWriteForbidden, ChatAdminRequired, UserBannedInChannel,
-                    PeerIdInvalid, UserIsBlocked, ChannelPrivate) as e:
+                    PeerIdInvalid, UserIsBlocked, ChannelPrivate):
                 errors += 1
                 STATE["stats"]["errors"] += 1
-                log.warning(f"[SKIP] {title}: {type(e).__name__} — {e}")
             except Exception as e:
                 errors += 1
                 STATE["stats"]["errors"] += 1
                 log.exception(f"[ERR] {title}: {e}")
-
             try:
                 lo = int(STATE.get("delay_min", 5))
                 hi = int(STATE.get("delay_max", 15))
@@ -299,32 +266,24 @@ async def mailing_loop():
         STATE["stats"]["rounds"] += 1
         STATE["stats"]["last_round"] = datetime.now().isoformat(timespec="seconds")
         save_json(STATE_FILE, STATE)
-
         if not STATE.get("running"):
             break
-
         interval = int(STATE.get("interval", 1800))
         STATE["stats"]["next_round"] = (
             datetime.now() + timedelta(seconds=interval)
         ).isoformat(timespec="seconds")
         save_json(STATE_FILE, STATE)
-
         try:
-            await bot_client.send_message(
-                CFG["admin_id"],
-                f"✅ Круг №{STATE['stats']['rounds']} завершён.\n"
+            await bot_client.send_message(CFG["admin_id"],
+                f"✅ Круг №{STATE['stats']['rounds']}.\n"
                 f"• Отправлено: {sent}\n• Ошибок: {errors}\n"
-                f"• Следующий круг через {interval // 60} мин."
-            )
+                f"• Следующий через {interval // 60} мин.")
         except Exception:
             pass
-
         remaining = interval
         while remaining > 0 and STATE.get("running"):
-            chunk = min(5, remaining)
-            await asyncio.sleep(chunk)
-            remaining -= chunk
-
+            await asyncio.sleep(min(5, remaining))
+            remaining -= 5
     log.info("Рассылка остановлена.")
 
 
@@ -333,7 +292,6 @@ def start_mailing() -> None:
     if mailing_task and not mailing_task.done():
         return
     mailing_task = asyncio.create_task(mailing_loop())
-
 
 # ---------------------------------------------------------------------------
 # Клавиатуры
@@ -346,17 +304,14 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     else:
         rows.append([InlineKeyboardButton(
             "🚀 Запустить рассылку" if not STATE.get("running") else "🚀 Рассылка идёт…",
-            callback_data="start",
-        )])
+            callback_data="start")])
         rows.append([InlineKeyboardButton("⏸ Остановить рассылку", callback_data="stop")])
     rows += [
         [InlineKeyboardButton("📝 Изменить сообщение", callback_data="edit_msg")],
         [InlineKeyboardButton("⏱ Настройка таймингов", callback_data="timings")],
         [InlineKeyboardButton("🔍 Обновить список групп", callback_data="scan")],
-        [
-            InlineKeyboardButton("➕ Добавить группу", callback_data="add_grp"),
-            InlineKeyboardButton("➖ Удалить группу", callback_data="del_grp"),
-        ],
+        [InlineKeyboardButton("➕ Добавить группу", callback_data="add_grp"),
+         InlineKeyboardButton("➖ Удалить группу", callback_data="del_grp")],
         [InlineKeyboardButton("📊 Статус и статистика", callback_data="status")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -365,14 +320,13 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 def groups_kb() -> InlineKeyboardMarkup:
     rows = []
     for g in (STATE.get("groups") or [])[:30]:
-        title = (g.get("title") or str(g.get("id")))[:40]
-        rows.append([InlineKeyboardButton(f"❌ {title}", callback_data=f"delgrp:{g['id']}")])
+        t = (g.get("title") or str(g.get("id")))[:40]
+        rows.append([InlineKeyboardButton(f"❌ {t}", callback_data=f"delgrp:{g['id']}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu")])
     return InlineKeyboardMarkup(rows)
 
-
 # ---------------------------------------------------------------------------
-# Хелпер: успешный логин юзербота
+# После логина
 # ---------------------------------------------------------------------------
 
 async def after_userbot_login(message=None):
@@ -383,14 +337,12 @@ async def after_userbot_login(message=None):
         log.info(f"Юзербот авторизован: {me.first_name} (@{me.username}) id={me.id}")
         if message is not None:
             await message.reply(
-                f"✅ Юзербот авторизован: {me.first_name} (@{me.username or '—'}).",
-                reply_markup=main_menu_kb(),
-            )
+                f"✅ Юзербот: {me.first_name} (@{me.username or '—'}).",
+                reply_markup=main_menu_kb())
     except Exception as e:
-        log.warning(f"Не удалось получить данные юзербота: {e}")
+        log.warning(f"Ошибка после логина: {e}")
         if message is not None:
             await message.reply("✅ Юзербот авторизован.", reply_markup=main_menu_kb())
-
 
 # ---------------------------------------------------------------------------
 # Обработчики бота
@@ -404,14 +356,11 @@ def register_handlers(bot: Client) -> None:
             await message.reply("⛔ Доступ запрещён.")
             return
         if message.from_user.id not in authed:
-            await message.reply(
-                "🔒 Требуется авторизация.\nВведите: `/auth <PIN>`",
-                parse_mode=enums.ParseMode.MARKDOWN,
-            )
+            await message.reply("🔒 `/auth <PIN>`", parse_mode=enums.ParseMode.MARKDOWN)
             return
         txt = "🎛 Панель управления:"
         if not USERBOT_READY:
-            txt += "\n\n⚠️ Юзербот ещё не авторизован. Нажмите «Авторизовать юзербота»."
+            txt += "\n\n⚠️ Юзербот не авторизован."
         await message.reply(txt, reply_markup=main_menu_kb())
 
     @bot.on_message(filters.command("auth") & filters.private)
@@ -455,9 +404,7 @@ def register_handlers(bot: Client) -> None:
         pending[message.from_user.id] = {"action": "login_phone"}
         await message.reply(
             "📱 Введите номер телефона юзербота в формате `+79991234567`.\n"
-            "Отмена — /cancel",
-            parse_mode=enums.ParseMode.MARKDOWN,
-        )
+            "Отмена — /cancel", parse_mode=enums.ParseMode.MARKDOWN)
 
     @bot.on_callback_query()
     async def on_cb(client, cb):
@@ -466,33 +413,29 @@ def register_handlers(bot: Client) -> None:
             await cb.answer("⛔ Нет доступа.", show_alert=True)
             return
         if uid not in authed:
-            await cb.answer("🔒 Сначала /auth <PIN>", show_alert=True)
+            await cb.answer("🔒 /auth <PIN>", show_alert=True)
             return
-
         data = cb.data or ""
         try:
             if data == "menu":
                 await cb.message.edit_text("🎛 Панель управления:", reply_markup=main_menu_kb())
-
             elif data == "login":
                 if USERBOT_READY:
                     await cb.answer("Уже авторизован.")
                     return
                 pending[uid] = {"action": "login_phone"}
                 await cb.message.edit_text(
-                    "📱 Введите номер телефона юзербота в формате `+79991234567`.\n/cancel — отмена",
-                    parse_mode=enums.ParseMode.MARKDOWN,
-                )
-
+                    "📱 Введите номер телефона в формате `+79991234567`.\n/cancel — отмена",
+                    parse_mode=enums.ParseMode.MARKDOWN)
             elif data == "start":
                 if not USERBOT_READY:
-                    await cb.answer("Сначала авторизуйте юзербота (/login).", show_alert=True)
+                    await cb.answer("Сначала /login.", show_alert=True)
                     return
                 if STATE.get("running"):
                     await cb.answer("Уже запущено.")
                     return
                 if not STATE.get("groups"):
-                    await cb.answer("Список групп пуст.", show_alert=True)
+                    await cb.answer("Нет групп.", show_alert=True)
                     return
                 if not (STATE.get("text") or STATE.get("media_path")):
                     await cb.answer("Не задано сообщение!", show_alert=True)
@@ -500,13 +443,11 @@ def register_handlers(bot: Client) -> None:
                 STATE["running"] = True
                 save_json(STATE_FILE, STATE)
                 start_mailing()
-                await cb.message.edit_text("🚀 Рассылка запущена.", reply_markup=main_menu_kb())
-
+                await cb.message.edit_text("🚀 Запущено.", reply_markup=main_menu_kb())
             elif data == "stop":
                 STATE["running"] = False
                 save_json(STATE_FILE, STATE)
-                await cb.message.edit_text("⏸ Рассылка остановлена.", reply_markup=main_menu_kb())
-
+                await cb.message.edit_text("⏸ Остановлено.", reply_markup=main_menu_kb())
             elif data == "edit_msg":
                 cur = "— (пусто)"
                 if STATE.get("media_path"):
@@ -515,116 +456,98 @@ def register_handlers(bot: Client) -> None:
                     cur = f"Текст: {STATE['text'][:200]}"
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("📝 Задать текст", callback_data="set_text")],
-                    [InlineKeyboardButton("🖼 Задать медиа (фото/видео)", callback_data="set_media")],
-                    [InlineKeyboardButton("🗑 Очистить сообщение", callback_data="clear_msg")],
+                    [InlineKeyboardButton("🖼 Задать медиа", callback_data="set_media")],
+                    [InlineKeyboardButton("🗑 Очистить", callback_data="clear_msg")],
                     [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
                 ])
-                await cb.message.edit_text(f"📝 Текущее сообщение:\n{cur}", reply_markup=kb)
-
+                await cb.message.edit_text(f"📝 Текущее:\n{cur}", reply_markup=kb)
             elif data == "set_text":
                 pending[uid] = {"action": "set_text"}
-                await cb.message.edit_text("Отправьте текст рекламного сообщения.\n/cancel для отмены")
-
+                await cb.message.edit_text("Отправьте текст.\n/cancel")
             elif data == "set_media":
                 pending[uid] = {"action": "set_media"}
-                await cb.message.edit_text("Отправьте фото или видео (можно с подписью).\n/cancel")
-
+                await cb.message.edit_text("Отправьте фото или видео.\n/cancel")
             elif data == "clear_msg":
                 STATE["text"] = None
                 STATE["media_path"] = None
                 STATE["media_type"] = None
                 STATE["caption"] = ""
                 save_json(STATE_FILE, STATE)
-                await cb.message.edit_text("🗑 Сообщение очищено.", reply_markup=main_menu_kb())
-
+                await cb.message.edit_text("🗑 Очищено.", reply_markup=main_menu_kb())
             elif data == "timings":
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("⏱ Интервал круга (сек)", callback_data="set_interval")],
-                    [InlineKeyboardButton("⏳ Мин. задержка (сек)", callback_data="set_delay_min")],
-                    [InlineKeyboardButton("⏳ Макс. задержка (сек)", callback_data="set_delay_max")],
+                    [InlineKeyboardButton("⏳ Мин. задержка", callback_data="set_delay_min")],
+                    [InlineKeyboardButton("⏳ Макс. задержка", callback_data="set_delay_max")],
                     [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
                 ])
                 await cb.message.edit_text(
-                    f"⏱ Текущие настройки:\n"
-                    f"• Интервал круга: {STATE['interval']} сек (~{STATE['interval'] // 60} мин)\n"
-                    f"• Задержка между группами: {STATE['delay_min']}–{STATE['delay_max']} сек",
-                    reply_markup=kb,
-                )
-
+                    f"⏱ Настройки:\n"
+                    f"• Интервал: {STATE['interval']} сек (~{STATE['interval'] // 60} мин)\n"
+                    f"• Задержка: {STATE['delay_min']}–{STATE['delay_max']} сек",
+                    reply_markup=kb)
             elif data == "set_interval":
                 pending[uid] = {"action": "set_interval"}
-                await cb.message.edit_text("Введите интервал между кругами в секундах (мин. 60).\n/cancel")
+                await cb.message.edit_text("Интервал в секундах (мин. 60).\n/cancel")
             elif data == "set_delay_min":
                 pending[uid] = {"action": "set_delay_min"}
-                await cb.message.edit_text("Минимальная задержка между группами в секундах (>= 1).\n/cancel")
+                await cb.message.edit_text("Мин. задержка (>=1).\n/cancel")
             elif data == "set_delay_max":
                 pending[uid] = {"action": "set_delay_max"}
-                await cb.message.edit_text("Максимальная задержка между группами в секундах.\n/cancel")
-
+                await cb.message.edit_text("Макс. задержка.\n/cancel")
             elif data == "scan":
                 if not USERBOT_READY:
-                    await cb.answer("Юзербот не авторизован.", show_alert=True)
+                    await cb.answer("Юзербот не готов.", show_alert=True)
                     return
                 await cb.answer("Сканирую…")
-                await cb.message.edit_text("🔍 Сканирую диалоги юзербота…")
+                await cb.message.edit_text("🔍 Сканирую…")
                 found = await scan_groups()
-                scanned_ids = {g["id"] for g in found}
-                manual_keep = [
-                    g for g in (STATE.get("groups") or [])
-                    if g.get("manual") and g["id"] not in scanned_ids
-                ]
-                STATE["groups"] = found + manual_keep
+                scanned = {g["id"] for g in found}
+                manual = [g for g in (STATE.get("groups") or [])
+                          if g.get("manual") and g["id"] not in scanned]
+                STATE["groups"] = found + manual
                 save_json(STATE_FILE, STATE)
                 await cb.message.edit_text(
-                    f"✅ Найдено групп: {len(found)}\n"
-                    f"• Всего в списке (с ручными): {len(STATE['groups'])}",
-                    reply_markup=main_menu_kb(),
-                )
-
+                    f"✅ Найдено: {len(found)}\n• Всего: {len(STATE['groups'])}",
+                    reply_markup=main_menu_kb())
             elif data == "add_grp":
                 if not USERBOT_READY:
-                    await cb.answer("Сначала авторизуйте юзербота.", show_alert=True)
+                    await cb.answer("Юзербот не готов.", show_alert=True)
                     return
                 pending[uid] = {"action": "add_group"}
                 await cb.message.edit_text(
-                    "Отправьте `@username`, ссылку `t.me/...` или числовой ID.\n/cancel",
-                    parse_mode=enums.ParseMode.MARKDOWN,
-                )
-
+                    "Отправьте `@username`, `t.me/...` или ID.\n/cancel",
+                    parse_mode=enums.ParseMode.MARKDOWN)
             elif data == "del_grp":
                 if not STATE.get("groups"):
-                    await cb.answer("Список пуст.", show_alert=True)
+                    await cb.answer("Пусто.", show_alert=True)
                     return
-                await cb.message.edit_text("Выберите группу для удаления:", reply_markup=groups_kb())
-
+                await cb.message.edit_text("Удалить группу:", reply_markup=groups_kb())
             elif data.startswith("delgrp:"):
                 try:
                     gid = int(data.split(":", 1)[1])
                 except ValueError:
-                    await cb.answer("Ошибка параметра.")
+                    await cb.answer("Ошибка.")
                     return
                 STATE["groups"] = [g for g in STATE["groups"] if g["id"] != gid]
                 save_json(STATE_FILE, STATE)
                 if STATE["groups"]:
-                    await cb.message.edit_text(
-                        f"➖ Удалено. Осталось: {len(STATE['groups'])}.",
-                        reply_markup=groups_kb(),
-                    )
+                    await cb.message.edit_text(f"➖ Осталось {len(STATE['groups'])}.",
+                        reply_markup=groups_kb())
                 else:
-                    await cb.message.edit_text("➖ Список групп пуст.", reply_markup=main_menu_kb())
-
+                    await cb.message.edit_text("➖ Пусто.", reply_markup=main_menu_kb())
             elif data == "status":
                 s = STATE["stats"]
                 txt = (
                     f"📊 Статистика\n"
-                    f"• Юзербот: {'🟢 готов' if USERBOT_READY else '🔴 не авторизован'}\n"
-                    f"• Рассылка: {'🟢 работает' if STATE.get('running') else '🔴 остановлена'}\n"
-                    f"• Групп в списке: {len(STATE.get('groups') or [])}\n"
+                    f"• Юзербот: {'🟢' if USERBOT_READY else '🔴'}\n"
+                    f"• Рассылка: {'🟢' if STATE.get('running') else '🔴'}\n"
+                    f"• Групп: {len(STATE.get('groups') or [])}\n"
                     f"• Отправлено: {s.get('sent', 0)}\n"
                     f"• Ошибок: {s.get('errors', 0)}\n"
-                    f"• Кругов завершено: {s.get('rounds', 0)}\n"
-                    f"• Последний круг: {s.get('last_round') or '—'}\n"
-                    f"• Следующий круг: {s.get('next_round') or '—'}\n"
+                    f"• Кругов: {s.get('rounds', 0)}\n"
+                    f"• Последний: {s.get('last_round') or '—'}\n"
+                    f"• Следующий: {s.get('next_round') or '—'}\n"
                     f"• Интервал: {STATE['interval']} сек\n"
                     f"• Задержка: {STATE['delay_min']}–{STATE['delay_max']} сек"
                 )
@@ -633,12 +556,10 @@ def register_handlers(bot: Client) -> None:
                     [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
                 ])
                 await cb.message.edit_text(txt, reply_markup=kb)
-
             else:
                 await cb.answer("Неизвестная команда.")
-
         except Exception as e:
-            log.exception("Ошибка в callback")
+            log.exception("Ошибка callback")
             try:
                 await cb.answer(f"Ошибка: {e}", show_alert=True)
             except Exception:
@@ -652,87 +573,50 @@ def register_handlers(bot: Client) -> None:
         act = pending.pop(uid, None)
         if not act:
             return
-
         action = act.get("action")
         text = (message.text or "").strip()
-
         try:
-            # ------------------- Логин юзербота -------------------
             if action == "login_phone":
                 phone = text
                 if not phone.startswith("+"):
-                    await message.reply("Номер должен начинаться с `+`. Повторите или /cancel",
-                                        parse_mode=enums.ParseMode.MARKDOWN)
+                    await message.reply("Номер должен начинаться с `+`.")
                     pending[uid] = {"action": "login_phone"}
                     return
-                # Подключаем клиент, если не подключён
                 if not user_client.is_connected:
                     try:
                         await user_client.connect()
                     except Exception as e:
-                        await message.reply(f"❌ Не удалось подключиться: {e}")
+                        await message.reply(f"❌ Не подключиться: {e}")
                         return
-                # Отправляем код
                 try:
                     sent = await user_client.send_code(phone)
                 except Exception as e:
-                    await message.reply(f"❌ Не удалось отправить код: {e}")
+                    await message.reply(f"❌ send_code: {e}")
                     return
-                pending[uid] = {
-                    "action": "login_code",
-                    "phone": phone,
-                    "hash": sent.phone_code_hash,
-                }
+                pending[uid] = {"action": "login_code", "phone": phone, "hash": sent.phone_code_hash}
                 await message.reply("📩 Введите код из Telegram (только цифры):")
-
             elif action == "login_code":
                 phone = act["phone"]
                 hash_ = act["hash"]
                 code = text.replace(" ", "")
-
-                # Проверяем, что клиент всё ещё подключён
-                if not user_client.is_connected:
-                    try:
-                        await user_client.connect()
-                    except Exception as e:
-                        await message.reply(f"❌ Сессия прервалась. Начните заново: /login")
-                        return
-
                 try:
-                    await user_client.sign_in(
-                        phone_number=phone,
-                        phone_code_hash=hash_,
-                        phone_code=code,
-                    )
+                    await user_client.sign_in(phone_number=phone, phone_code_hash=hash_, phone_code=code)
                 except SessionPasswordNeeded:
                     pending[uid] = {"action": "login_password"}
-                    await message.reply("🔐 Включена 2FA. Введите пароль:")
+                    await message.reply("🔐 Введите пароль 2FA:")
                     return
                 except PhoneCodeInvalid:
                     pending[uid] = act
                     await message.reply("❌ Неверный код. Повторите или /cancel")
                     return
                 except PhoneCodeExpired:
-                    # НЕ запрашиваем новый код автоматически!
-                    # Просим пользователя подождать и начать заново
-                    await message.reply(
-                        "⚠️ Код истёк. Telegram аннулировал попытку входа.\n"
-                        "Подождите 1-2 минуты и отправьте /login заново.\n"
-                        "Важно: вводите код сразу после получения."
-                    )
+                    await message.reply("⚠️ Код истёк. Подожди 2 мин и /login заново.")
                     return
                 except Exception as e:
-                    await message.reply(f"❌ Ошибка: {e}")
+                    await message.reply(f"❌ {e}")
                     return
                 await after_userbot_login(message)
-
             elif action == "login_password":
-                if not user_client.is_connected:
-                    try:
-                        await user_client.connect()
-                    except Exception as e:
-                        await message.reply("❌ Сессия прервалась. Начните заново: /login")
-                        return
                 try:
                     await user_client.check_password(text)
                 except PasswordHashInvalid:
@@ -740,15 +624,13 @@ def register_handlers(bot: Client) -> None:
                     await message.reply("❌ Неверный пароль. Повторите или /cancel")
                     return
                 except Exception as e:
-                    await message.reply(f"❌ Ошибка: {e}")
+                    await message.reply(f"❌ {e}")
                     return
                 await after_userbot_login(message)
-
-            # ------------------- Текст сообщения -------------------
             elif action == "set_text":
                 if not text:
                     pending[uid] = {"action": "set_text"}
-                    await message.reply("Пустой текст, повторите или /cancel")
+                    await message.reply("Пустой текст.")
                     return
                 STATE["text"] = text
                 STATE["media_path"] = None
@@ -756,12 +638,10 @@ def register_handlers(bot: Client) -> None:
                 STATE["caption"] = ""
                 save_json(STATE_FILE, STATE)
                 await message.reply("✅ Текст сохранён.", reply_markup=main_menu_kb())
-
-            # ------------------- Медиа -------------------
             elif action == "set_media":
                 if not (message.photo or message.video):
                     pending[uid] = {"action": "set_media"}
-                    await message.reply("Это не фото и не видео. Пришлите медиа или /cancel")
+                    await message.reply("Не медиа. Пришлите фото/видео.")
                     return
                 if message.photo:
                     ext = "jpg"; STATE["media_type"] = "photo"
@@ -773,22 +653,17 @@ def register_handlers(bot: Client) -> None:
                 STATE["caption"] = message.caption or ""
                 STATE["text"] = None
                 save_json(STATE_FILE, STATE)
-                await message.reply(
-                    f"✅ Медиа сохранено ({STATE['media_type']}).\n"
-                    f"Caption: {(STATE['caption'] or '')[:80] or '—'}",
-                    reply_markup=main_menu_kb(),
-                )
-
-            # ------------------- Добавить группу -------------------
+                await message.reply(f"✅ Медиа сохранено ({STATE['media_type']}).",
+                    reply_markup=main_menu_kb())
             elif action == "add_group":
                 ref = parse_chat_ref(text)
                 if ref is None:
-                    await message.reply("Не удалось распарсить. /cancel")
+                    await message.reply("Не распарсил. /cancel")
                     return
                 try:
                     chat = await user_client.get_chat(ref)
                 except Exception as e:
-                    await message.reply(f"❌ Не удалось получить чат: {e}")
+                    await message.reply(f"❌ {e}")
                     return
                 gid = chat.id
                 title = chat.title or str(gid)
@@ -796,127 +671,68 @@ def register_handlers(bot: Client) -> None:
                     await message.reply("ℹ️ Уже в списке.", reply_markup=main_menu_kb())
                     return
                 STATE["groups"].append({
-                    "id": gid,
-                    "title": title,
+                    "id": gid, "title": title,
                     "type": chat.type.name if chat.type else "UNKNOWN",
                     "manual": True,
                 })
                 save_json(STATE_FILE, STATE)
-                await message.reply(f"✅ Добавлено: {title} ({gid})", reply_markup=main_menu_kb())
-
-            # ------------------- Тайминги -------------------
+                await message.reply(f"✅ {title} ({gid})", reply_markup=main_menu_kb())
             elif action == "set_interval":
                 try:
-                    val = int(text)
-                    if val < 60:
-                        raise ValueError("минимум 60 секунд")
-                    STATE["interval"] = val
+                    v = int(text)
+                    if v < 60: raise ValueError("мин. 60")
+                    STATE["interval"] = v
                     save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ Интервал: {val} сек.", reply_markup=main_menu_kb())
+                    await message.reply(f"✅ {v} сек.", reply_markup=main_menu_kb())
                 except Exception as e:
                     pending[uid] = {"action": "set_interval"}
                     await message.reply(f"❌ {e}")
-
             elif action == "set_delay_min":
                 try:
-                    val = int(text)
-                    if val < 1:
-                        raise ValueError("минимум 1 сек")
-                    STATE["delay_min"] = val
-                    if STATE["delay_max"] < val:
-                        STATE["delay_max"] = val
+                    v = int(text)
+                    if v < 1: raise ValueError("мин. 1")
+                    STATE["delay_min"] = v
+                    if STATE["delay_max"] < v: STATE["delay_max"] = v
                     save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ Мин. задержка: {val} сек.", reply_markup=main_menu_kb())
+                    await message.reply(f"✅ {v} сек.", reply_markup=main_menu_kb())
                 except Exception as e:
                     pending[uid] = {"action": "set_delay_min"}
                     await message.reply(f"❌ {e}")
-
             elif action == "set_delay_max":
                 try:
-                    val = int(text)
-                    if val < 1:
-                        raise ValueError("минимум 1 сек")
-                    if val < STATE["delay_min"]:
-                        raise ValueError(f"должно быть >= {STATE['delay_min']}")
-                    STATE["delay_max"] = val
+                    v = int(text)
+                    if v < 1: raise ValueError("мин. 1")
+                    if v < STATE["delay_min"]: raise ValueError(f">= {STATE['delay_min']}")
+                    STATE["delay_max"] = v
                     save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ Макс. задержка: {val} сек.", reply_markup=main_menu_kb())
+                    await message.reply(f"✅ {v} сек.", reply_markup=main_menu_kb())
                 except Exception as e:
                     pending[uid] = {"action": "set_delay_max"}
                     await message.reply(f"❌ {e}")
-
         except Exception as e:
-            log.exception("Ошибка обработки ввода админа")
-            await message.reply(f"❌ Ошибка: {e}")
-
+            log.exception("Ошибка ввода админа")
+            await message.reply(f"❌ {e}")
 
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
-async def try_autostart_userbot():
-    global USERBOT_READY
-    try:
-        await user_client.connect()
-    except Exception as e:
-        log.warning(f"Не удалось подключить юзербота: {e}")
-        return False
-    try:
-        me = await user_client.get_me()
-        if me:
-            log.info(f"Юзербот авторизован: {me.first_name} (@{me.username}) id={me.id}")
-            USERBOT_READY = True
-            return True
-    except Exception as e:
-        log.info(f"Юзербот пока не авторизован: {e}")
-    return False
-
-
 async def main():
     global CFG, STATE, user_client, bot_client, USERBOT_READY
 
-    # 1) Конфиг
     CFG = load_cfg()
     if not cfg_ok(CFG):
-        if sys.stdin and sys.stdin.isatty():
-            print("=" * 64)
-            print("   Первичная настройка Telegram-автопостера")
-            print("=" * 64)
-            try:
-                CFG = {
-                    "api_id": int(input("API_ID: ").strip()),
-                    "api_hash": input("API_HASH: ").strip(),
-                    "bot_token": input("BOT_TOKEN: ").strip(),
-                    "admin_id": int(input("ADMIN_ID: ").strip()),
-                    "pin": DEFAULT_PIN,
-                }
-                save_json(CONFIG_FILE, CFG)
-            except (KeyboardInterrupt, EOFError):
-                print("\nПрервано.")
-                return
-        else:
-            print("=" * 64)
-            print("  Не заданы обязательные параметры!")
-            print("  Задайте переменные окружения на хостинге:")
-            print("    API_ID, API_HASH, BOT_TOKEN, ADMIN_ID")
-            print("  (опционально: PIN)")
-            print("=" * 64)
-            return
+        print("Не заданы переменные: API_ID, API_HASH, BOT_TOKEN, ADMIN_ID")
+        return
 
     CFG.setdefault("pin", DEFAULT_PIN)
     save_json(CONFIG_FILE, CFG)
-
-    # 2) Состояние
     STATE = load_state()
 
-    # 3) Юзербот
-    user_client = Client(
-        name=SESSION_USER,
-        api_id=CFG["api_id"],
-        api_hash=CFG["api_hash"],
-    )
+    # --- Юзербот ---
+    user_client = Client(name=SESSION_USER, api_id=CFG["api_id"], api_hash=CFG["api_hash"])
 
-    # 4) Бот
+    # --- Бот ---
     bot_client = Client(
         name=SESSION_BOT,
         api_id=CFG["api_id"],
@@ -925,38 +741,41 @@ async def main():
     )
     register_handlers(bot_client)
 
-    # 5) Запуск бота
     log.info("Запуск управляющего бота…")
     await bot_client.start()
     bme = await bot_client.get_me()
     log.info(f"Бот запущен: @{bme.username}")
 
-    # 6) Пробуем авторизовать юзербота
-    await try_autostart_userbot()
-
-    # 7) Приветствие админу
+    # --- Пробуем поднять юзербот из файла сессии ---
     try:
-        status = "🟢 готов" if USERBOT_READY else "🔴 не авторизован (используйте /login)"
+        await user_client.connect()
+        me = await user_client.get_me()
+        if me:
+            USERBOT_READY = True
+            log.info(f"✅ Юзербот авторизован: {me.first_name} (@{me.username}) id={me.id}")
+    except Exception as e:
+        log.warning(f"Юзербот не авторизован: {e}")
+        USERBOT_READY = False
+
+    # --- Приветствие ---
+    try:
+        status = "🟢 готов" if USERBOT_READY else "🔴 не авторизован (/login)"
         await bot_client.send_message(
             CFG["admin_id"],
-            f"🤖 Автопостер запущен.\n"
-            f"Юзербот: {status}\n"
-            f"Для доступа: `/auth <PIN>`",
-            parse_mode=enums.ParseMode.MARKDOWN,
-        )
+            f"🤖 Автопостер запущен.\nЮзербот: {status}\nДля доступа: `/auth <PIN>`",
+            parse_mode=enums.ParseMode.MARKDOWN)
     except Exception as e:
-        log.warning(f"Не удалось отправить приветствие: {e}")
+        log.warning(f"Не отправить приветствие: {e}")
 
-    # 8) Восстановление рассылки
+    # --- Восстановление рассылки ---
     if STATE.get("running") and USERBOT_READY:
-        log.info("Возобновляю рассылку после рестарта…")
+        log.info("Возобновляю рассылку…")
         start_mailing()
     elif STATE.get("running") and not USERBOT_READY:
-        log.warning("Рассылка была активна, но юзербот не авторизован — снимаю флаг.")
         STATE["running"] = False
         save_json(STATE_FILE, STATE)
 
-    log.info("Сервис работает. Остановка — Ctrl+C.")
+    log.info("Сервис работает. Ctrl+C для остановки.")
     await asyncio.Event().wait()
 
 
