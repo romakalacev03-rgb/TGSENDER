@@ -690,7 +690,11 @@ def register_handlers(bot: Client) -> None:
                 hash_ = act["hash"]
                 code = text.replace(" ", "")
                 try:
-                    await user_client.sign_in(phone, hash_, code=code)
+                    await user_client.sign_in(
+                        phone_number=phone,
+                        phone_code_hash=hash_,
+                        phone_code=code,
+                    )
                 except SessionPasswordNeeded:
                     pending[uid] = {"action": "login_password"}
                     await message.reply("🔐 Включена 2FA. Введите пароль:")
@@ -885,7 +889,7 @@ async def main():
     # 2) Состояние
     STATE = load_state()
 
-       # 3) Юзербот (файловая сессия)
+    # 3) Юзербот (файловая сессия)
     user_client = Client(
         name=SESSION_USER,
         api_id=CFG["api_id"],
