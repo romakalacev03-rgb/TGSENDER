@@ -2,23 +2,19 @@ import os
 import asyncio
 import random
 import logging
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.errors import FloodWait, SlowmodeWait, ChatWriteForbidden
 from pyrogram.raw import functions
 
-# Включаем логирование, чтобы видеть скрытые ошибки
 logging.basicConfig(level=logging.INFO)
 
 # === НАСТРОЙКИ ===
-API_ID = int(os.environ.get("API_ID", "0"))
+API_ID = int(os.environ.get("API_ID", "1234567")) # Укажи тут свой API ID если хочешь
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-SESSION_STRING = os.environ.get("SESSION_STRING", "")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
-# === ИНИЦИАЛИЗАЦИЯ ===
-# in_memory=True для бота, чтобы исключить конфликты файлов на хостинге
-user_app = Client("user_account", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
+# SESSION_STRING удален. Теперь используется файл сессии "user_account.session"
+user_app = Client("user_account", api_id=API_ID, api_hash=API_HASH)
 bot_app = Client("bot_account", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, in_memory=True)
 
 class Config:
@@ -29,18 +25,21 @@ class Config:
     folder_name = "Пиар"
     target_chats = []
     task = None
+    userbot_ready = False
 
-def is_admin(_, __, message):
-    return message.from_user and message.from_user.id == ADMIN_ID
+# Список ID пользователей, которые ввели правильный пароль
+authorized_users = set()
 
-admin_filter = filters.create(is_admin)
+def is_authorized(_, __, message):
+    return message.from_user and message.from_user.id in authorized_users
 
-# === ФУНКЦИИ ===
+auth_filter = filters.create(is_authorized)
+
+# === ФУНКЦИИ РАССЫЛКИ ===
 async def get_chats_from_folder(folder_title):
     chats = []
     try:
-        # Прогреваем кэш ТОЛЬКО при запуске рассылки, чтобы не тормозить старт бота
-        print("📥 Синхронизация чатов (это может занять до минуты)...")
+        print("📥 Синхронизация чатов...")
         async for _ in user_app.get_dialogs(limit=300):
             pass
 
@@ -60,7 +59,7 @@ async def get_chats_from_folder(folder_title):
 async def poster_task():
     while Config.is_running:
         if not Config.target_chats:
-            await bot_app.send_message(ADMIN_ID, "⚠️ Список чатов пуст. Рассылка остановлена.")
+            await bot_app.send_message(list(authorized_users)[0], "⚠️ Список чатов пуст. Рассылка остановлена.")
             Config.is_running = False
             break
             
@@ -91,38 +90,35 @@ async def poster_task():
         if Config.is_running:
             await asyncio.sleep(60)
 
-# === КОМАНДЫ ===
+# === КОМАНДЫ БОТА ===
 
-# ТЕСТОВАЯ КОМАНДА ДЛЯ ПРОВЕРКИ СВЯЗИ (Доступна всем!)
+# Пинг доступен всем для проверки того, что бот не завис
 @bot_app.on_message(filters.command("ping"))
 async def ping_cmd(client, message):
-    await message.reply(
-        f"🏓 Понг! Бот жив и моментально читает сообщения.\n\n"
-        f"👤 Твой ID: <code>{message.from_user.id}</code>\n"
-        f"🛠 ID Админа в настройках: <code>{ADMIN_ID}</code>"
-    )
+    status = "✅ Готов к работе" if Config.userbot_ready else "❌ Сессия юзербота отсутствует"
+    await message.reply(f"🏓 Понг! Бот моментально читает сообщения.\nЮзербот: {status}")
 
-@bot_app.on_message(filters.command("start"))
+# ПЕРЕХВАТЧИК ДЛЯ ВВОДА ПАРОЛЯ (2 ФАКТОРКА)
+@bot_app.on_message(filters.private & ~auth_filter)
+async def auth_handler(client, message):
+    if message.text and message.text.strip() == "2512":
+        authorized_users.add(message.from_user.id)
+        await message.reply("✅ Пароль верный! Доступ к боту открыт.\n\nНажми /start для вызова меню.")
+    else:
+        await message.reply("🔒 **Бот защищен.**\nПожалуйста, отправь пароль (4 цифры) для доступа:")
+
+# Дальше идут команды, доступные ТОЛЬКО после ввода пароля
+@bot_app.on_message(filters.command("start") & auth_filter)
 async def start_cmd(client, message):
-    # Теперь бот скажет, если твой ID не совпадает
-    if message.from_user.id != ADMIN_ID:
-        await message.reply(
-            f"⛔️ Доступ запрещен!\n"
-            f"В настройках Amvera указан ADMIN_ID: {ADMIN_ID}\n"
-            f"А твой реальный ID: {message.from_user.id}\n"
-            f"👉 Исправь переменную ADMIN_ID на хостинге!"
-        )
-        return
-        
     await message.reply("🤖 **Панель управления**\n\n`/run` — Запуск\n`/stop` — Стоп\n`/status` — Настройки\n`/set_folder [имя]` — Папка\n`/set_msg [текст]` — Текст")
 
-@bot_app.on_message(filters.command("set_msg") & admin_filter)
+@bot_app.on_message(filters.command("set_msg") & auth_filter)
 async def set_msg_cmd(client, message):
     if len(message.command) > 1:
         Config.message_text = message.text.split(None, 1)[1]
         await message.reply("✅ Текст обновлен!")
 
-@bot_app.on_message(filters.command("set_delay") & admin_filter)
+@bot_app.on_message(filters.command("set_delay") & auth_filter)
 async def set_delay_cmd(client, message):
     try:
         _, min_d, max_d = message.text.split()
@@ -131,7 +127,7 @@ async def set_delay_cmd(client, message):
     except Exception:
         await message.reply("⚠️ Использование: `/set_delay 60 120`")
 
-@bot_app.on_message(filters.command("set_folder") & admin_filter)
+@bot_app.on_message(filters.command("set_folder") & auth_filter)
 async def set_folder_cmd(client, message):
     try:
         Config.folder_name = message.text.split(None, 1)[1]
@@ -139,13 +135,16 @@ async def set_folder_cmd(client, message):
     except Exception:
         pass
 
-@bot_app.on_message(filters.command("status") & admin_filter)
+@bot_app.on_message(filters.command("status") & auth_filter)
 async def status_cmd(client, message):
     status = "🟢 РАБОТАЕТ" if Config.is_running else "🔴 ОСТАНОВЛЕН"
     await message.reply(f"📊 **Статус:** {status}\n📁 **Папка:** {Config.folder_name}\n🎯 **Групп:** {len(Config.target_chats)}\n📝 **Текст:**\n{Config.message_text}")
 
-@bot_app.on_message(filters.command("run") & admin_filter)
+@bot_app.on_message(filters.command("run") & auth_filter)
 async def run_cmd(client, message):
+    if not Config.userbot_ready:
+        return await message.reply("❌ **ОШИБКА:** Юзербот не авторизован!\nСкрипт работает без `SESSION_STRING`. Загрузи файл `user_account.session` в корень с ботом.")
+        
     if Config.is_running:
         return await message.reply("⚠️ Уже работает!")
 
@@ -159,40 +158,50 @@ async def run_cmd(client, message):
     Config.task = asyncio.create_task(poster_task())
     await msg.edit_text(f"✅ **Запущено!** Групп: {len(Config.target_chats)}")
 
-@bot_app.on_message(filters.command("stop") & admin_filter)
+@bot_app.on_message(filters.command("stop") & auth_filter)
 async def stop_cmd(client, message):
     Config.is_running = False
     if Config.task: Config.task.cancel()
     await message.reply("🛑 **Остановлено.**")
 
-# === ЗАПУСК ===
+# === БЕЗОПАСНЫЙ ЗАПУСК ===
 async def main():
     print("="*40)
     print("🚀 НАЧИНАЕТСЯ ЗАПУСК СКРИПТА...")
     print("="*40)
     
-    try:
-        print("1. Подключаем Юзербота...")
-        await user_app.start()
-        print("✅ Юзербот авторизован!")
+    # 1. Сначала запускаем бота (чтобы он точно не завис и отвечал на /ping)
+    print("1. Подключаем Бота управления...")
+    await bot_app.start()
+    print("✅ Бот управления в сети!")
 
-        print("2. Подключаем Бота управления...")
-        await bot_app.start()
-        print("✅ Бот управления в сети!")
-        print("="*40)
-        print("🔥 ВСЁ ГОТОВО! НАПИШИ БОТУ /ping ИЛИ /start")
-        print("="*40)
-        
-        from pyrogram import idle
-        await idle()
-        
+    # 2. Безопасно проверяем юзербота, не вызывая консоль
+    print("2. Проверяем файл сессии юзербота...")
+    await user_app.connect()
+    try:
+        await user_app.get_me() # Проверка авторизации
+        Config.userbot_ready = True
+        print("✅ Юзербот успешно авторизован!")
     except Exception as e:
-        print(f"❌ КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ: {e}")
-        import traceback
-        traceback.print_exc()
+        print("❌ ЮЗЕРБОТ НЕ АВТОРИЗОВАН! Нет файла user_account.session")
+        Config.userbot_ready = False
     finally:
-        await user_app.stop()
+        await user_app.disconnect()
+        
+    # Запускаем юзербота ТОЛЬКО если есть рабочая сессия, чтобы скрипт не зависал
+    if Config.userbot_ready:
+        await user_app.start()
+        
+    print("="*40)
+    print("🔥 ВСЁ ГОТОВО! НАПИШИ БОТУ /ping ИЛИ ЛЮБОЕ СООБЩЕНИЕ")
+    print("="*40)
+    
+    await idle()
+    
+    try:
+        if Config.userbot_ready: await user_app.stop()
         await bot_app.stop()
+    except: pass
 
 if __name__ == "__main__":
     asyncio.run(main())
