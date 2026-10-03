@@ -667,12 +667,14 @@ def register_handlers(bot: Client) -> None:
                                         parse_mode=enums.ParseMode.MARKDOWN)
                     pending[uid] = {"action": "login_phone"}
                     return
+                # Сначала убеждаемся, что клиент подключён
                 try:
                     if not user_client.is_connected:
                         await user_client.connect()
                 except Exception as e:
                     await message.reply(f"❌ Не удалось подключиться: {e}")
                     return
+                # Отправляем код
                 try:
                     sent = await user_client.send_code(phone)
                 except Exception as e:
@@ -689,6 +691,14 @@ def register_handlers(bot: Client) -> None:
                 phone = act["phone"]
                 hash_ = act["hash"]
                 code = text.replace(" ", "")
+
+                # Проверка: клиент всё ещё подключён?
+                if not user_client.is_connected:
+                    await message.reply(
+                        "❌ Сессия прервалась. Начните заново: /login"
+                    )
+                    return
+
                 try:
                     await user_client.sign_in(
                         phone_number=phone,
@@ -704,7 +714,18 @@ def register_handlers(bot: Client) -> None:
                     await message.reply("❌ Неверный код. Повторите или /cancel")
                     return
                 except PhoneCodeExpired:
-                    await message.reply("❌ Код истёк. /login заново.")
+                    # Автоматически запрашиваем новый код
+                    await message.reply("⚠️ Код истёк. Запрашиваю новый...")
+                    try:
+                        sent = await user_client.send_code(phone)
+                        pending[uid] = {
+                            "action": "login_code",
+                            "phone": phone,
+                            "hash": sent.phone_code_hash,
+                        }
+                        await message.reply("📩 Новый код отправлен. Введите его (только цифры):")
+                    except Exception as e:
+                        await message.reply(f"❌ Не удалось отправить новый код: {e}\nПопробуйте /login")
                     return
                 except Exception as e:
                     await message.reply(f"❌ Ошибка: {e}")
@@ -712,6 +733,9 @@ def register_handlers(bot: Client) -> None:
                 await after_userbot_login(message)
 
             elif action == "login_password":
+                if not user_client.is_connected:
+                    await message.reply("❌ Сессия прервалась. Начните заново: /login")
+                    return
                 try:
                     await user_client.check_password(text)
                 except PasswordHashInvalid:
