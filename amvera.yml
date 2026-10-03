@@ -2,8 +2,12 @@ meta:
   environment: python
   toolchain:
     name: pip
-    version: "3.11"
+    version: "3.10"
+
+build:
+  requirementsPath: requirements.txt
+  useCache: false
 
 run:
-  script: python main.py
+  scriptName: main.py
   persistenceMount: /data
