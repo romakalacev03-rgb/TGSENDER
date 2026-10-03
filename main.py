@@ -5,7 +5,7 @@
 
 - Конфиг берётся из переменных окружения, с fallback на config.json.
 - Авторизация юзербота — через управляющего бота в Telegram (/login).
-- Сессия юзербота хранится строкой в config.json (StringSession).
+- Сессия юзербота хранится как файл (userbot.session) в /data.
 
 Установка:
     pip install -U pyrogram tgcrypto
@@ -21,7 +21,6 @@ from datetime import datetime, timedelta
 
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram import StringSession
 from pyrogram.errors import (
     FloodWait,
     ChatWriteForbidden,
@@ -37,13 +36,31 @@ from pyrogram.errors import (
 )
 
 # ---------------------------------------------------------------------------
-# Константы и глобальное состояние
+# Пути (persistent volume на Amvera монтируется в /data)
 # ---------------------------------------------------------------------------
 
-CONFIG_FILE = "config.json"
-STATE_FILE = "state.json"
-MEDIA_DIR = "media"
-SESSION_BOT = "control_bot"   # файл-сессия бота (не критично, бот по токену)
+def _pick_data_dir() -> str:
+    """Если /data существует и доступен для записи — используем его,
+    иначе работаем в директории скрипта."""
+    try:
+        if os.path.isdir("/data") and os.access("/data", os.W_OK):
+            return "/data"
+    except Exception:
+        pass
+    return os.path.dirname(os.path.abspath(__file__))
+
+DATA_DIR = _pick_data_dir()
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
+MEDIA_DIR = os.path.join(DATA_DIR, "media")
+SESSION_USER = os.path.join(DATA_DIR, "userbot")        # → userbot.session
+SESSION_BOT = os.path.join(DATA_DIR, "control_bot")     # → control_bot.session
+
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+except Exception:
+    pass
 
 DEFAULT_PIN = "2512"
 
@@ -53,6 +70,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("autoposter")
+log.info(f"DATA_DIR = {DATA_DIR}")
 
 CFG: dict = {}
 STATE: dict = {}
@@ -61,8 +79,8 @@ bot_client: Client = None
 mailing_task: asyncio.Task = None
 USERBOT_READY: bool = False
 
-authed: set = set()          # авторизованные в боте (по PIN)
-pending: dict = {}           # ожидаемый ввод: {uid: {"action": ...}}
+authed: set = set()
+pending: dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +106,7 @@ def save_json(path: str, data) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Конфиг: env vars + config.json
+# Конфиг (env vars + config.json)
 # ---------------------------------------------------------------------------
 
 ENV_MAP = {
@@ -97,12 +115,10 @@ ENV_MAP = {
     "BOT_TOKEN": ("bot_token", str),
     "ADMIN_ID": ("admin_id", int),
     "PIN": ("pin", str),
-    "USERBOT_SESSION": ("userbot_session", str),
 }
 
 
 def load_cfg() -> dict:
-    """Читаем config.json, поверх накатываем переменные окружения."""
     cfg = load_json(CONFIG_FILE, {}) or {}
     for env, (key, typ) in ENV_MAP.items():
         v = os.getenv(env)
@@ -122,7 +138,7 @@ def cfg_ok(cfg: dict) -> bool:
 def default_state() -> dict:
     return {
         "text": None,
-        "media_type": None,       # 'photo' | 'video' | None
+        "media_type": None,
         "media_path": None,
         "caption": "",
         "interval": 1800,
@@ -147,7 +163,7 @@ def load_state() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Парсинг ссылок на чаты
+# Парсинг ссылок
 # ---------------------------------------------------------------------------
 
 def parse_chat_ref(text: str):
@@ -170,7 +186,7 @@ def parse_chat_ref(text: str):
 
 
 # ---------------------------------------------------------------------------
-# Отправка сообщения в один чат
+# Отправка сообщения
 # ---------------------------------------------------------------------------
 
 async def send_post(chat_id: int) -> None:
@@ -192,7 +208,7 @@ async def send_post(chat_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Автоскан групп
+# Автоскан
 # ---------------------------------------------------------------------------
 
 async def scan_groups() -> list:
@@ -216,12 +232,12 @@ async def scan_groups() -> list:
         log.warning(f"FloodWait при сканировании: {e.value}s")
         await asyncio.sleep(e.value + 2)
     except Exception as e:
-        log.exception(f"Ошибка при сканировании диалогов: {e}")
+        log.exception(f"Ошибка при сканировании: {e}")
     return found
 
 
 # ---------------------------------------------------------------------------
-# Основной цикл рассылки
+# Цикл рассылки
 # ---------------------------------------------------------------------------
 
 async def mailing_loop():
@@ -358,28 +374,22 @@ def groups_kb() -> InlineKeyboardMarkup:
 
 
 # ---------------------------------------------------------------------------
-# Сохранение сессии юзербота
+# Хелпер: успешный логин юзербота
 # ---------------------------------------------------------------------------
 
-async def persist_userbot_session(message=None):
+async def after_userbot_login(message=None):
     global USERBOT_READY
     USERBOT_READY = True
     try:
-        ss = user_client.export_session_string()
-        CFG["userbot_session"] = ss
-        save_json(CONFIG_FILE, CFG)
-        log.info("Сессия юзербота сохранена в config.json")
-    except Exception as e:
-        log.warning(f"Не удалось сохранить сессию: {e}")
-    try:
         me = await user_client.get_me()
-        log.info(f"Юзербот: {me.first_name} (@{me.username}) id={me.id}")
+        log.info(f"Юзербот авторизован: {me.first_name} (@{me.username}) id={me.id}")
         if message is not None:
             await message.reply(
                 f"✅ Юзербот авторизован: {me.first_name} (@{me.username or '—'}).",
                 reply_markup=main_menu_kb(),
             )
-    except Exception:
+    except Exception as e:
+        log.warning(f"Не удалось получить данные юзербота: {e}")
         if message is not None:
             await message.reply("✅ Юзербот авторизован.", reply_markup=main_menu_kb())
 
@@ -660,6 +670,10 @@ def register_handlers(bot: Client) -> None:
                 try:
                     if not user_client.is_connected:
                         await user_client.connect()
+                except Exception as e:
+                    await message.reply(f"❌ Не удалось подключиться: {e}")
+                    return
+                try:
                     sent = await user_client.send_code(phone)
                 except Exception as e:
                     await message.reply(f"❌ Не удалось отправить код: {e}")
@@ -691,7 +705,7 @@ def register_handlers(bot: Client) -> None:
                 except Exception as e:
                     await message.reply(f"❌ Ошибка: {e}")
                     return
-                await persist_userbot_session(message)
+                await after_userbot_login(message)
 
             elif action == "login_password":
                 try:
@@ -703,7 +717,7 @@ def register_handlers(bot: Client) -> None:
                 except Exception as e:
                     await message.reply(f"❌ Ошибка: {e}")
                     return
-                await persist_userbot_session(message)
+                await after_userbot_login(message)
 
             # ------------------- Текст сообщения -------------------
             elif action == "set_text":
@@ -724,7 +738,6 @@ def register_handlers(bot: Client) -> None:
                     pending[uid] = {"action": "set_media"}
                     await message.reply("Это не фото и не видео. Пришлите медиа или /cancel")
                     return
-                os.makedirs(MEDIA_DIR, exist_ok=True)
                 if message.photo:
                     ext = "jpg"; STATE["media_type"] = "photo"
                 else:
@@ -816,6 +829,25 @@ def register_handlers(bot: Client) -> None:
 # main
 # ---------------------------------------------------------------------------
 
+async def try_autostart_userbot():
+    """Пробует поднять юзербот из сохранённой сессии. Возвращает True/False."""
+    global USERBOT_READY
+    try:
+        await user_client.connect()
+    except Exception as e:
+        log.warning(f"Не удалось подключить юзербота: {e}")
+        return False
+    try:
+        me = await user_client.get_me()
+        if me:
+            log.info(f"Юзербот авторизован: {me.first_name} (@{me.username}) id={me.id}")
+            USERBOT_READY = True
+            return True
+    except Exception as e:
+        log.info(f"Юзербот пока не авторизован: {e}")
+    return False
+
+
 async def main():
     global CFG, STATE, user_client, bot_client, USERBOT_READY
 
@@ -823,7 +855,6 @@ async def main():
     CFG = load_cfg()
     if not cfg_ok(CFG):
         if sys.stdin and sys.stdin.isatty():
-            # локальный запуск — спрашиваем в консоли
             print("=" * 64)
             print("   Первичная настройка Telegram-автопостера")
             print("=" * 64)
@@ -834,7 +865,6 @@ async def main():
                     "bot_token": input("BOT_TOKEN: ").strip(),
                     "admin_id": int(input("ADMIN_ID: ").strip()),
                     "pin": DEFAULT_PIN,
-                    "userbot_session": CFG.get("userbot_session", ""),
                 }
                 save_json(CONFIG_FILE, CFG)
             except (KeyboardInterrupt, EOFError):
@@ -845,7 +875,7 @@ async def main():
             print("  Не заданы обязательные параметры!")
             print("  Задайте переменные окружения на хостинге:")
             print("    API_ID, API_HASH, BOT_TOKEN, ADMIN_ID")
-            print("  (опционально: PIN, USERBOT_SESSION)")
+            print("  (опционально: PIN)")
             print("=" * 64)
             return
 
@@ -855,21 +885,21 @@ async def main():
     # 2) Состояние
     STATE = load_state()
 
-    # 3) Клиент юзербота (StringSession)
-    user_session = CFG.get("userbot_session") or ""
+    # 3) Юзербот (файловая сессия)
     user_client = Client(
-        StringSession(user_session),
+        name=SESSION_USER,
         api_id=CFG["api_id"],
         api_hash=CFG["api_hash"],
-        name="userbot",
+        workdir=None,
     )
 
-    # 4) Бот
+    # 4) Управляющий бот
     bot_client = Client(
-        SESSION_BOT,
+        name=SESSION_BOT,
         api_id=CFG["api_id"],
         api_hash=CFG["api_hash"],
         bot_token=CFG["bot_token"],
+        workdir=None,
     )
     register_handlers(bot_client)
 
@@ -879,21 +909,10 @@ async def main():
     bme = await bot_client.get_me()
     log.info(f"Бот запущен: @{bme.username}")
 
-    # 6) Попытка поднять юзербот, если есть сохранённая сессия
-    if user_session:
-        try:
-            await user_client.connect()
-            me = await user_client.get_me()
-            USERBOT_READY = True
-            log.info(f"Юзербот авторизован: {me.first_name} (@{me.username}) id={me.id}")
-        except Exception as e:
-            USERBOT_READY = False
-            log.warning(f"Не удалось авторизовать юзербота из сессии: {e}")
-            log.warning("Используйте /login в боте для повторной авторизации.")
-    else:
-        log.info("Сессия юзербота отсутствует — авторизуйтесь через /login в боте.")
+    # 6) Пробуем авторизовать юзербота из сохранённой сессии
+    await try_autostart_userbot()
 
-    # 7) Уведомление админу
+    # 7) Приветствие админу
     try:
         status = "🟢 готов" if USERBOT_READY else "🔴 не авторизован (используйте /login)"
         await bot_client.send_message(
@@ -906,7 +925,7 @@ async def main():
     except Exception as e:
         log.warning(f"Не удалось отправить приветствие: {e}")
 
-    # 8) Восстановление рассылки после рестарта
+    # 8) Восстановление рассылки
     if STATE.get("running") and USERBOT_READY:
         log.info("Возобновляю рассылку после рестарта…")
         start_mailing()
