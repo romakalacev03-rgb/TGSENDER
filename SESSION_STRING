@@ -1,8 +1,1 @@
-from pyrogram import Client
-# Вставь сюда свои API_ID и API_HASH (получить на my.telegram.org)
-api_id = 1234567 
-api_hash = "твой_хеш"
 
-with Client("my_account", api_id=api_id, api_hash=api_hash, in_memory=True) as app:
-    print("\nТВОЯ SESSION STRING:\n")
-    print(app.export_session_string())
