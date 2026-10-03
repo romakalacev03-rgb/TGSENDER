@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.sessions import StringSession
+from pyrogram import StringSession
 from pyrogram.errors import (
     FloodWait,
     ChatWriteForbidden,
