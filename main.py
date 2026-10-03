@@ -36,12 +36,10 @@ from pyrogram.errors import (
 )
 
 # ---------------------------------------------------------------------------
-# Пути (persistent volume на Amvera монтируется в /data)
+# Пути
 # ---------------------------------------------------------------------------
 
 def _pick_data_dir() -> str:
-    """Если /data существует и доступен для записи — используем его,
-    иначе работаем в директории скрипта."""
     try:
         if os.path.isdir("/data") and os.access("/data", os.W_OK):
             return "/data"
@@ -53,8 +51,8 @@ DATA_DIR = _pick_data_dir()
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 MEDIA_DIR = os.path.join(DATA_DIR, "media")
-SESSION_USER = os.path.join(DATA_DIR, "userbot")        # → userbot.session
-SESSION_BOT = os.path.join(DATA_DIR, "control_bot")     # → control_bot.session
+SESSION_USER = os.path.join(DATA_DIR, "userbot")
+SESSION_BOT = os.path.join(DATA_DIR, "control_bot")
 
 try:
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -106,7 +104,7 @@ def save_json(path: str, data) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Конфиг (env vars + config.json)
+# Конфиг
 # ---------------------------------------------------------------------------
 
 ENV_MAP = {
@@ -667,13 +665,13 @@ def register_handlers(bot: Client) -> None:
                                         parse_mode=enums.ParseMode.MARKDOWN)
                     pending[uid] = {"action": "login_phone"}
                     return
-                # Сначала убеждаемся, что клиент подключён
-                try:
-                    if not user_client.is_connected:
+                # Подключаем клиент, если не подключён
+                if not user_client.is_connected:
+                    try:
                         await user_client.connect()
-                except Exception as e:
-                    await message.reply(f"❌ Не удалось подключиться: {e}")
-                    return
+                    except Exception as e:
+                        await message.reply(f"❌ Не удалось подключиться: {e}")
+                        return
                 # Отправляем код
                 try:
                     sent = await user_client.send_code(phone)
@@ -692,12 +690,13 @@ def register_handlers(bot: Client) -> None:
                 hash_ = act["hash"]
                 code = text.replace(" ", "")
 
-                # Проверка: клиент всё ещё подключён?
+                # Проверяем, что клиент всё ещё подключён
                 if not user_client.is_connected:
-                    await message.reply(
-                        "❌ Сессия прервалась. Начните заново: /login"
-                    )
-                    return
+                    try:
+                        await user_client.connect()
+                    except Exception as e:
+                        await message.reply(f"❌ Сессия прервалась. Начните заново: /login")
+                        return
 
                 try:
                     await user_client.sign_in(
@@ -714,18 +713,13 @@ def register_handlers(bot: Client) -> None:
                     await message.reply("❌ Неверный код. Повторите или /cancel")
                     return
                 except PhoneCodeExpired:
-                    # Автоматически запрашиваем новый код
-                    await message.reply("⚠️ Код истёк. Запрашиваю новый...")
-                    try:
-                        sent = await user_client.send_code(phone)
-                        pending[uid] = {
-                            "action": "login_code",
-                            "phone": phone,
-                            "hash": sent.phone_code_hash,
-                        }
-                        await message.reply("📩 Новый код отправлен. Введите его (только цифры):")
-                    except Exception as e:
-                        await message.reply(f"❌ Не удалось отправить новый код: {e}\nПопробуйте /login")
+                    # НЕ запрашиваем новый код автоматически!
+                    # Просим пользователя подождать и начать заново
+                    await message.reply(
+                        "⚠️ Код истёк. Telegram аннулировал попытку входа.\n"
+                        "Подождите 1-2 минуты и отправьте /login заново.\n"
+                        "Важно: вводите код сразу после получения."
+                    )
                     return
                 except Exception as e:
                     await message.reply(f"❌ Ошибка: {e}")
@@ -734,8 +728,11 @@ def register_handlers(bot: Client) -> None:
 
             elif action == "login_password":
                 if not user_client.is_connected:
-                    await message.reply("❌ Сессия прервалась. Начните заново: /login")
-                    return
+                    try:
+                        await user_client.connect()
+                    except Exception as e:
+                        await message.reply("❌ Сессия прервалась. Начните заново: /login")
+                        return
                 try:
                     await user_client.check_password(text)
                 except PasswordHashInvalid:
@@ -858,7 +855,6 @@ def register_handlers(bot: Client) -> None:
 # ---------------------------------------------------------------------------
 
 async def try_autostart_userbot():
-    """Пробует поднять юзербот из сохранённой сессии. Возвращает True/False."""
     global USERBOT_READY
     try:
         await user_client.connect()
@@ -913,14 +909,14 @@ async def main():
     # 2) Состояние
     STATE = load_state()
 
-    # 3) Юзербот (файловая сессия)
+    # 3) Юзербот
     user_client = Client(
         name=SESSION_USER,
         api_id=CFG["api_id"],
         api_hash=CFG["api_hash"],
     )
 
-    # 4) Управляющий бот
+    # 4) Бот
     bot_client = Client(
         name=SESSION_BOT,
         api_id=CFG["api_id"],
@@ -935,7 +931,7 @@ async def main():
     bme = await bot_client.get_me()
     log.info(f"Бот запущен: @{bme.username}")
 
-    # 6) Пробуем авторизовать юзербота из сохранённой сессии
+    # 6) Пробуем авторизовать юзербота
     await try_autostart_userbot()
 
     # 7) Приветствие админу
