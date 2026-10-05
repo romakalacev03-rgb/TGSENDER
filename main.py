@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Автопостер по группам Telegram с управляющим ботом.
-Работает на Amvera. Сессия юзербота — файл /data/userbot.session.
+Автопостер + автоответчик.
+Юзербот-сессия: /data/userbot.session
 """
 
 import asyncio
@@ -61,6 +61,7 @@ user_client: Client = None
 bot_client: Client = None
 mailing_task: asyncio.Task = None
 USERBOT_READY: bool = False
+ME_ID: int = 0
 
 authed: set = set()
 pending: dict = {}
@@ -116,6 +117,24 @@ def cfg_ok(cfg: dict) -> bool:
     return all(cfg.get(k) for k in ("api_id", "api_hash", "bot_token", "admin_id"))
 
 
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+
+def _default_autoreply() -> dict:
+    return {
+        "enabled": False,
+        "inactive_minutes": 5,
+        "cooldown_minutes": 60,
+        "template_first": "",
+        "template_known": "",
+        "known_users": [],           # список str(user_id)
+        "known_users_loaded": False, # загружен ли список из диалогов
+        "last_reply": {},            # {str(user_id): iso}
+        "last_user_activity": None,  # iso последнего моего исходящего (не автоответа)
+    }
+
+
 def default_state() -> dict:
     return {
         "text": None,
@@ -127,7 +146,12 @@ def default_state() -> dict:
         "delay_max": 15,
         "groups": [],
         "running": False,
-        "stats": {"sent": 0, "errors": 0, "rounds": 0, "last_round": None, "next_round": None},
+        "autoreply": _default_autoreply(),
+        "stats": {
+            "sent": 0, "errors": 0, "rounds": 0,
+            "autoreplies": 0,
+            "last_round": None, "next_round": None,
+        },
     }
 
 
@@ -135,12 +159,26 @@ def load_state() -> dict:
     raw = load_json(STATE_FILE, {}) or {}
     st = default_state()
     st.update(raw)
+
+    # аккуратно мержим вложенные словари
+    default_ar = _default_autoreply()
+    ar = st.get("autoreply") or {}
+    for k, v in default_ar.items():
+        ar.setdefault(k, v)
+    if not isinstance(ar.get("known_users"), list):
+        ar["known_users"] = []
+    if not isinstance(ar.get("last_reply"), dict):
+        ar["last_reply"] = {}
+    st["autoreply"] = ar
+
     if not isinstance(st.get("stats"), dict):
         st["stats"] = default_state()["stats"]
+    st["stats"].setdefault("autoreplies", 0)
     return st
 
+
 # ---------------------------------------------------------------------------
-# Парсинг ссылок
+# Вспомогательные
 # ---------------------------------------------------------------------------
 
 def parse_chat_ref(text: str):
@@ -161,8 +199,53 @@ def parse_chat_ref(text: str):
     except ValueError:
         return "@" + s
 
+
+def _is_owner_inactive() -> bool:
+    """True если владелец давно не писал → автоответчик активен."""
+    ar = STATE.get("autoreply") or {}
+    last = ar.get("last_user_activity")
+    if not last:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(last)
+        minutes = int(ar.get("inactive_minutes", 5))
+        return (datetime.now() - last_dt).total_seconds() > minutes * 60
+    except Exception:
+        return True
+
+
+def _is_known(user_id: int) -> bool:
+    ar = STATE.get("autoreply") or {}
+    return str(user_id) in (ar.get("known_users") or [])
+
+
+def _mark_known(user_id: int) -> None:
+    ar = STATE.setdefault("autoreply", _default_autoreply())
+    known = ar.setdefault("known_users", [])
+    s = str(user_id)
+    if s not in known:
+        known.append(s)
+        # ограничим размер, чтобы state.json не пух
+        if len(known) > 5000:
+            ar["known_users"] = known[-3000:]
+
+
+def _cooldown_ok(user_id: int) -> bool:
+    ar = STATE.get("autoreply") or {}
+    lr = ar.get("last_reply") or {}
+    last = lr.get(str(user_id))
+    if not last:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(last)
+        cd = int(ar.get("cooldown_minutes", 60)) * 60
+        return (datetime.now() - last_dt).total_seconds() >= cd
+    except Exception:
+        return True
+
+
 # ---------------------------------------------------------------------------
-# Отправка
+# Отправка (автопостинг)
 # ---------------------------------------------------------------------------
 
 async def send_post(chat_id: int) -> None:
@@ -181,8 +264,9 @@ async def send_post(chat_id: int) -> None:
     else:
         raise ValueError("Не задан текст или медиа")
 
+
 # ---------------------------------------------------------------------------
-# Скан
+# Автоскан
 # ---------------------------------------------------------------------------
 
 async def scan_groups() -> list:
@@ -208,6 +292,7 @@ async def scan_groups() -> list:
     except Exception as e:
         log.exception(f"Ошибка скана: {e}")
     return found
+
 
 # ---------------------------------------------------------------------------
 # Цикл рассылки
@@ -293,6 +378,7 @@ def start_mailing() -> None:
         return
     mailing_task = asyncio.create_task(mailing_loop())
 
+
 # ---------------------------------------------------------------------------
 # Клавиатуры
 # ---------------------------------------------------------------------------
@@ -306,12 +392,15 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             "🚀 Запустить рассылку" if not STATE.get("running") else "🚀 Рассылка идёт…",
             callback_data="start")])
         rows.append([InlineKeyboardButton("⏸ Остановить рассылку", callback_data="stop")])
+    ar = STATE.get("autoreply") or {}
+    ar_state = "🟢 вкл" if ar.get("enabled") else "🔴 выкл"
     rows += [
         [InlineKeyboardButton("📝 Изменить сообщение", callback_data="edit_msg")],
         [InlineKeyboardButton("⏱ Настройка таймингов", callback_data="timings")],
         [InlineKeyboardButton("🔍 Обновить список групп", callback_data="scan")],
         [InlineKeyboardButton("➕ Добавить группу", callback_data="add_grp"),
          InlineKeyboardButton("➖ Удалить группу", callback_data="del_grp")],
+        [InlineKeyboardButton(f"🤖 Автоответчик ({ar_state})", callback_data="ar_menu")],
         [InlineKeyboardButton("📊 Статус и статистика", callback_data="status")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -325,16 +414,86 @@ def groups_kb() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu")])
     return InlineKeyboardMarkup(rows)
 
+
+def autoreply_menu_kb() -> InlineKeyboardMarkup:
+    ar = STATE.get("autoreply") or {}
+    enabled = ar.get("enabled", False)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔴 Выключить" if enabled else "🟢 Включить", callback_data="ar_toggle")],
+        [InlineKeyboardButton("📝 Шаблон для новых", callback_data="ar_first")],
+        [InlineKeyboardButton("📝 Шаблон для знакомых", callback_data="ar_known")],
+        [InlineKeyboardButton(f"⏱ Неактивность: {ar.get('inactive_minutes', 5)} мин",
+                              callback_data="ar_inactive")],
+        [InlineKeyboardButton(f"⏳ Cooldown: {ar.get('cooldown_minutes', 60)} мин",
+                              callback_data="ar_cooldown")],
+        [InlineKeyboardButton("♻️ Сбросить список знакомых", callback_data="ar_reset_known")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
+    ])
+
+
+def autoreply_menu_text() -> str:
+    ar = STATE.get("autoreply") or {}
+    tf = (ar.get("template_first") or "").strip()
+    tk = (ar.get("template_known") or "").strip()
+    return (
+        "🤖 Автоответчик\n"
+        f"• Статус: {'🟢 вкл' if ar.get('enabled') else '🔴 выкл'}\n"
+        f"• Неактивность: {ar.get('inactive_minutes', 5)} мин\n"
+        f"• Cooldown: {ar.get('cooldown_minutes', 60)} мин\n"
+        f"• Знакомых: {len(ar.get('known_users') or [])}\n\n"
+        f"📩 Шаблон для новых:\n{tf if tf else '— (не задан)'}\n\n"
+        f"📩 Шаблон для знакомых:\n{tk if tk else '— (не задан)'}"
+    )
+
+
 # ---------------------------------------------------------------------------
-# После логина
+# Логин юзербота / заполнение known_users
 # ---------------------------------------------------------------------------
 
+async def populate_known_users():
+    """Один раз подтягиваем личные диалоги, чтобы считать их знакомыми."""
+    global ME_ID
+    if not USERBOT_READY:
+        return
+    ar = STATE.get("autoreply") or {}
+    if ar.get("known_users_loaded"):
+        return
+    log.info("Загружаю известных юзеров из диалогов…")
+    known = set(ar.get("known_users") or [])
+    try:
+        async for dialog in user_client.get_dialogs():
+            c = dialog.chat
+            if c and c.type == enums.ChatType.PRIVATE and c.id > 0:
+                known.add(str(c.id))
+    except Exception as e:
+        log.warning(f"Не смог получить диалоги: {e}")
+    ar["known_users"] = list(known)
+    ar["known_users_loaded"] = True
+    STATE["autoreply"] = ar
+    save_json(STATE_FILE, STATE)
+    log.info(f"Известных юзеров: {len(known)}")
+
+
 async def after_userbot_login(message=None):
-    global USERBOT_READY
+    global USERBOT_READY, ME_ID
     USERBOT_READY = True
     try:
         me = await user_client.get_me()
+        ME_ID = me.id
         log.info(f"Юзербот авторизован: {me.first_name} (@{me.username}) id={me.id}")
+        # запустить dispatcher, если ещё не запущен
+        try:
+            if not user_client.is_connected:
+                await user_client.connect()
+            # start() на уже авторизованном клиенте поднимет dispatcher
+            await user_client.start()
+            log.info("Dispatcher юзербота запущен.")
+        except Exception as e:
+            log.warning(f"Не удалось запустить dispatcher: {e}")
+
+        # фоном заполним known_users
+        asyncio.create_task(populate_known_users())
+
         if message is not None:
             await message.reply(
                 f"✅ Юзербот: {me.first_name} (@{me.username or '—'}).",
@@ -343,6 +502,86 @@ async def after_userbot_login(message=None):
         log.warning(f"Ошибка после логина: {e}")
         if message is not None:
             await message.reply("✅ Юзербот авторизован.", reply_markup=main_menu_kb())
+
+
+# ---------------------------------------------------------------------------
+# Автоответчик: обработчики юзербота
+# ---------------------------------------------------------------------------
+
+def register_user_handlers(client: Client) -> None:
+
+    @client.on_message(filters.private & filters.outgoing)
+    async def on_outgoing(client, message):
+        """Обновляем 'активность владельца' и метим собеседников как знакомых."""
+        try:
+            ar = STATE.get("autoreply") or {}
+            text = (message.text or "").strip()
+            tf = (ar.get("template_first") or "").strip()
+            tk = (ar.get("template_known") or "").strip()
+
+            # если это автоответ — не считаем за активность
+            is_autoreply = bool(text) and (text == tf or text == tk)
+
+            chat = message.chat
+            if chat and chat.id and chat.id != ME_ID and chat.type == enums.ChatType.PRIVATE:
+                if not is_autoreply:
+                    _mark_known(chat.id)
+
+            if not is_autoreply:
+                ar["last_user_activity"] = datetime.now().isoformat(timespec="seconds")
+                STATE["autoreply"] = ar
+                save_json(STATE_FILE, STATE)
+        except Exception as e:
+            log.exception(f"on_outgoing: {e}")
+
+    @client.on_message(filters.private & filters.incoming)
+    async def on_incoming(client, message):
+        """Логика автоответа."""
+        try:
+            if not USERBOT_READY:
+                return
+            ar = STATE.get("autoreply") or {}
+            if not ar.get("enabled"):
+                return
+
+            user = message.from_user
+            if not user or user.is_bot or user.is_deleted:
+                return
+            if user.id == ME_ID:
+                return
+            # не отвечаем на сообщения от админа бота (это управляющий)
+            if user.id == CFG.get("admin_id"):
+                return
+
+            # проверка «владелец не в сети»
+            if not _is_owner_inactive():
+                return
+
+            # cooldown на юзера
+            if not _cooldown_ok(user.id):
+                return
+
+            known = _is_known(user.id)
+            template = (ar.get("template_known") if known else ar.get("template_first")) or ""
+            template = template.strip()
+            if not template:
+                return
+
+            await user_client.send_message(user.id, template)
+            log.info(f"[AUTOREPLY] → {user.id} ({'known' if known else 'new'})")
+
+            # помечаем известным и ставим cooldown
+            _mark_known(user.id)
+            ar = STATE.setdefault("autoreply", _default_autoreply())
+            ar.setdefault("last_reply", {})[str(user.id)] = datetime.now().isoformat(timespec="seconds")
+            STATE["stats"]["autoreplies"] = STATE["stats"].get("autoreplies", 0) + 1
+            save_json(STATE_FILE, STATE)
+        except FloodWait as fw:
+            log.warning(f"FloodWait автоответ: {fw.value}s")
+            await asyncio.sleep(fw.value + 2)
+        except Exception as e:
+            log.exception(f"Автоответ: {e}")
+
 
 # ---------------------------------------------------------------------------
 # Обработчики бота
@@ -417,8 +656,10 @@ def register_handlers(bot: Client) -> None:
             return
         data = cb.data or ""
         try:
+            # ---------- главное меню ----------
             if data == "menu":
                 await cb.message.edit_text("🎛 Панель управления:", reply_markup=main_menu_kb())
+
             elif data == "login":
                 if USERBOT_READY:
                     await cb.answer("Уже авторизован.")
@@ -427,6 +668,7 @@ def register_handlers(bot: Client) -> None:
                 await cb.message.edit_text(
                     "📱 Введите номер телефона в формате `+79991234567`.\n/cancel — отмена",
                     parse_mode=enums.ParseMode.MARKDOWN)
+
             elif data == "start":
                 if not USERBOT_READY:
                     await cb.answer("Сначала /login.", show_alert=True)
@@ -444,10 +686,12 @@ def register_handlers(bot: Client) -> None:
                 save_json(STATE_FILE, STATE)
                 start_mailing()
                 await cb.message.edit_text("🚀 Запущено.", reply_markup=main_menu_kb())
+
             elif data == "stop":
                 STATE["running"] = False
                 save_json(STATE_FILE, STATE)
                 await cb.message.edit_text("⏸ Остановлено.", reply_markup=main_menu_kb())
+
             elif data == "edit_msg":
                 cur = "— (пусто)"
                 if STATE.get("media_path"):
@@ -474,6 +718,8 @@ def register_handlers(bot: Client) -> None:
                 STATE["caption"] = ""
                 save_json(STATE_FILE, STATE)
                 await cb.message.edit_text("🗑 Очищено.", reply_markup=main_menu_kb())
+
+            # ---------- тайминги ----------
             elif data == "timings":
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("⏱ Интервал круга (сек)", callback_data="set_interval")],
@@ -495,6 +741,8 @@ def register_handlers(bot: Client) -> None:
             elif data == "set_delay_max":
                 pending[uid] = {"action": "set_delay_max"}
                 await cb.message.edit_text("Макс. задержка.\n/cancel")
+
+            # ---------- группы ----------
             elif data == "scan":
                 if not USERBOT_READY:
                     await cb.answer("Юзербот не готов.", show_alert=True)
@@ -536,8 +784,57 @@ def register_handlers(bot: Client) -> None:
                         reply_markup=groups_kb())
                 else:
                     await cb.message.edit_text("➖ Пусто.", reply_markup=main_menu_kb())
+
+            # ---------- автоответчик ----------
+            elif data == "ar_menu":
+                await cb.message.edit_text(autoreply_menu_text(), reply_markup=autoreply_menu_kb())
+
+            elif data == "ar_toggle":
+                ar = STATE.setdefault("autoreply", _default_autoreply())
+                ar["enabled"] = not ar.get("enabled", False)
+                save_json(STATE_FILE, STATE)
+                await cb.message.edit_text(autoreply_menu_text(), reply_markup=autoreply_menu_kb())
+
+            elif data == "ar_first":
+                pending[uid] = {"action": "ar_first"}
+                await cb.message.edit_text(
+                    "Отправь текст шаблона для НОВЫХ собеседников.\n/cancel",
+                )
+
+            elif data == "ar_known":
+                pending[uid] = {"action": "ar_known"}
+                await cb.message.edit_text(
+                    "Отправь текст шаблона для ЗНАКОМЫХ собеседников.\n/cancel",
+                )
+
+            elif data == "ar_inactive":
+                pending[uid] = {"action": "ar_inactive"}
+                await cb.message.edit_text(
+                    f"Через сколько минут отсутствия владельца включать автоответ? (сейчас "
+                    f"{STATE['autoreply'].get('inactive_minutes', 5)})\n/cancel",
+                )
+
+            elif data == "ar_cooldown":
+                pending[uid] = {"action": "ar_cooldown"}
+                await cb.message.edit_text(
+                    f"Cooldown на одного собеседника в минутах (сейчас "
+                    f"{STATE['autoreply'].get('cooldown_minutes', 60)})\n/cancel",
+                )
+
+            elif data == "ar_reset_known":
+                ar = STATE.setdefault("autoreply", _default_autoreply())
+                ar["known_users"] = []
+                ar["known_users_loaded"] = False
+                save_json(STATE_FILE, STATE)
+                await cb.message.edit_text(
+                    "♻️ Список знакомых сброшен. Он перезагрузится из диалогов "
+                    "(если юзербот подключён).",
+                    reply_markup=autoreply_menu_kb())
+
+            # ---------- статус ----------
             elif data == "status":
                 s = STATE["stats"]
+                ar = STATE.get("autoreply") or {}
                 txt = (
                     f"📊 Статистика\n"
                     f"• Юзербот: {'🟢' if USERBOT_READY else '🔴'}\n"
@@ -546,10 +843,15 @@ def register_handlers(bot: Client) -> None:
                     f"• Отправлено: {s.get('sent', 0)}\n"
                     f"• Ошибок: {s.get('errors', 0)}\n"
                     f"• Кругов: {s.get('rounds', 0)}\n"
-                    f"• Последний: {s.get('last_round') or '—'}\n"
-                    f"• Следующий: {s.get('next_round') or '—'}\n"
+                    f"• Последний круг: {s.get('last_round') or '—'}\n"
+                    f"• Следующий круг: {s.get('next_round') or '—'}\n"
                     f"• Интервал: {STATE['interval']} сек\n"
-                    f"• Задержка: {STATE['delay_min']}–{STATE['delay_max']} сек"
+                    f"• Задержка: {STATE['delay_min']}–{STATE['delay_max']} сек\n\n"
+                    f"🤖 Автоответчик: {'🟢' if ar.get('enabled') else '🔴'}\n"
+                    f"• Автоответов отправлено: {s.get('autoreplies', 0)}\n"
+                    f"• Знакомых: {len(ar.get('known_users') or [])}\n"
+                    f"• Неактивность: {ar.get('inactive_minutes', 5)} мин\n"
+                    f"• Cooldown: {ar.get('cooldown_minutes', 60)} мин"
                 )
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Обновить", callback_data="status")],
@@ -576,6 +878,7 @@ def register_handlers(bot: Client) -> None:
         action = act.get("action")
         text = (message.text or "").strip()
         try:
+            # ---- логин ----
             if action == "login_phone":
                 phone = text
                 if not phone.startswith("+"):
@@ -595,6 +898,7 @@ def register_handlers(bot: Client) -> None:
                     return
                 pending[uid] = {"action": "login_code", "phone": phone, "hash": sent.phone_code_hash}
                 await message.reply("📩 Введите код из Telegram (только цифры):")
+
             elif action == "login_code":
                 phone = act["phone"]
                 hash_ = act["hash"]
@@ -616,6 +920,7 @@ def register_handlers(bot: Client) -> None:
                     await message.reply(f"❌ {e}")
                     return
                 await after_userbot_login(message)
+
             elif action == "login_password":
                 try:
                     await user_client.check_password(text)
@@ -627,6 +932,8 @@ def register_handlers(bot: Client) -> None:
                     await message.reply(f"❌ {e}")
                     return
                 await after_userbot_login(message)
+
+            # ---- сообщение рассылки ----
             elif action == "set_text":
                 if not text:
                     pending[uid] = {"action": "set_text"}
@@ -638,6 +945,7 @@ def register_handlers(bot: Client) -> None:
                 STATE["caption"] = ""
                 save_json(STATE_FILE, STATE)
                 await message.reply("✅ Текст сохранён.", reply_markup=main_menu_kb())
+
             elif action == "set_media":
                 if not (message.photo or message.video):
                     pending[uid] = {"action": "set_media"}
@@ -655,6 +963,8 @@ def register_handlers(bot: Client) -> None:
                 save_json(STATE_FILE, STATE)
                 await message.reply(f"✅ Медиа сохранено ({STATE['media_type']}).",
                     reply_markup=main_menu_kb())
+
+            # ---- группы ----
             elif action == "add_group":
                 ref = parse_chat_ref(text)
                 if ref is None:
@@ -677,6 +987,8 @@ def register_handlers(bot: Client) -> None:
                 })
                 save_json(STATE_FILE, STATE)
                 await message.reply(f"✅ {title} ({gid})", reply_markup=main_menu_kb())
+
+            # ---- тайминги ----
             elif action == "set_interval":
                 try:
                     v = int(text)
@@ -709,28 +1021,68 @@ def register_handlers(bot: Client) -> None:
                 except Exception as e:
                     pending[uid] = {"action": "set_delay_max"}
                     await message.reply(f"❌ {e}")
+
+            # ---- автоответчик ----
+            elif action == "ar_first":
+                # разрешаем и текст, и как угодно длинный
+                STATE.setdefault("autoreply", _default_autoreply())["template_first"] = message.text or ""
+                save_json(STATE_FILE, STATE)
+                await message.reply("✅ Шаблон для новых сохранён.",
+                                    reply_markup=autoreply_menu_kb())
+
+            elif action == "ar_known":
+                STATE.setdefault("autoreply", _default_autoreply())["template_known"] = message.text or ""
+                save_json(STATE_FILE, STATE)
+                await message.reply("✅ Шаблон для знакомых сохранён.",
+                                    reply_markup=autoreply_menu_kb())
+
+            elif action == "ar_inactive":
+                try:
+                    v = int(text)
+                    if v < 1: raise ValueError("мин. 1")
+                    STATE["autoreply"]["inactive_minutes"] = v
+                    save_json(STATE_FILE, STATE)
+                    await message.reply(f"✅ Неактивность: {v} мин.",
+                                        reply_markup=autoreply_menu_kb())
+                except Exception as e:
+                    pending[uid] = {"action": "ar_inactive"}
+                    await message.reply(f"❌ {e}")
+
+            elif action == "ar_cooldown":
+                try:
+                    v = int(text)
+                    if v < 0: raise ValueError("мин. 0")
+                    STATE["autoreply"]["cooldown_minutes"] = v
+                    save_json(STATE_FILE, STATE)
+                    await message.reply(f"✅ Cooldown: {v} мин.",
+                                        reply_markup=autoreply_menu_kb())
+                except Exception as e:
+                    pending[uid] = {"action": "ar_cooldown"}
+                    await message.reply(f"❌ {e}")
+
         except Exception as e:
             log.exception("Ошибка ввода админа")
             await message.reply(f"❌ {e}")
+
 
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
 async def main():
-    global CFG, STATE, user_client, bot_client, USERBOT_READY
+    global CFG, STATE, user_client, bot_client, USERBOT_READY, ME_ID
 
     CFG = load_cfg()
     if not cfg_ok(CFG):
         print("Не заданы переменные: API_ID, API_HASH, BOT_TOKEN, ADMIN_ID")
         return
-
     CFG.setdefault("pin", DEFAULT_PIN)
     save_json(CONFIG_FILE, CFG)
     STATE = load_state()
 
     # --- Юзербот ---
     user_client = Client(name=SESSION_USER, api_id=CFG["api_id"], api_hash=CFG["api_hash"])
+    register_user_handlers(user_client)
 
     # --- Бот ---
     bot_client = Client(
@@ -746,15 +1098,22 @@ async def main():
     bme = await bot_client.get_me()
     log.info(f"Бот запущен: @{bme.username}")
 
-    # --- Пробуем поднять юзербот из файла сессии ---
+    # --- Пытаемся поднять юзербот из сохранённой сессии ---
     try:
-        await user_client.connect()
+        await user_client.start()   # это поднимет и dispatcher
         me = await user_client.get_me()
         if me:
+            ME_ID = me.id
             USERBOT_READY = True
             log.info(f"✅ Юзербот авторизован: {me.first_name} (@{me.username}) id={me.id}")
+            asyncio.create_task(populate_known_users())
     except Exception as e:
         log.warning(f"Юзербот не авторизован: {e}")
+        try:
+            if not user_client.is_connected:
+                await user_client.connect()
+        except Exception:
+            pass
         USERBOT_READY = False
 
     # --- Приветствие ---
