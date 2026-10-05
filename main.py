@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Автопостер + автоответчик.
-Юзербот-сессия: /data/userbot.session
+Автопостер + ИИ-ассистент на Groq (Llama 3.3 70B).
+Помнит диалоги через SQLite. Ручное вмешательство из бота.
 """
 
 import asyncio
@@ -10,7 +10,10 @@ import os
 import random
 import sys
 import logging
+import aiosqlite
 from datetime import datetime, timedelta
+
+from groq import Groq
 
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -36,6 +39,7 @@ DATA_DIR = _pick_data_dir()
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 MEDIA_DIR = os.path.join(DATA_DIR, "media")
+DB_FILE = os.path.join(DATA_DIR, "chat_history.db")
 SESSION_USER = os.path.join(DATA_DIR, "userbot")
 SESSION_BOT = os.path.join(DATA_DIR, "control_bot")
 
@@ -59,12 +63,62 @@ CFG: dict = {}
 STATE: dict = {}
 user_client: Client = None
 bot_client: Client = None
+groq_client: Groq = None
 mailing_task: asyncio.Task = None
 USERBOT_READY: bool = False
 ME_ID: int = 0
 
 authed: set = set()
 pending: dict = {}
+
+# ---------------------------------------------------------------------------
+# SQLite
+# ---------------------------------------------------------------------------
+
+async def db_init():
+    """Создаёт таблицу истории диалогов, если её нет."""
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_user_id ON messages(user_id)
+        """)
+        await db.commit()
+
+
+async def db_add_message(user_id: int, role: str, content: str):
+    """role: 'user' (клиент) или 'assistant' (ИИ) или 'owner' (владелец)."""
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO messages (user_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            (user_id, role, content, datetime.now().isoformat(timespec="seconds"))
+        )
+        await db.commit()
+
+
+async def db_get_history(user_id: int, limit: int = 20) -> list:
+    """Возвращает последние N сообщений диалога в формате Groq messages."""
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT role, content FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, limit)
+        ) as cursor:
+            rows = await cursor.fetchall()
+    rows.reverse()
+    result = []
+    for role, content in rows:
+        # Мапим 'user' (клиент) -> 'user' в Groq, 'assistant'/'owner' -> 'assistant'
+        groq_role = "user" if role == "user" else "assistant"
+        result.append({"role": groq_role, "content": content})
+    return result
+
 
 # ---------------------------------------------------------------------------
 # JSON
@@ -87,6 +141,7 @@ def save_json(path: str, data) -> None:
     except Exception as e:
         log.error(f"Ошибка записи {path}: {e}")
 
+
 # ---------------------------------------------------------------------------
 # Конфиг
 # ---------------------------------------------------------------------------
@@ -97,6 +152,7 @@ ENV_MAP = {
     "BOT_TOKEN": ("bot_token", str),
     "ADMIN_ID": ("admin_id", int),
     "PIN": ("pin", str),
+    "GROQ_API_KEY": ("groq_api_key", str),
 }
 
 
@@ -118,8 +174,94 @@ def cfg_ok(cfg: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Дефолтный промпт (твои примеры)
+# ---------------------------------------------------------------------------
+
+DEFAULT_SYSTEM_PROMPT = """Ты — Алексей (можно Леха), менеджер по продажам. Общаешься с потенциальными клиентами в Telegram.
+
+СТИЛЬ ОБЩЕНИЯ:
+- Дружелюбно, но по делу. Позитивно, чтобы клиенту было интересно общаться.
+- Пиши как живой человек, НЕ как робот. Можно лёгкие разговорные фразы.
+- Не будь слишком заученным. Не пиши длинные сообщения. Но и не пиши односложно.
+- Умеренно используй эмодзи (🤝, 😊, 👍) — не перебарщивай.
+
+СУТЬ РАБОТЫ:
+- Мы продаём IP-ключи (прокси/доступы). Оптовая цена — 14$, розничная — 18$. 
+- Клиент покупает у нас оптом, продаёт дороже, маржу оставляет себе.
+- Твоя задача: познакомиться, рассказать о сути, заинтересовать, собрать информацию о клиенте.
+
+КАК ВЕСТИ ДИАЛОГ:
+1. Познакомься. Пример: "Хорошо, я понял меня то вообщем зовут Алексей а если просто то леха. Как мне обращаться к тебе? И сколько готов уделять времени?"
+2. Узнай о клиенте: возраст, чем занимается, был ли опыт с крипто-кошельками (Send, Xrocet).
+3. Если заинтересовал — попроси написать о себе.
+4. Общайся неформально, создавай комфортную атмосферу.
+
+ЗАПРЕЩЕНО:
+- Называть точные цены без согласования (можешь сказать "около 14$", но не гарантировать).
+- Обещать конкретные сроки или доход.
+- Давить на клиента.
+- Говорить, что ты бот или ИИ. Ты — Алексей, живой человек.
+- Отвечать на голосовые сообщения (передай владельцу).
+- Если клиент запутан или задаёт сложный вопрос — передай владельцу.
+"""
+
+
+# ---------------------------------------------------------------------------
+# ИИ-ассистент
+# ---------------------------------------------------------------------------
+
+# Флаг: юзеры, с которыми ИИ НЕ должен общаться (владелец вмешался)
+ai_paused_users: set = set()
+
+
+async def ai_generate_reply(user_id: int, user_message: str) -> str:
+    """Генерирует ответ от ИИ с учётом истории диалога."""
+    global groq_client
+    if not groq_client:
+        return None
+
+    ai_cfg = STATE.get("ai_assistant", {})
+    if not ai_cfg.get("enabled"):
+        return None
+
+    # Собираем системный промпт из настроек
+    system_prompt = ai_cfg.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
+
+    # Достаём историю диалога
+    history = await db_get_history(user_id, limit=20)
+
+    # Собираем messages для Groq
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_message})
+
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=500,
+        )
+        reply = response.choices[0].message.content.strip()
+        return reply
+    except Exception as e:
+        log.exception(f"Ошибка Groq: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
+
+def _default_ai() -> dict:
+    return {
+        "enabled": False,
+        "inactive_minutes": 5,      # через сколько минут офлайна включается ИИ
+        "system_prompt": DEFAULT_SYSTEM_PROMPT,
+        "last_user_activity": None,
+        "paused_users": [],         # юзеры, с которыми ИИ не общается (ты вмешался)
+    }
+
 
 def _default_autoreply() -> dict:
     return {
@@ -128,10 +270,9 @@ def _default_autoreply() -> dict:
         "cooldown_minutes": 60,
         "template_first": "",
         "template_known": "",
-        "known_users": [],           # список str(user_id)
-        "known_users_loaded": False, # загружен ли список из диалогов
-        "last_reply": {},            # {str(user_id): iso}
-        "last_user_activity": None,  # iso последнего моего исходящего (не автоответа)
+        "known_users": [],
+        "known_users_loaded": False,
+        "last_reply": {},
     }
 
 
@@ -147,9 +288,10 @@ def default_state() -> dict:
         "groups": [],
         "running": False,
         "autoreply": _default_autoreply(),
+        "ai_assistant": _default_ai(),
         "stats": {
             "sent": 0, "errors": 0, "rounds": 0,
-            "autoreplies": 0,
+            "autoreplies": 0, "ai_replies": 0,
             "last_round": None, "next_round": None,
         },
     }
@@ -160,25 +302,21 @@ def load_state() -> dict:
     st = default_state()
     st.update(raw)
 
-    # аккуратно мержим вложенные словари
-    default_ar = _default_autoreply()
-    ar = st.get("autoreply") or {}
-    for k, v in default_ar.items():
-        ar.setdefault(k, v)
-    if not isinstance(ar.get("known_users"), list):
-        ar["known_users"] = []
-    if not isinstance(ar.get("last_reply"), dict):
-        ar["last_reply"] = {}
-    st["autoreply"] = ar
+    for key in ("autoreply", "ai_assistant"):
+        default = _default_autoreply() if key == "autoreply" else _default_ai()
+        merged = st.get(key) or {}
+        for k, v in default.items():
+            merged.setdefault(k, v)
+        st[key] = merged
 
     if not isinstance(st.get("stats"), dict):
         st["stats"] = default_state()["stats"]
-    st["stats"].setdefault("autoreplies", 0)
+    st["stats"].setdefault("ai_replies", 0)
     return st
 
 
 # ---------------------------------------------------------------------------
-# Вспомогательные
+# Утилиты
 # ---------------------------------------------------------------------------
 
 def parse_chat_ref(text: str):
@@ -200,52 +338,21 @@ def parse_chat_ref(text: str):
         return "@" + s
 
 
-def _is_owner_inactive() -> bool:
-    """True если владелец давно не писал → автоответчик активен."""
-    ar = STATE.get("autoreply") or {}
-    last = ar.get("last_user_activity")
+def _is_owner_inactive_ai() -> bool:
+    ai = STATE.get("ai_assistant") or {}
+    last = ai.get("last_user_activity")
     if not last:
         return True
     try:
         last_dt = datetime.fromisoformat(last)
-        minutes = int(ar.get("inactive_minutes", 5))
+        minutes = int(ai.get("inactive_minutes", 5))
         return (datetime.now() - last_dt).total_seconds() > minutes * 60
     except Exception:
         return True
 
 
-def _is_known(user_id: int) -> bool:
-    ar = STATE.get("autoreply") or {}
-    return str(user_id) in (ar.get("known_users") or [])
-
-
-def _mark_known(user_id: int) -> None:
-    ar = STATE.setdefault("autoreply", _default_autoreply())
-    known = ar.setdefault("known_users", [])
-    s = str(user_id)
-    if s not in known:
-        known.append(s)
-        # ограничим размер, чтобы state.json не пух
-        if len(known) > 5000:
-            ar["known_users"] = known[-3000:]
-
-
-def _cooldown_ok(user_id: int) -> bool:
-    ar = STATE.get("autoreply") or {}
-    lr = ar.get("last_reply") or {}
-    last = lr.get(str(user_id))
-    if not last:
-        return True
-    try:
-        last_dt = datetime.fromisoformat(last)
-        cd = int(ar.get("cooldown_minutes", 60)) * 60
-        return (datetime.now() - last_dt).total_seconds() >= cd
-    except Exception:
-        return True
-
-
 # ---------------------------------------------------------------------------
-# Отправка (автопостинг)
+# Отправка / скан / рассылка (без изменений)
 # ---------------------------------------------------------------------------
 
 async def send_post(chat_id: int) -> None:
@@ -264,10 +371,6 @@ async def send_post(chat_id: int) -> None:
     else:
         raise ValueError("Не задан текст или медиа")
 
-
-# ---------------------------------------------------------------------------
-# Автоскан
-# ---------------------------------------------------------------------------
 
 async def scan_groups() -> list:
     found = []
@@ -293,10 +396,6 @@ async def scan_groups() -> list:
         log.exception(f"Ошибка скана: {e}")
     return found
 
-
-# ---------------------------------------------------------------------------
-# Цикл рассылки
-# ---------------------------------------------------------------------------
 
 async def mailing_loop():
     log.info("Рассылка запущена.")
@@ -392,15 +491,15 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             "🚀 Запустить рассылку" if not STATE.get("running") else "🚀 Рассылка идёт…",
             callback_data="start")])
         rows.append([InlineKeyboardButton("⏸ Остановить рассылку", callback_data="stop")])
-    ar = STATE.get("autoreply") or {}
-    ar_state = "🟢 вкл" if ar.get("enabled") else "🔴 выкл"
+    ai = STATE.get("ai_assistant") or {}
+    ai_state = "🟢" if ai.get("enabled") else "🔴"
     rows += [
         [InlineKeyboardButton("📝 Изменить сообщение", callback_data="edit_msg")],
         [InlineKeyboardButton("⏱ Настройка таймингов", callback_data="timings")],
         [InlineKeyboardButton("🔍 Обновить список групп", callback_data="scan")],
         [InlineKeyboardButton("➕ Добавить группу", callback_data="add_grp"),
          InlineKeyboardButton("➖ Удалить группу", callback_data="del_grp")],
-        [InlineKeyboardButton(f"🤖 Автоответчик ({ar_state})", callback_data="ar_menu")],
+        [InlineKeyboardButton(f"🤖 ИИ-ассистент ({ai_state})", callback_data="ai_menu")],
         [InlineKeyboardButton("📊 Статус и статистика", callback_data="status")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -415,64 +514,39 @@ def groups_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def autoreply_menu_kb() -> InlineKeyboardMarkup:
-    ar = STATE.get("autoreply") or {}
-    enabled = ar.get("enabled", False)
+def ai_menu_kb() -> InlineKeyboardMarkup:
+    ai = STATE.get("ai_assistant") or {}
+    enabled = ai.get("enabled", False)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔴 Выключить" if enabled else "🟢 Включить", callback_data="ar_toggle")],
-        [InlineKeyboardButton("📝 Шаблон для новых", callback_data="ar_first")],
-        [InlineKeyboardButton("📝 Шаблон для знакомых", callback_data="ar_known")],
-        [InlineKeyboardButton(f"⏱ Неактивность: {ar.get('inactive_minutes', 5)} мин",
-                              callback_data="ar_inactive")],
-        [InlineKeyboardButton(f"⏳ Cooldown: {ar.get('cooldown_minutes', 60)} мин",
-                              callback_data="ar_cooldown")],
-        [InlineKeyboardButton("♻️ Сбросить список знакомых", callback_data="ar_reset_known")],
+        [InlineKeyboardButton("🔴 Выключить" if enabled else "🟢 Включить", callback_data="ai_toggle")],
+        [InlineKeyboardButton("📝 Стиль общения", callback_data="ai_style")],
+        [InlineKeyboardButton("👤 Информация о тебе", callback_data="ai_about")],
+        [InlineKeyboardButton("💼 Описание работы", callback_data="ai_work")],
+        [InlineKeyboardButton("🚫 Запрещённые темы", callback_data="ai_forbidden")],
+        [InlineKeyboardButton("📋 Показать полный промпт", callback_data="ai_show_prompt")],
+        [InlineKeyboardButton("♻️ Сбросить промпт к дефолту", callback_data="ai_reset_prompt")],
+        [InlineKeyboardButton(f"⏱ Офлайн-порог: {ai.get('inactive_minutes', 5)} мин",
+                              callback_data="ai_inactive")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
     ])
 
 
-def autoreply_menu_text() -> str:
-    ar = STATE.get("autoreply") or {}
-    tf = (ar.get("template_first") or "").strip()
-    tk = (ar.get("template_known") or "").strip()
+def ai_menu_text() -> str:
+    ai = STATE.get("ai_assistant") or {}
+    paused = len(ai.get("paused_users") or [])
     return (
-        "🤖 Автоответчик\n"
-        f"• Статус: {'🟢 вкл' if ar.get('enabled') else '🔴 выкл'}\n"
-        f"• Неактивность: {ar.get('inactive_minutes', 5)} мин\n"
-        f"• Cooldown: {ar.get('cooldown_minutes', 60)} мин\n"
-        f"• Знакомых: {len(ar.get('known_users') or [])}\n\n"
-        f"📩 Шаблон для новых:\n{tf if tf else '— (не задан)'}\n\n"
-        f"📩 Шаблон для знакомых:\n{tk if tk else '— (не задан)'}"
+        "🤖 ИИ-ассистент\n"
+        f"• Статус: {'🟢 вкл' if ai.get('enabled') else '🔴 выкл'}\n"
+        f"• Офлайн-порог: {ai.get('inactive_minutes', 5)} мин\n"
+        f"• Ответов ИИ: {STATE['stats'].get('ai_replies', 0)}\n"
+        f"• Приостановлено диалогов: {paused}\n\n"
+        "Настрой разделы ниже — они собираются в один системный промпт для Llama 3.3."
     )
 
 
 # ---------------------------------------------------------------------------
-# Логин юзербота / заполнение known_users
+# Логин юзербота
 # ---------------------------------------------------------------------------
-
-async def populate_known_users():
-    """Один раз подтягиваем личные диалоги, чтобы считать их знакомыми."""
-    global ME_ID
-    if not USERBOT_READY:
-        return
-    ar = STATE.get("autoreply") or {}
-    if ar.get("known_users_loaded"):
-        return
-    log.info("Загружаю известных юзеров из диалогов…")
-    known = set(ar.get("known_users") or [])
-    try:
-        async for dialog in user_client.get_dialogs():
-            c = dialog.chat
-            if c and c.type == enums.ChatType.PRIVATE and c.id > 0:
-                known.add(str(c.id))
-    except Exception as e:
-        log.warning(f"Не смог получить диалоги: {e}")
-    ar["known_users"] = list(known)
-    ar["known_users_loaded"] = True
-    STATE["autoreply"] = ar
-    save_json(STATE_FILE, STATE)
-    log.info(f"Известных юзеров: {len(known)}")
-
 
 async def after_userbot_login(message=None):
     global USERBOT_READY, ME_ID
@@ -481,19 +555,13 @@ async def after_userbot_login(message=None):
         me = await user_client.get_me()
         ME_ID = me.id
         log.info(f"Юзербот авторизован: {me.first_name} (@{me.username}) id={me.id}")
-        # запустить dispatcher, если ещё не запущен
         try:
             if not user_client.is_connected:
                 await user_client.connect()
-            # start() на уже авторизованном клиенте поднимет dispatcher
             await user_client.start()
             log.info("Dispatcher юзербота запущен.")
         except Exception as e:
             log.warning(f"Не удалось запустить dispatcher: {e}")
-
-        # фоном заполним known_users
-        asyncio.create_task(populate_known_users())
-
         if message is not None:
             await message.reply(
                 f"✅ Юзербот: {me.first_name} (@{me.username or '—'}).",
@@ -505,82 +573,121 @@ async def after_userbot_login(message=None):
 
 
 # ---------------------------------------------------------------------------
-# Автоответчик: обработчики юзербота
+# Обработчики юзербота (главное!)
 # ---------------------------------------------------------------------------
 
 def register_user_handlers(client: Client) -> None:
 
     @client.on_message(filters.private & filters.outgoing)
     async def on_outgoing(client, message):
-        """Обновляем 'активность владельца' и метим собеседников как знакомых."""
+        """Владелец написал сам — обновляем активность и приостанавливаем ИИ."""
         try:
-            ar = STATE.get("autoreply") or {}
-            text = (message.text or "").strip()
-            tf = (ar.get("template_first") or "").strip()
-            tk = (ar.get("template_known") or "").strip()
-
-            # если это автоответ — не считаем за активность
-            is_autoreply = bool(text) and (text == tf or text == tk)
-
             chat = message.chat
-            if chat and chat.id and chat.id != ME_ID and chat.type == enums.ChatType.PRIVATE:
-                if not is_autoreply:
-                    _mark_known(chat.id)
+            if not chat or not chat.id or chat.id == ME_ID:
+                return
+            if chat.type != enums.ChatType.PRIVATE:
+                return
 
-            if not is_autoreply:
-                ar["last_user_activity"] = datetime.now().isoformat(timespec="seconds")
-                STATE["autoreply"] = ar
-                save_json(STATE_FILE, STATE)
+            text = (message.text or "").strip()
+            # Определяем: это автоответ/ИИ или сам владелец?
+            ai = STATE.get("ai_assistant") or {}
+            # ИИ-ответы и автоответы содержат характерные маркеры, но проще:
+            # если сообщение отправлено не через наш send_ai_reply — считаем владельцем.
+            # Здесь ловим только сообщения, отправленные ВЛАДЕЛЬЦЕМ вручную.
+
+            # Проверяем, не наш ли это последний ИИ-ответ
+            from_ai = message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == ME_ID
+
+            # Обновляем активность владельца
+            ai["last_user_activity"] = datetime.now().isoformat(timespec="seconds")
+
+            # Если владелец написал сам (не через reply на свой же пост) — ставим ИИ на паузу
+            if not from_ai:
+                paused = set(ai.get("paused_users") or [])
+                paused.add(str(chat.id))
+                ai["paused_users"] = list(paused)
+                log.info(f"[AI PAUSED] Владелец вмешался в диалог с {chat.id}")
+
+            STATE["ai_assistant"] = ai
+            save_json(STATE_FILE, STATE)
         except Exception as e:
             log.exception(f"on_outgoing: {e}")
 
     @client.on_message(filters.private & filters.incoming)
     async def on_incoming(client, message):
-        """Логика автоответа."""
+        """Новое входящее сообщение от клиента."""
         try:
             if not USERBOT_READY:
                 return
-            ar = STATE.get("autoreply") or {}
-            if not ar.get("enabled"):
-                return
-
             user = message.from_user
             if not user or user.is_bot or user.is_deleted:
                 return
             if user.id == ME_ID:
                 return
-            # не отвечаем на сообщения от админа бота (это управляющий)
             if user.id == CFG.get("admin_id"):
                 return
 
-            # проверка «владелец не в сети»
-            if not _is_owner_inactive():
+            ai = STATE.get("ai_assistant") or {}
+            if not ai.get("enabled"):
                 return
 
-            # cooldown на юзера
-            if not _cooldown_ok(user.id):
+            # Если владелец недавно писал — ИИ молчит
+            if not _is_owner_inactive_ai():
                 return
 
-            known = _is_known(user.id)
-            template = (ar.get("template_known") if known else ar.get("template_first")) or ""
-            template = template.strip()
-            if not template:
+            # Если этот юзер на паузе (владелец вмешался)
+            if str(user.id) in (ai.get("paused_users") or []):
                 return
 
-            await user_client.send_message(user.id, template)
-            log.info(f"[AUTOREPLY] → {user.id} ({'known' if known else 'new'})")
+            # ---- Голосовое сообщение -> пересылаем владельцу ----
+            if message.voice or message.video_note or message.audio:
+                try:
+                    await bot_client.send_message(
+                        CFG["admin_id"],
+                        f"🔔 Клиент {user.first_name} (@{user.username or '—'}, id={user.id}) "
+                        f"прислал голосовое. Ответь сам."
+                    )
+                except Exception:
+                    pass
+                return
 
-            # помечаем известным и ставим cooldown
-            _mark_known(user.id)
-            ar = STATE.setdefault("autoreply", _default_autoreply())
-            ar.setdefault("last_reply", {})[str(user.id)] = datetime.now().isoformat(timespec="seconds")
-            STATE["stats"]["autoreplies"] = STATE["stats"].get("autoreplies", 0) + 1
+            # ---- Обычный текст ----
+            text = (message.text or message.caption or "").strip()
+            if not text:
+                return
+
+            # Сохраняем входящее в историю
+            await db_add_message(user.id, "user", text)
+
+            # Генерируем ответ ИИ
+            reply = await ai_generate_reply(user.id, text)
+            if not reply:
+                # ИИ не смог — уведомляем владельца
+                try:
+                    await bot_client.send_message(
+                        CFG["admin_id"],
+                        f"❓ ИИ не смог ответить клиенту {user.first_name} (@{user.username or '—'}, id={user.id}).\n"
+                        f"Сообщение: {text[:200]}\nОтветь сам или нажми /pause {user.id}"
+                    )
+                except Exception:
+                    pass
+                return
+
+            # Отправляем ответ
+            await user_client.send_message(user.id, reply)
+
+            # Сохраняем ответ в историю
+            await db_add_message(user.id, "assistant", reply)
+
+            STATE["stats"]["ai_replies"] = STATE["stats"].get("ai_replies", 0) + 1
             save_json(STATE_FILE, STATE)
+            log.info(f"[AI REPLY] → {user.id}: {reply[:80]}")
+
         except FloodWait as fw:
-            log.warning(f"FloodWait автоответ: {fw.value}s")
+            log.warning(f"FloodWait ИИ: {fw.value}s")
             await asyncio.sleep(fw.value + 2)
         except Exception as e:
-            log.exception(f"Автоответ: {e}")
+            log.exception(f"ИИ-ответ: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -614,14 +721,53 @@ def register_handlers(bot: Client) -> None:
         pending.pop(message.from_user.id, None)
         await message.reply("✅ Авторизация успешна.", reply_markup=main_menu_kb())
 
-    @bot.on_message(filters.command("panel") & filters.private)
-    async def cmd_panel(client, message):
-        if message.from_user.id != CFG["admin_id"]:
+    @bot.on_message(filters.command("pause") & filters.private)
+    async def cmd_pause(client, message):
+        """Ручное приостановление ИИ для конкретного юзера: /pause <user_id или @username>."""
+        if message.from_user.id != CFG["admin_id"] or message.from_user.id not in authed:
             return
-        if message.from_user.id not in authed:
-            await message.reply("🔒 /auth <PIN>")
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2:
+            await message.reply("Использование: `/pause <user_id>` или `/pause @username`",
+                                parse_mode=enums.ParseMode.MARKDOWN)
             return
-        await message.reply("🎛 Панель:", reply_markup=main_menu_kb())
+        target = parts[1].strip()
+        uid = None
+        try:
+            uid = int(target)
+        except ValueError:
+            try:
+                chat = await user_client.get_chat(target)
+                uid = chat.id
+            except Exception as e:
+                await message.reply(f"❌ Не смог найти: {e}")
+                return
+        ai = STATE.setdefault("ai_assistant", _default_ai())
+        paused = set(ai.get("paused_users") or [])
+        paused.add(str(uid))
+        ai["paused_users"] = list(paused)
+        save_json(STATE_FILE, STATE)
+        await message.reply(f"⏸ ИИ приостановлен для {uid}. Когда захочешь — /resume {uid}")
+
+    @bot.on_message(filters.command("resume") & filters.private)
+    async def cmd_resume(client, message):
+        if message.from_user.id != CFG["admin_id"] or message.from_user.id not in authed:
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2:
+            await message.reply("Использование: `/resume <user_id>`", parse_mode=enums.ParseMode.MARKDOWN)
+            return
+        try:
+            uid = str(int(parts[1].strip()))
+        except ValueError:
+            await message.reply("❌ user_id должен быть числом.")
+            return
+        ai = STATE.setdefault("ai_assistant", _default_ai())
+        paused = set(ai.get("paused_users") or [])
+        paused.discard(uid)
+        ai["paused_users"] = list(paused)
+        save_json(STATE_FILE, STATE)
+        await message.reply(f"▶️ ИИ снова общается с {uid}.")
 
     @bot.on_message(filters.command("cancel") & filters.private)
     async def cmd_cancel(client, message):
@@ -656,7 +802,6 @@ def register_handlers(bot: Client) -> None:
             return
         data = cb.data or ""
         try:
-            # ---------- главное меню ----------
             if data == "menu":
                 await cb.message.edit_text("🎛 Панель управления:", reply_markup=main_menu_kb())
 
@@ -719,7 +864,6 @@ def register_handlers(bot: Client) -> None:
                 save_json(STATE_FILE, STATE)
                 await cb.message.edit_text("🗑 Очищено.", reply_markup=main_menu_kb())
 
-            # ---------- тайминги ----------
             elif data == "timings":
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("⏱ Интервал круга (сек)", callback_data="set_interval")],
@@ -729,7 +873,7 @@ def register_handlers(bot: Client) -> None:
                 ])
                 await cb.message.edit_text(
                     f"⏱ Настройки:\n"
-                    f"• Интервал: {STATE['interval']} сек (~{STATE['interval'] // 60} мин)\n"
+                    f"• Интервал: {STATE['interval']} сек\n"
                     f"• Задержка: {STATE['delay_min']}–{STATE['delay_max']} сек",
                     reply_markup=kb)
             elif data == "set_interval":
@@ -742,7 +886,6 @@ def register_handlers(bot: Client) -> None:
                 pending[uid] = {"action": "set_delay_max"}
                 await cb.message.edit_text("Макс. задержка.\n/cancel")
 
-            # ---------- группы ----------
             elif data == "scan":
                 if not USERBOT_READY:
                     await cb.answer("Юзербот не готов.", show_alert=True)
@@ -785,56 +928,64 @@ def register_handlers(bot: Client) -> None:
                 else:
                     await cb.message.edit_text("➖ Пусто.", reply_markup=main_menu_kb())
 
-            # ---------- автоответчик ----------
-            elif data == "ar_menu":
-                await cb.message.edit_text(autoreply_menu_text(), reply_markup=autoreply_menu_kb())
+            # ---------- ИИ-ассистент ----------
+            elif data == "ai_menu":
+                await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
 
-            elif data == "ar_toggle":
-                ar = STATE.setdefault("autoreply", _default_autoreply())
-                ar["enabled"] = not ar.get("enabled", False)
+            elif data == "ai_toggle":
+                ai = STATE.setdefault("ai_assistant", _default_ai())
+                ai["enabled"] = not ai.get("enabled", False)
                 save_json(STATE_FILE, STATE)
-                await cb.message.edit_text(autoreply_menu_text(), reply_markup=autoreply_menu_kb())
+                await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
 
-            elif data == "ar_first":
-                pending[uid] = {"action": "ar_first"}
+            elif data == "ai_style":
+                pending[uid] = {"action": "ai_style"}
                 await cb.message.edit_text(
-                    "Отправь текст шаблона для НОВЫХ собеседников.\n/cancel",
+                    "📝 Опиши стиль общения ИИ. Например:\n"
+                    "«Дружелюбно, неформально, с лёгкими эмодзи, короткие сообщения»\n\n"
+                    "Отправь текст:",
                 )
-
-            elif data == "ar_known":
-                pending[uid] = {"action": "ar_known"}
+            elif data == "ai_about":
+                pending[uid] = {"action": "ai_about"}
                 await cb.message.edit_text(
-                    "Отправь текст шаблона для ЗНАКОМЫХ собеседников.\n/cancel",
+                    "👤 Напиши информацию о себе (имя, чем занимаешься):",
                 )
-
-            elif data == "ar_inactive":
-                pending[uid] = {"action": "ar_inactive"}
+            elif data == "ai_work":
+                pending[uid] = {"action": "ai_work"}
                 await cb.message.edit_text(
-                    f"Через сколько минут отсутствия владельца включать автоответ? (сейчас "
-                    f"{STATE['autoreply'].get('inactive_minutes', 5)})\n/cancel",
+                    "💼 Опиши суть работы/продукта (что продаёшь, цены, схему):",
                 )
-
-            elif data == "ar_cooldown":
-                pending[uid] = {"action": "ar_cooldown"}
+            elif data == "ai_forbidden":
+                pending[uid] = {"action": "ai_forbidden"}
                 await cb.message.edit_text(
-                    f"Cooldown на одного собеседника в минутах (сейчас "
-                    f"{STATE['autoreply'].get('cooldown_minutes', 60)})\n/cancel",
+                    "🚫 Что ИИ НИКОГДА не должен говорить/делать:",
                 )
-
-            elif data == "ar_reset_known":
-                ar = STATE.setdefault("autoreply", _default_autoreply())
-                ar["known_users"] = []
-                ar["known_users_loaded"] = False
+            elif data == "ai_show_prompt":
+                prompt = (STATE.get("ai_assistant") or {}).get("system_prompt") or DEFAULT_SYSTEM_PROMPT
+                # Telegram ограничивает длину, разбиваем если надо
+                if len(prompt) > 3500:
+                    prompt = prompt[:3500] + "\n…(обрезано)"
+                await cb.message.edit_text(
+                    f"📋 Текущий системный промпт:\n\n{prompt}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⬅️ Назад", callback_data="ai_menu")],
+                    ]))
+            elif data == "ai_reset_prompt":
+                ai = STATE.setdefault("ai_assistant", _default_ai())
+                ai["system_prompt"] = DEFAULT_SYSTEM_PROMPT
                 save_json(STATE_FILE, STATE)
+                await cb.message.edit_text("♻️ Промпт сброшен к дефолту.",
+                                            reply_markup=ai_menu_kb())
+            elif data == "ai_inactive":
+                pending[uid] = {"action": "ai_inactive"}
                 await cb.message.edit_text(
-                    "♻️ Список знакомых сброшен. Он перезагрузится из диалогов "
-                    "(если юзербот подключён).",
-                    reply_markup=autoreply_menu_kb())
+                    f"Через сколько минут твоего отсутствия включать ИИ? "
+                    f"(сейчас {(STATE.get('ai_assistant') or {}).get('inactive_minutes', 5)})"
+                )
 
-            # ---------- статус ----------
             elif data == "status":
                 s = STATE["stats"]
-                ar = STATE.get("autoreply") or {}
+                ai = STATE.get("ai_assistant") or {}
                 txt = (
                     f"📊 Статистика\n"
                     f"• Юзербот: {'🟢' if USERBOT_READY else '🔴'}\n"
@@ -842,16 +993,11 @@ def register_handlers(bot: Client) -> None:
                     f"• Групп: {len(STATE.get('groups') or [])}\n"
                     f"• Отправлено: {s.get('sent', 0)}\n"
                     f"• Ошибок: {s.get('errors', 0)}\n"
-                    f"• Кругов: {s.get('rounds', 0)}\n"
-                    f"• Последний круг: {s.get('last_round') or '—'}\n"
-                    f"• Следующий круг: {s.get('next_round') or '—'}\n"
-                    f"• Интервал: {STATE['interval']} сек\n"
-                    f"• Задержка: {STATE['delay_min']}–{STATE['delay_max']} сек\n\n"
-                    f"🤖 Автоответчик: {'🟢' if ar.get('enabled') else '🔴'}\n"
-                    f"• Автоответов отправлено: {s.get('autoreplies', 0)}\n"
-                    f"• Знакомых: {len(ar.get('known_users') or [])}\n"
-                    f"• Неактивность: {ar.get('inactive_minutes', 5)} мин\n"
-                    f"• Cooldown: {ar.get('cooldown_minutes', 60)} мин"
+                    f"• Кругов: {s.get('rounds', 0)}\n\n"
+                    f"🤖 ИИ-ассистент: {'🟢' if ai.get('enabled') else '🔴'}\n"
+                    f"• Ответов ИИ: {s.get('ai_replies', 0)}\n"
+                    f"• Приостановлено: {len(ai.get('paused_users') or [])}\n"
+                    f"• Офлайн-порог: {ai.get('inactive_minutes', 5)} мин"
                 )
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Обновить", callback_data="status")],
@@ -1022,42 +1168,51 @@ def register_handlers(bot: Client) -> None:
                     pending[uid] = {"action": "set_delay_max"}
                     await message.reply(f"❌ {e}")
 
-            # ---- автоответчик ----
-            elif action == "ar_first":
-                # разрешаем и текст, и как угодно длинный
-                STATE.setdefault("autoreply", _default_autoreply())["template_first"] = message.text or ""
-                save_json(STATE_FILE, STATE)
-                await message.reply("✅ Шаблон для новых сохранён.",
-                                    reply_markup=autoreply_menu_kb())
+            # ---- ИИ-настройки ----
+            elif action in ("ai_style", "ai_about", "ai_work", "ai_forbidden"):
+                # Сохраняем в отдельные поля, потом собираем системный промпт
+                ai = STATE.setdefault("ai_assistant", _default_ai())
+                parts = ai.setdefault("prompt_parts", {})
+                parts[action] = message.text or ""
+                ai["prompt_parts"] = parts
 
-            elif action == "ar_known":
-                STATE.setdefault("autoreply", _default_autoreply())["template_known"] = message.text or ""
-                save_json(STATE_FILE, STATE)
-                await message.reply("✅ Шаблон для знакомых сохранён.",
-                                    reply_markup=autoreply_menu_kb())
+                # Пересобираем системный промпт
+                style = parts.get("ai_style", "").strip()
+                about = parts.get("ai_about", "").strip()
+                work = parts.get("ai_work", "").strip()
+                forb = parts.get("ai_forbidden", "").strip()
 
-            elif action == "ar_inactive":
+                prompt_lines = [DEFAULT_SYSTEM_PROMPT.split("СТИЛЬ ОБЩЕНИЯ:")[0].strip()]
+                if style:
+                    prompt_lines.append(f"\nСТИЛЬ ОБЩЕНИЯ:\n{style}")
+                if about:
+                    prompt_lines.append(f"\nИНФОРМАЦИЯ ОБО МНЕ:\n{about}")
+                if work:
+                    prompt_lines.append(f"\nСУТЬ РАБОТЫ:\n{work}")
+                if forb:
+                    prompt_lines.append(f"\nЗАПРЕЩЕНО:\n{forb}")
+                prompt_lines.append(
+                    "\nОБЩИЕ ПРАВИЛА:\n"
+                    "- Пиши как живой человек, не как робот.\n"
+                    "- Не пиши слишком длинные или слишком короткие сообщения.\n"
+                    "- Если клиент запутан или сложный вопрос — передай владельцу.\n"
+                    "- Никогда не говори, что ты бот или ИИ."
+                )
+                ai["system_prompt"] = "\n".join(prompt_lines)
+                save_json(STATE_FILE, STATE)
+                await message.reply("✅ Сохранено. Промпт обновлён.",
+                                    reply_markup=ai_menu_kb())
+
+            elif action == "ai_inactive":
                 try:
                     v = int(text)
                     if v < 1: raise ValueError("мин. 1")
-                    STATE["autoreply"]["inactive_minutes"] = v
+                    STATE["ai_assistant"]["inactive_minutes"] = v
                     save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ Неактивность: {v} мин.",
-                                        reply_markup=autoreply_menu_kb())
+                    await message.reply(f"✅ Офлайн-порог: {v} мин.",
+                                        reply_markup=ai_menu_kb())
                 except Exception as e:
-                    pending[uid] = {"action": "ar_inactive"}
-                    await message.reply(f"❌ {e}")
-
-            elif action == "ar_cooldown":
-                try:
-                    v = int(text)
-                    if v < 0: raise ValueError("мин. 0")
-                    STATE["autoreply"]["cooldown_minutes"] = v
-                    save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ Cooldown: {v} мин.",
-                                        reply_markup=autoreply_menu_kb())
-                except Exception as e:
-                    pending[uid] = {"action": "ar_cooldown"}
+                    pending[uid] = {"action": "ai_inactive"}
                     await message.reply(f"❌ {e}")
 
         except Exception as e:
@@ -1070,7 +1225,7 @@ def register_handlers(bot: Client) -> None:
 # ---------------------------------------------------------------------------
 
 async def main():
-    global CFG, STATE, user_client, bot_client, USERBOT_READY, ME_ID
+    global CFG, STATE, user_client, bot_client, groq_client, USERBOT_READY, ME_ID
 
     CFG = load_cfg()
     if not cfg_ok(CFG):
@@ -1079,6 +1234,17 @@ async def main():
     CFG.setdefault("pin", DEFAULT_PIN)
     save_json(CONFIG_FILE, CFG)
     STATE = load_state()
+
+    # --- SQLite ---
+    await db_init()
+
+    # --- Groq ---
+    if CFG.get("groq_api_key"):
+        try:
+            groq_client = Groq(api_key=CFG["groq_api_key"])
+            log.info("Groq клиент инициализирован.")
+        except Exception as e:
+            log.warning(f"Groq не инициализирован: {e}")
 
     # --- Юзербот ---
     user_client = Client(name=SESSION_USER, api_id=CFG["api_id"], api_hash=CFG["api_hash"])
@@ -1098,15 +1264,14 @@ async def main():
     bme = await bot_client.get_me()
     log.info(f"Бот запущен: @{bme.username}")
 
-    # --- Пытаемся поднять юзербот из сохранённой сессии ---
+    # --- Пытаемся поднять юзербот ---
     try:
-        await user_client.start()   # это поднимет и dispatcher
+        await user_client.start()
         me = await user_client.get_me()
         if me:
             ME_ID = me.id
             USERBOT_READY = True
             log.info(f"✅ Юзербот авторизован: {me.first_name} (@{me.username}) id={me.id}")
-            asyncio.create_task(populate_known_users())
     except Exception as e:
         log.warning(f"Юзербот не авторизован: {e}")
         try:
@@ -1118,10 +1283,16 @@ async def main():
 
     # --- Приветствие ---
     try:
+        ai_status = "🟢 вкл" if (STATE.get("ai_assistant") or {}).get("enabled") else "🔴 выкл"
+        groq_status = "🟢 подключён" if groq_client else "🔴 нет ключа"
         status = "🟢 готов" if USERBOT_READY else "🔴 не авторизован (/login)"
         await bot_client.send_message(
             CFG["admin_id"],
-            f"🤖 Автопостер запущен.\nЮзербот: {status}\nДля доступа: `/auth <PIN>`",
+            f"🤖 Автопостер запущен.\n"
+            f"Юзербот: {status}\n"
+            f"Groq: {groq_status}\n"
+            f"ИИ-ассистент: {ai_status}\n"
+            f"Для доступа: `/auth <PIN>`",
             parse_mode=enums.ParseMode.MARKDOWN)
     except Exception as e:
         log.warning(f"Не отправить приветствие: {e}")
