@@ -5,7 +5,7 @@
 История диалогов: /data/chat_history.db (SQLite)
 
 Приоритет ответа клиенту:
-    1) ИИ (Cloudflare Workers AI) — если включён, владелец неактивен, юзер не на паузе
+    1) ИИ (Cloudflare Workers AI) — если включён, владелец неактивен (или тест-режим), юзер не на паузе
     2) Автоответчик — если включён, владелец неактивен, cooldown ок
     3) Передача клиента владельцу — если ИИ не смог ответить
 """
@@ -77,6 +77,18 @@ ME_ID: int = 0
 authed: set = set()
 pending: dict = {}
 BOT_LAST_SENT: dict = {}
+
+# ---------------------------------------------------------------------------
+# Утилита очистки строк от пробелов/переносов
+# ---------------------------------------------------------------------------
+
+def clean_secret(s) -> str:
+    """Удаляет ВСЕ пробелы, табы, переносы строк из строки.
+    Нужно для токенов/ID, которые пользователь копирует из браузера."""
+    if s is None:
+        return ""
+    return "".join(str(s).split())
+
 
 # ---------------------------------------------------------------------------
 # SQLite
@@ -179,7 +191,10 @@ def load_cfg() -> dict:
         if v is None or v == "":
             continue
         try:
-            cfg[key] = typ(v)
+            if key in ("cf_account_id", "cf_api_token"):
+                cfg[key] = clean_secret(v)
+            else:
+                cfg[key] = typ(v)
         except Exception:
             log.warning(f"Некорректное значение {env}={v!r}")
     return cfg
@@ -229,6 +244,7 @@ DEFAULT_SYSTEM_PROMPT = """Ты — Алексей (можно Леха), мен
 def _default_ai() -> dict:
     return {
         "enabled": False,
+        "test_mode": False,               # 🧪 тест: отвечать сразу, без ожидания неактивности
         "inactive_minutes": 5,
         "system_prompt": DEFAULT_SYSTEM_PROMPT,
         "prompt_parts": {},
@@ -283,6 +299,14 @@ def load_state() -> dict:
         for k, v in default_fn().items():
             merged.setdefault(k, v)
         st[key] = merged
+
+    # Чистим креды от возможного мусора (переносы, пробелы), если они там были сохранены
+    ai = st.get("ai_assistant") or {}
+    if ai.get("cf_account_id"):
+        ai["cf_account_id"] = clean_secret(ai["cf_account_id"])
+    if ai.get("cf_api_token"):
+        ai["cf_api_token"] = clean_secret(ai["cf_api_token"])
+
     if not isinstance(st.get("stats"), dict):
         st["stats"] = default_state()["stats"]
     for k in ("autoreplies", "ai_replies", "ai_fallbacks"):
@@ -420,19 +444,32 @@ CF_MODELS = [
 ]
 
 
+def _get_cf_creds():
+    ai = STATE.get("ai_assistant") or {}
+    account_id = clean_secret(
+        ai.get("cf_account_id") or CFG.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID") or ""
+    )
+    api_token = clean_secret(
+        ai.get("cf_api_token") or CFG.get("cf_api_token") or os.getenv("CF_API_TOKEN") or ""
+    )
+    return account_id, api_token
+
+
 async def ask_ai(user_id: int, user_message: str):
     """Возвращает (reply | None, reason | None). reason='api_error' если временный сбой."""
     ai_cfg = STATE.get("ai_assistant") or {}
     if not ai_cfg.get("enabled"):
         return None, "disabled"
 
-    account_id = (ai_cfg.get("cf_account_id") or CFG.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID") or "").strip()
-    api_token = (ai_cfg.get("cf_api_token") or CFG.get("cf_api_token") or os.getenv("CF_API_TOKEN") or "").strip()
+    account_id, api_token = _get_cf_creds()
     if not account_id or not api_token:
         log.warning("[AI] Cloudflare: не заданы account_id или api_token")
         return None, "no_credentials"
 
-    model = (ai_cfg.get("cf_model") or CFG.get("cf_model") or CF_MODELS[0]).strip()
+    model = clean_secret(ai_cfg.get("cf_model") or CFG.get("cf_model") or CF_MODELS[0])
+    if not model:
+        model = CF_MODELS[0]
+
     system_prompt = ai_cfg.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
     history = await db_get_history(user_id, limit=30)
 
@@ -451,7 +488,6 @@ async def ask_ai(user_id: int, user_message: str):
         "temperature": 0.7,
     }
 
-    # Пробуем основную модель, потом фоллбэк-модель
     models_to_try = [model] + [m for m in CF_MODELS if m != model]
 
     last_error = None
@@ -472,7 +508,6 @@ async def ask_ai(user_id: int, user_message: str):
                 if status != 200:
                     log.error(f"[AI] {m} → HTTP {status}: {body[:300]}")
                     last_error = f"http_{status}"
-                    # 401/403 — не тот ключ, дальше пробовать бессмысленно
                     if status in (401, 403):
                         return None, "auth_error"
                     continue
@@ -531,13 +566,12 @@ async def notify_ai_fallback(user_id: int, user_message: str, reason: str = ""):
 
 
 async def notify_ai_temp_error(user_id: int, user_message: str, reason: str):
-    """Временный сбой — без паузы, просто уведомляем."""
     try:
         await bot_client.send_message(
             CFG["admin_id"],
             f"⚠️ Временный сбой ИИ ({reason}). Клиент `{user_id}` не получил ответ.\n"
             f"💬 {user_message[:200]}\n"
-            f"(ИИ НЕ приостановлен для этого клиента — следующее сообщение попробует снова.)",
+            f"(ИИ НЕ приостановлен для этого клиента.)",
             parse_mode=enums.ParseMode.MARKDOWN,
         )
     except Exception:
@@ -667,12 +701,10 @@ def start_mailing() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Обновление кэша пиров (лечит Peer id invalid)
+# Обновление кэша пиров
 # ---------------------------------------------------------------------------
 
 async def peer_refresh_loop():
-    """Раз в 30 минут прогреваем кэш пиров — иначе Pyrogram падает
-    с 'Peer id invalid' на апдейтах из незнакомых чатов."""
     while True:
         await asyncio.sleep(1800)
         if not USERBOT_READY:
@@ -716,6 +748,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     ai = STATE.get("ai_assistant") or {}
     ar_state = "🟢" if ar.get("enabled") else "🔴"
     ai_state = "🟢" if ai.get("enabled") else "🔴"
+    test_mark = " 🧪" if ai.get("test_mode") else ""
 
     rows += [
         [InlineKeyboardButton("📝 Изменить сообщение", callback_data="edit_msg")],
@@ -723,7 +756,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔍 Обновить список групп", callback_data="scan")],
         [InlineKeyboardButton("➕ Добавить группу", callback_data="add_grp"),
          InlineKeyboardButton("➖ Удалить группу", callback_data="del_grp")],
-        [InlineKeyboardButton(f"🧠 ИИ-ассистент ({ai_state})", callback_data="ai_menu")],
+        [InlineKeyboardButton(f"🧠 ИИ-ассистент ({ai_state}){test_mark}", callback_data="ai_menu")],
         [InlineKeyboardButton(f"🤖 Автоответчик ({ar_state})", callback_data="ar_menu")],
         [InlineKeyboardButton("📊 Статус и статистика", callback_data="status")],
     ]
@@ -744,12 +777,16 @@ def groups_kb() -> InlineKeyboardMarkup:
 def ai_menu_kb() -> InlineKeyboardMarkup:
     ai = STATE.get("ai_assistant") or {}
     enabled = ai.get("enabled", False)
+    test = ai.get("test_mode", False)
     has_cf = bool((ai.get("cf_account_id") or CFG.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID")))
     has_tok = bool((ai.get("cf_api_token") or CFG.get("cf_api_token") or os.getenv("CF_API_TOKEN")))
     cred_state = "✅" if (has_cf and has_tok) else "❌"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔴 Выключить ИИ" if enabled else "🟢 Включить ИИ",
                               callback_data="ai_toggle")],
+        [InlineKeyboardButton(
+            f"🧪 Тест-режим: {'🟢 ВКЛ' if test else '🔴 выкл'}",
+            callback_data="ai_test_toggle")],
         [InlineKeyboardButton("📝 Стиль общения", callback_data="ai_style")],
         [InlineKeyboardButton("👤 Информация обо мне", callback_data="ai_about")],
         [InlineKeyboardButton("💼 Описание работы", callback_data="ai_work")],
@@ -786,7 +823,7 @@ def ai_cf_menu_text() -> str:
         "1. https://dash.cloudflare.com → AI → Workers AI\n"
         "2. 'Use REST API' → Create Token\n"
         "3. Скопируй Account ID и API Token\n"
-        "4. Вставь сюда."
+        "4. Вставь сюда (бот сам вычистит переносы строк)."
     )
 
 
@@ -795,17 +832,19 @@ def ai_menu_text() -> str:
     paused = len(ai.get("paused_users") or [])
     cf_id = ai.get("cf_account_id") or CFG.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID", "")
     cf_tok = ai.get("cf_api_token") or CFG.get("cf_api_token") or os.getenv("CF_API_TOKEN", "")
+    test = ai.get("test_mode", False)
     return (
         "🧠 ИИ-ассистент (Cloudflare Workers AI)\n"
         f"• Статус: {'🟢 вкл' if ai.get('enabled') else '🔴 выкл'}\n"
+        f"• Тест-режим: {'🟢 ВКЛ (отвечает сразу)' if test else '🔴 выкл'}\n"
         f"• Неактивность: {ai.get('inactive_minutes', 5)} мин\n"
         f"• Модель: {ai.get('cf_model')}\n"
         f"• Ключи CF: {'✅' if (cf_id and cf_tok) else '❌'}\n"
         f"• Ответов ИИ: {STATE['stats'].get('ai_replies', 0)}\n"
         f"• Передач владельцу: {STATE['stats'].get('ai_fallbacks', 0)}\n"
         f"• Приостановлено диалогов: {paused}\n\n"
-        "Разделы ниже собираются в один системный промпт.\n"
-        "ИИ отвечает только когда ты неактивен."
+        "🧪 Тест-режим — ИИ отвечает сразу, даже если ты онлайн.\n"
+        "Выключи его, когда закончишь тесты."
     )
 
 
@@ -923,8 +962,13 @@ def register_user_handlers(client: Client) -> None:
                 return
             _mark_owner_activity()
             _mark_known_ar(chat.id)
-            _pause_ai(chat.id)
-            log.info(f"[OWNER ACTIVE] Владелец написал {chat.id} — ИИ на паузе")
+            # В тест-режиме не ставим на паузу — чтобы удобно было тестировать
+            ai = STATE.get("ai_assistant") or {}
+            if not ai.get("test_mode"):
+                _pause_ai(chat.id)
+                log.info(f"[OWNER ACTIVE] Владелец написал {chat.id} — ИИ на паузе")
+            else:
+                log.info(f"[OWNER ACTIVE] {chat.id} — тест-режим, пауза не ставится")
             if text:
                 await db_add_message(chat.id, "assistant", text)
         except Exception as e:
@@ -967,7 +1011,13 @@ def register_user_handlers(client: Client) -> None:
             await db_add_message(user.id, "user", text)
 
             # ---- 1. ИИ ----
-            if ai.get("enabled") and not _is_paused_ai(user.id) and _owner_inactive_ai():
+            test_mode = bool(ai.get("test_mode"))
+            ai_should_run = (
+                ai.get("enabled")
+                and (test_mode or not _is_paused_ai(user.id))
+                and (test_mode or _owner_inactive_ai())
+            )
+            if ai_should_run:
                 reply, reason = await ask_ai(user.id, text)
                 if reply:
                     await _send_as_userbot(user.id, reply)
@@ -976,18 +1026,15 @@ def register_user_handlers(client: Client) -> None:
                     log.info(f"[AI REPLY] → {user.id}: {reply[:80]}")
                     return
 
-                # Классификация причин
                 hard_fail = reason in ("no_credentials", "auth_error", "disabled", "empty")
                 soft_fail = reason in ("timeout", "rate_limit", "exception", "bad_json")
 
                 if hard_fail:
-                    # ИИ реально не может — ставим на паузу и уведомляем
                     _pause_ai(user.id)
                     STATE["stats"]["ai_fallbacks"] = STATE["stats"].get("ai_fallbacks", 0) + 1
                     save_json(STATE_FILE, STATE)
                     await notify_ai_fallback(user.id, text, reason)
                 elif soft_fail:
-                    # Временный сбой — не паузим, просто уведомляем
                     await notify_ai_temp_error(user.id, text, reason)
                 else:
                     _pause_ai(user.id)
@@ -996,7 +1043,7 @@ def register_user_handlers(client: Client) -> None:
                     await notify_ai_fallback(user.id, text, reason)
 
             # ---- 2. Автоответчик ----
-            if ar.get("enabled") and _owner_inactive_ar() and _cooldown_ok_ar(user.id):
+            if (not test_mode) and ar.get("enabled") and _owner_inactive_ar() and _cooldown_ok_ar(user.id):
                 known = _is_known_ar(user.id)
                 template = (ar.get("template_known") if known else ar.get("template_first")) or ""
                 template = template.strip()
@@ -1256,6 +1303,14 @@ def register_handlers(bot: Client) -> None:
                 save_json(STATE_FILE, STATE)
                 await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
 
+            elif data == "ai_test_toggle":
+                ai = STATE.setdefault("ai_assistant", _default_ai())
+                ai["test_mode"] = not ai.get("test_mode", False)
+                save_json(STATE_FILE, STATE)
+                st = "🟢 ВКЛ" if ai["test_mode"] else "🔴 выкл"
+                await cb.answer(f"Тест-режим: {st}", show_alert=False)
+                await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
+
             elif data == "ai_style":
                 pending[uid] = {"action": "ai_style"}
                 await cb.message.edit_text(
@@ -1299,11 +1354,15 @@ def register_handlers(bot: Client) -> None:
 
             elif data == "ai_cf_account":
                 pending[uid] = {"action": "ai_cf_account"}
-                await cb.message.edit_text("Отправь Cloudflare Account ID.\n/cancel")
+                await cb.message.edit_text(
+                    "Отправь Cloudflare Account ID.\n"
+                    "(Бот сам уберёт переносы строк, если они попадут при копировании.)\n/cancel")
 
             elif data == "ai_cf_token":
                 pending[uid] = {"action": "ai_cf_token"}
-                await cb.message.edit_text("Отправь Cloudflare API Token.\n/cancel")
+                await cb.message.edit_text(
+                    "Отправь Cloudflare API Token.\n"
+                    "(Бот сам уберёт переносы строк, если они попадут при копировании.)\n/cancel")
 
             elif data == "ai_cf_model":
                 models_text = "\n".join(f"`{m}`" for m in CF_MODELS)
@@ -1380,6 +1439,7 @@ def register_handlers(bot: Client) -> None:
                     f"• Ошибок: {s.get('errors', 0)}\n"
                     f"• Кругов: {s.get('rounds', 0)}\n\n"
                     f"🧠 ИИ (Cloudflare): {'🟢' if ai.get('enabled') else '🔴'}\n"
+                    f"• Тест-режим: {'🟢' if ai.get('test_mode') else '🔴'}\n"
                     f"• Ключи CF: {'✅' if (cf_id and cf_tok) else '❌'}\n"
                     f"• Модель: {ai.get('cf_model')}\n"
                     f"• Ответов ИИ: {s.get('ai_replies', 0)}\n"
@@ -1606,17 +1666,24 @@ def register_handlers(bot: Client) -> None:
                     await message.reply(f"❌ {e}")
 
             elif action == "ai_cf_account":
-                STATE["ai_assistant"]["cf_account_id"] = text
+                cleaned = clean_secret(text)
+                STATE["ai_assistant"]["cf_account_id"] = cleaned
                 save_json(STATE_FILE, STATE)
-                await message.reply("✅ CF Account ID сохранён.", reply_markup=ai_cf_menu_kb())
+                await message.reply(
+                    f"✅ CF Account ID сохранён (длина {len(cleaned)}).",
+                    reply_markup=ai_cf_menu_kb())
 
             elif action == "ai_cf_token":
-                STATE["ai_assistant"]["cf_api_token"] = text
+                cleaned = clean_secret(text)
+                STATE["ai_assistant"]["cf_api_token"] = cleaned
                 save_json(STATE_FILE, STATE)
-                await message.reply("✅ CF API Token сохранён.", reply_markup=ai_cf_menu_kb())
+                await message.reply(
+                    f"✅ CF API Token сохранён (длина {len(cleaned)}).",
+                    reply_markup=ai_cf_menu_kb())
 
             elif action == "ai_cf_model":
-                STATE["ai_assistant"]["cf_model"] = text or CF_MODELS[0]
+                cleaned = clean_secret(text)
+                STATE["ai_assistant"]["cf_model"] = cleaned or CF_MODELS[0]
                 save_json(STATE_FILE, STATE)
                 await message.reply(f"✅ Модель: {STATE['ai_assistant']['cf_model']}",
                                     reply_markup=ai_menu_kb())
@@ -1665,8 +1732,6 @@ def register_handlers(bot: Client) -> None:
 # ---------------------------------------------------------------------------
 
 def _install_asyncio_exception_handler(loop):
-    """Pyrogram иногда падает на 'Peer id invalid' в фоновых тасках.
-    Это не критично — просто пропускаем такие ошибки, не спамим в логи."""
     def handler(loop, context):
         exc = context.get("exception")
         msg = str(context.get("message") or "")
@@ -1695,20 +1760,15 @@ async def main():
     save_json(CONFIG_FILE, CFG)
     STATE = load_state()
 
-    # Глобальный handler ДО запуска клиентов
     _install_asyncio_exception_handler(asyncio.get_running_loop())
 
-    # SQLite
     await db_init()
 
-    # aiohttp сессия
     http_session = aiohttp.ClientSession()
 
-    # Юзербот
     user_client = Client(name=SESSION_USER, api_id=CFG["api_id"], api_hash=CFG["api_hash"])
     register_user_handlers(user_client)
 
-    # Бот
     bot_client = Client(
         name=SESSION_BOT,
         api_id=CFG["api_id"],
@@ -1722,7 +1782,6 @@ async def main():
     bme = await bot_client.get_me()
     log.info(f"Бот запущен: @{bme.username}")
 
-    # Юзербот из сессии
     try:
         await user_client.start()
         me = await user_client.get_me()
@@ -1741,18 +1800,17 @@ async def main():
             pass
         USERBOT_READY = False
 
-    # Приветствие
     try:
         ai = STATE.get("ai_assistant") or {}
         ar = STATE.get("autoreply") or {}
-        cf_id = ai.get("cf_account_id") or CFG.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID", "")
-        cf_tok = ai.get("cf_api_token") or CFG.get("cf_api_token") or os.getenv("CF_API_TOKEN", "")
+        cf_id, cf_tok = _get_cf_creds()
         cf_ok = "🟢" if (cf_id and cf_tok) else "🔴 (настрой в ИИ-меню)"
         await bot_client.send_message(
             CFG["admin_id"],
             f"🤖 Автопостер запущен.\n"
             f"• Юзербот: {'🟢 готов' if USERBOT_READY else '🔴 /login'}\n"
             f"• ИИ (Cloudflare): {'🟢 вкл' if ai.get('enabled') else '🔴 выкл'}\n"
+            f"• Тест-режим: {'🧪 ВКЛ' if ai.get('test_mode') else '🔴 выкл'}\n"
             f"• CF ключи: {cf_ok}\n"
             f"• Автоответчик: {'🟢 вкл' if ar.get('enabled') else '🔴 выкл'}\n"
             f"Для доступа: `/auth <PIN>`",
