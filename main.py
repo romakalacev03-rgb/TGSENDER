@@ -1,18 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Автопостер + автоответчик + ИИ-ассистент на DeepSeek.
-Юзербот-сессия: /data/userbot.session
+Автопостер + автоответчик + ИИ-ассистент (DeepSeek).
+Сессии: /data/userbot.session, /data/control_bot.session
+История диалогов: /data/chat_history.db (SQLite)
+
+Приоритет ответа клиенту:
+    1) ИИ (если включён и владелец неактивен и юзер не на паузе)
+    2) Автоответчик (если включён и владелец неактивен и cooldown ок)
+    3) Передача клиента владельцу (если ИИ не смог ответить)
 """
 
 import asyncio
 import json
 import os
 import random
-import sys
 import logging
-import aiosqlite
 from datetime import datetime, timedelta
 
+import aiosqlite
 from openai import OpenAI
 
 from pyrogram import Client, filters, enums
@@ -71,6 +76,10 @@ ME_ID: int = 0
 authed: set = set()
 pending: dict = {}
 
+# Защита от ложного определения "владелец вмешался": храним последнее
+# сообщение, отправленное самим ботом (ИИ или автоответчиком) для каждого юзера.
+BOT_LAST_SENT: dict = {}   # user_id -> текст последнего сообщения от бота
+
 # ---------------------------------------------------------------------------
 # SQLite
 # ---------------------------------------------------------------------------
@@ -86,34 +95,49 @@ async def db_init():
                 timestamp TEXT NOT NULL
             )
         """)
-        await db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_user_id ON messages(user_id)
-        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_user_id ON messages(user_id)")
         await db.commit()
 
 
 async def db_add_message(user_id: int, role: str, content: str):
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            "INSERT INTO messages (user_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-            (user_id, role, content, datetime.now().isoformat(timespec="seconds"))
-        )
-        await db.commit()
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "INSERT INTO messages (user_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+                (user_id, role, content, datetime.now().isoformat(timespec="seconds"))
+            )
+            await db.commit()
+    except Exception as e:
+        log.error(f"DB add error: {e}")
 
 
 async def db_get_history(user_id: int, limit: int = 20) -> list:
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute(
-            "SELECT role, content FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT ?",
-            (user_id, limit)
-        ) as cursor:
-            rows = await cursor.fetchall()
-    rows.reverse()
-    result = []
-    for role, content in rows:
-        groq_role = "user" if role == "user" else "assistant"
-        result.append({"role": groq_role, "content": content})
-    return result
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            async with db.execute(
+                "SELECT role, content FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+                (user_id, limit)
+            ) as cursor:
+                rows = await cursor.fetchall()
+        rows.reverse()
+        result = []
+        for role, content in rows:
+            r = "user" if role == "user" else "assistant"
+            result.append({"role": r, "content": content})
+        return result
+    except Exception as e:
+        log.error(f"DB history error: {e}")
+        return []
+
+
+async def db_cleanup(days: int = 30):
+    try:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute("DELETE FROM messages WHERE timestamp < ?", (cutoff,))
+            await db.commit()
+    except Exception as e:
+        log.error(f"DB cleanup error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +194,7 @@ def cfg_ok(cfg: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Дефолтный промпт
+# Дефолтный промпт ИИ
 # ---------------------------------------------------------------------------
 
 DEFAULT_SYSTEM_PROMPT = """Ты — Алексей (можно Леха), менеджер по продажам. Общаешься с потенциальными клиентами в Telegram.
@@ -187,10 +211,11 @@ DEFAULT_SYSTEM_PROMPT = """Ты — Алексей (можно Леха), мен
 - Твоя задача: познакомиться, рассказать о сути, заинтересовать, собрать информацию о клиенте.
 
 КАК ВЕСТИ ДИАЛОГ:
-1. Познакомься. Пример: "Хорошо, я понял меня то вообщем зовут Алексей а если просто то леха. Как мне обращаться к тебе? И сколько готов уделять времени?"
-2. Узнай о клиенте: возраст, чем занимается, был ли опыт с крипто-кошельками (Send, Xrocet).
+1. Познакомься. Пример: "Хорошо, меня зовут Алексей, а если просто — Лёха. Как мне обращаться к тебе?"
+2. Узнай о клиенте: возраст, чем занимается, был ли опыт с крипто-кошельками.
 3. Если заинтересовал — попроси написать о себе.
 4. Общайся неформально, создавай комфортную атмосферу.
+5. Мягко подводи к покупке.
 
 ЗАПРЕЩЕНО:
 - Называть точные цены без согласования (можешь сказать "около 14$", но не гарантировать).
@@ -198,58 +223,7 @@ DEFAULT_SYSTEM_PROMPT = """Ты — Алексей (можно Леха), мен
 - Давить на клиента.
 - Говорить, что ты бот или ИИ. Ты — Алексей, живой человек.
 - Отвечать на голосовые сообщения (передай владельцу).
-- Если клиент запутан или задаёт сложный вопрос — передай владельцу.
 """
-
-
-# ---------------------------------------------------------------------------
-# ИИ-ассистент (DeepSeek)
-# ---------------------------------------------------------------------------
-
-async def ai_generate_reply(user_id: int, user_message: str) -> str:
-    global deepseek_client
-    if not deepseek_client:
-        log.warning("[AI] DeepSeek клиент не инициализирован — пропускаю")
-        return None
-
-    ai_cfg = STATE.get("ai_assistant", {})
-    if not ai_cfg.get("enabled"):
-        log.info("[AI] ИИ выключен в настройках — пропускаю")
-        return None
-
-    system_prompt = ai_cfg.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
-    history = await db_get_history(user_id, limit=20)
-
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": user_message})
-
-    try:
-        log.info("[AI] Запрос в DeepSeek (deepseek-chat)")
-        response = deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=messages,
-            temperature=0.7,
-            max_tokens=500,
-        )
-        reply = response.choices[0].message.content.strip()
-        if reply:
-            log.info(f"[AI] ✅ Ответ ({len(reply)} симв.)")
-            return reply
-        else:
-            log.warning("[AI] DeepSeek вернул пустой ответ")
-            return None
-    except Exception as e:
-        log.error(f"[AI] Ошибка DeepSeek: {type(e).__name__}: {e}")
-        try:
-            await bot_client.send_message(
-                CFG["admin_id"],
-                f"❌ ИИ не смог ответить — ошибка DeepSeek:\n`{e}`",
-                parse_mode=enums.ParseMode.MARKDOWN
-            )
-        except Exception:
-            pass
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -261,9 +235,8 @@ def _default_ai() -> dict:
         "enabled": False,
         "inactive_minutes": 5,
         "system_prompt": DEFAULT_SYSTEM_PROMPT,
-        "last_user_activity": None,
-        "paused_users": [],
         "prompt_parts": {},
+        "paused_users": [],           # юзеры, которым ИИ больше не отвечает
     }
 
 
@@ -291,11 +264,12 @@ def default_state() -> dict:
         "delay_max": 15,
         "groups": [],
         "running": False,
+        "owner_last_activity": None,   # общее поле: когда ВЛАДЕЛЕЦ последний раз писал
         "autoreply": _default_autoreply(),
         "ai_assistant": _default_ai(),
         "stats": {
             "sent": 0, "errors": 0, "rounds": 0,
-            "autoreplies": 0, "ai_replies": 0,
+            "autoreplies": 0, "ai_replies": 0, "ai_fallbacks": 0,
             "last_round": None, "next_round": None,
         },
     }
@@ -306,16 +280,16 @@ def load_state() -> dict:
     st = default_state()
     st.update(raw)
 
-    for key in ("autoreply", "ai_assistant"):
-        default = _default_autoreply() if key == "autoreply" else _default_ai()
+    for key, default_fn in (("autoreply", _default_autoreply), ("ai_assistant", _default_ai)):
         merged = st.get(key) or {}
-        for k, v in default.items():
+        for k, v in default_fn().items():
             merged.setdefault(k, v)
         st[key] = merged
 
     if not isinstance(st.get("stats"), dict):
         st["stats"] = default_state()["stats"]
-    st["stats"].setdefault("ai_replies", 0)
+    for k in ("autoreplies", "ai_replies", "ai_fallbacks"):
+        st["stats"].setdefault(k, 0)
     return st
 
 
@@ -342,17 +316,175 @@ def parse_chat_ref(text: str):
         return "@" + s
 
 
-def _is_owner_inactive_ai() -> bool:
-    ai = STATE.get("ai_assistant") or {}
-    last = ai.get("last_user_activity")
+def _owner_inactive(minutes: int) -> bool:
+    """Общая проверка неактивности владельца по заданному порогу."""
+    last = STATE.get("owner_last_activity")
     if not last:
         return True
     try:
         last_dt = datetime.fromisoformat(last)
-        minutes = int(ai.get("inactive_minutes", 5))
         return (datetime.now() - last_dt).total_seconds() > minutes * 60
     except Exception:
         return True
+
+
+def _owner_inactive_ai() -> bool:
+    ai = STATE.get("ai_assistant") or {}
+    return _owner_inactive(int(ai.get("inactive_minutes", 5)))
+
+
+def _owner_inactive_ar() -> bool:
+    ar = STATE.get("autoreply") or {}
+    return _owner_inactive(int(ar.get("inactive_minutes", 5)))
+
+
+def _mark_owner_activity():
+    STATE["owner_last_activity"] = datetime.now().isoformat(timespec="seconds")
+    save_json(STATE_FILE, STATE)
+
+
+def _is_known_ar(user_id: int) -> bool:
+    ar = STATE.get("autoreply") or {}
+    return str(user_id) in (ar.get("known_users") or [])
+
+
+def _mark_known_ar(user_id: int):
+    ar = STATE.setdefault("autoreply", _default_autoreply())
+    known = ar.setdefault("known_users", [])
+    s = str(user_id)
+    if s not in known:
+        known.append(s)
+        if len(known) > 5000:
+            ar["known_users"] = known[-3000:]
+
+
+def _cooldown_ok_ar(user_id: int) -> bool:
+    ar = STATE.get("autoreply") or {}
+    lr = ar.get("last_reply") or {}
+    last = lr.get(str(user_id))
+    if not last:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(last)
+        cd = int(ar.get("cooldown_minutes", 60)) * 60
+        return (datetime.now() - last_dt).total_seconds() >= cd
+    except Exception:
+        return True
+
+
+def _set_cooldown_ar(user_id: int):
+    ar = STATE.setdefault("autoreply", _default_autoreply())
+    ar.setdefault("last_reply", {})[str(user_id)] = datetime.now().isoformat(timespec="seconds")
+    save_json(STATE_FILE, STATE)
+
+
+def _is_paused_ai(user_id: int) -> bool:
+    ai = STATE.get("ai_assistant") or {}
+    return str(user_id) in (ai.get("paused_users") or [])
+
+
+def _pause_ai(user_id: int):
+    ai = STATE.setdefault("ai_assistant", _default_ai())
+    paused = set(ai.get("paused_users") or [])
+    paused.add(str(user_id))
+    ai["paused_users"] = list(paused)
+    save_json(STATE_FILE, STATE)
+
+
+def _unpause_ai(user_id: int):
+    ai = STATE.setdefault("ai_assistant", _default_ai())
+    paused = set(ai.get("paused_users") or [])
+    paused.discard(str(user_id))
+    ai["paused_users"] = list(paused)
+    save_json(STATE_FILE, STATE)
+
+
+def _register_bot_sent(user_id: int, text: str):
+    """Помечаем, что это сообщение отправил сам бот, а не владелец."""
+    BOT_LAST_SENT[user_id] = (text or "").strip()
+
+
+def _was_sent_by_bot(user_id: int, text: str) -> bool:
+    last = BOT_LAST_SENT.get(user_id)
+    if not last:
+        return False
+    return last == (text or "").strip()
+
+
+async def _send_as_userbot(user_id: int, text: str, save_to_db: bool = True):
+    """Отправка от юзербота с регистрацией в BOT_LAST_SENT."""
+    _register_bot_sent(user_id, text)
+    await user_client.send_message(user_id, text)
+    if save_to_db:
+        await db_add_message(user_id, "assistant", text)
+
+
+# ---------------------------------------------------------------------------
+# ИИ-ассистент
+# ---------------------------------------------------------------------------
+
+async def ai_generate_reply(user_id: int, user_message: str):
+    global deepseek_client
+    if not deepseek_client:
+        log.warning("[AI] DeepSeek клиент не инициализирован")
+        return None
+
+    ai_cfg = STATE.get("ai_assistant", {})
+    if not ai_cfg.get("enabled"):
+        return None
+
+    system_prompt = ai_cfg.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
+    history = await db_get_history(user_id, limit=30)   # не ограничиваем жёстко
+
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_message})
+
+    try:
+        log.info(f"[AI] Запрос в DeepSeek для {user_id}")
+        # max_tokens не ограничиваем — берём большой лимит
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=2000,
+        )
+        reply = (response.choices[0].message.content or "").strip()
+        if reply:
+            log.info(f"[AI] ✅ Ответ ({len(reply)} симв.)")
+            return reply
+        log.warning("[AI] DeepSeek вернул пустой ответ")
+        return None
+    except Exception as e:
+        log.error(f"[AI] Ошибка DeepSeek: {type(e).__name__}: {e}")
+        return None
+
+
+async def notify_ai_fallback(user_id: int, user_message: str, reason: str = ""):
+    """Уведомляет владельца, что ИИ не справился и клиента нужно подхватить."""
+    try:
+        username = ""
+        name = str(user_id)
+        try:
+            u = await user_client.get_users(user_id)
+            if u:
+                name = u.first_name or name
+                username = f" (@{u.username})" if u.username else ""
+        except Exception:
+            pass
+        await bot_client.send_message(
+            CFG["admin_id"],
+            f"⚠️ **ИИ не смог ответить клиенту**\n\n"
+            f"👤 {name}{username}\n"
+            f"🆔 `{user_id}`\n"
+            f"💬 Сообщение: {user_message[:300]}\n"
+            f"❓ Причина: {reason or 'неизвестно'}\n\n"
+            f"ИИ приостановлен для этого клиента. Когда разберёшься — "
+            f"`/resume {user_id}`",
+            parse_mode=enums.ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        log.error(f"Не удалось уведомить админа: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -421,11 +553,6 @@ async def mailing_loop():
                 log.info(f"[OK] {title} ({gid})")
             except FloodWait as fw:
                 log.warning(f"[FLOOD] {fw.value}s {title}")
-                try:
-                    await bot_client.send_message(CFG["admin_id"],
-                        f"⚠️ FloodWait {fw.value} сек ({title})")
-                except Exception:
-                    pass
                 await asyncio.sleep(fw.value + 2)
                 try:
                     await send_post(gid)
@@ -495,15 +622,20 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             "🚀 Запустить рассылку" if not STATE.get("running") else "🚀 Рассылка идёт…",
             callback_data="start")])
         rows.append([InlineKeyboardButton("⏸ Остановить рассылку", callback_data="stop")])
+
+    ar = STATE.get("autoreply") or {}
     ai = STATE.get("ai_assistant") or {}
+    ar_state = "🟢" if ar.get("enabled") else "🔴"
     ai_state = "🟢" if ai.get("enabled") else "🔴"
+
     rows += [
         [InlineKeyboardButton("📝 Изменить сообщение", callback_data="edit_msg")],
         [InlineKeyboardButton("⏱ Настройка таймингов", callback_data="timings")],
         [InlineKeyboardButton("🔍 Обновить список групп", callback_data="scan")],
         [InlineKeyboardButton("➕ Добавить группу", callback_data="add_grp"),
          InlineKeyboardButton("➖ Удалить группу", callback_data="del_grp")],
-        [InlineKeyboardButton(f"🤖 ИИ-ассистент ({ai_state})", callback_data="ai_menu")],
+        [InlineKeyboardButton(f"🧠 ИИ-ассистент ({ai_state})", callback_data="ai_menu")],
+        [InlineKeyboardButton(f"🤖 Автоответчик ({ar_state})", callback_data="ar_menu")],
         [InlineKeyboardButton("📊 Статус и статистика", callback_data="status")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -518,19 +650,24 @@ def groups_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+# ---- ИИ ----
+
 def ai_menu_kb() -> InlineKeyboardMarkup:
     ai = STATE.get("ai_assistant") or {}
     enabled = ai.get("enabled", False)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔴 Выключить" if enabled else "🟢 Включить", callback_data="ai_toggle")],
+        [InlineKeyboardButton("🔴 Выключить ИИ" if enabled else "🟢 Включить ИИ",
+                              callback_data="ai_toggle")],
         [InlineKeyboardButton("📝 Стиль общения", callback_data="ai_style")],
-        [InlineKeyboardButton("👤 Информация о тебе", callback_data="ai_about")],
+        [InlineKeyboardButton("👤 Информация обо мне", callback_data="ai_about")],
         [InlineKeyboardButton("💼 Описание работы", callback_data="ai_work")],
         [InlineKeyboardButton("🚫 Запрещённые темы", callback_data="ai_forbidden")],
         [InlineKeyboardButton("📋 Показать полный промпт", callback_data="ai_show_prompt")],
         [InlineKeyboardButton("♻️ Сбросить промпт к дефолту", callback_data="ai_reset_prompt")],
-        [InlineKeyboardButton(f"⏱ Офлайн-порог: {ai.get('inactive_minutes', 5)} мин",
+        [InlineKeyboardButton(f"⏱ Неактивность: {ai.get('inactive_minutes', 5)} мин",
                               callback_data="ai_inactive")],
+        [InlineKeyboardButton(f"📋 Приостановленные ({len(ai.get('paused_users') or [])})",
+                              callback_data="ai_paused")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
     ])
 
@@ -539,18 +676,86 @@ def ai_menu_text() -> str:
     ai = STATE.get("ai_assistant") or {}
     paused = len(ai.get("paused_users") or [])
     return (
-        "🤖 ИИ-ассистент (DeepSeek)\n"
+        "🧠 ИИ-ассистент (DeepSeek)\n"
         f"• Статус: {'🟢 вкл' if ai.get('enabled') else '🔴 выкл'}\n"
-        f"• Офлайн-порог: {ai.get('inactive_minutes', 5)} мин\n"
+        f"• Неактивность: {ai.get('inactive_minutes', 5)} мин\n"
         f"• Ответов ИИ: {STATE['stats'].get('ai_replies', 0)}\n"
+        f"• Передач админу: {STATE['stats'].get('ai_fallbacks', 0)}\n"
         f"• Приостановлено диалогов: {paused}\n\n"
         "Настрой разделы ниже — они собираются в один системный промпт."
     )
 
 
+def ai_paused_kb() -> InlineKeyboardMarkup:
+    ai = STATE.get("ai_assistant") or {}
+    rows = []
+    for uid in (ai.get("paused_users") or [])[:25]:
+        rows.append([InlineKeyboardButton(f"▶️ Возобновить {uid}", callback_data=f"ai_resume:{uid}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="ai_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ---- Автоответчик ----
+
+def autoreply_menu_kb() -> InlineKeyboardMarkup:
+    ar = STATE.get("autoreply") or {}
+    enabled = ar.get("enabled", False)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔴 Выключить" if enabled else "🟢 Включить",
+                              callback_data="ar_toggle")],
+        [InlineKeyboardButton("📝 Шаблон для новых", callback_data="ar_first")],
+        [InlineKeyboardButton("📝 Шаблон для знакомых", callback_data="ar_known")],
+        [InlineKeyboardButton(f"⏱ Неактивность: {ar.get('inactive_minutes', 5)} мин",
+                              callback_data="ar_inactive")],
+        [InlineKeyboardButton(f"⏳ Cooldown: {ar.get('cooldown_minutes', 60)} мин",
+                              callback_data="ar_cooldown")],
+        [InlineKeyboardButton("♻️ Сбросить список знакомых", callback_data="ar_reset_known")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
+    ])
+
+
+def autoreply_menu_text() -> str:
+    ar = STATE.get("autoreply") or {}
+    tf = (ar.get("template_first") or "").strip()
+    tk = (ar.get("template_known") or "").strip()
+    return (
+        "🤖 Автоответчик\n"
+        f"• Статус: {'🟢 вкл' if ar.get('enabled') else '🔴 выкл'}\n"
+        f"• Неактивность: {ar.get('inactive_minutes', 5)} мин\n"
+        f"• Cooldown: {ar.get('cooldown_minutes', 60)} мин\n"
+        f"• Знакомых: {len(ar.get('known_users') or [])}\n\n"
+        f"📩 Шаблон для новых:\n{tf if tf else '— (не задан)'}\n\n"
+        f"📩 Шаблон для знакомых:\n{tk if tk else '— (не задан)'}\n\n"
+        "Автоответчик срабатывает, если ИИ выключен или не смог ответить."
+    )
+
+
 # ---------------------------------------------------------------------------
-# Логин юзербота
+# Логин юзербота / заполнение known_users
 # ---------------------------------------------------------------------------
+
+async def populate_known_users():
+    global ME_ID
+    if not USERBOT_READY:
+        return
+    ar = STATE.get("autoreply") or {}
+    if ar.get("known_users_loaded"):
+        return
+    log.info("Загружаю известных юзеров из диалогов…")
+    known = set(ar.get("known_users") or [])
+    try:
+        async for dialog in user_client.get_dialogs():
+            c = dialog.chat
+            if c and c.type == enums.ChatType.PRIVATE and c.id > 0:
+                known.add(str(c.id))
+    except Exception as e:
+        log.warning(f"Не смог получить диалоги: {e}")
+    ar["known_users"] = list(known)
+    ar["known_users_loaded"] = True
+    STATE["autoreply"] = ar
+    save_json(STATE_FILE, STATE)
+    log.info(f"Известных юзеров: {len(known)}")
+
 
 async def after_userbot_login(message=None):
     global USERBOT_READY, ME_ID
@@ -566,6 +771,9 @@ async def after_userbot_login(message=None):
             log.info("Dispatcher юзербота запущен.")
         except Exception as e:
             log.warning(f"Не удалось запустить dispatcher: {e}")
+
+        asyncio.create_task(populate_known_users())
+
         if message is not None:
             await message.reply(
                 f"✅ Юзербот: {me.first_name} (@{me.username or '—'}).",
@@ -584,6 +792,7 @@ def register_user_handlers(client: Client) -> None:
 
     @client.on_message(filters.private & filters.outgoing)
     async def on_outgoing(client, message):
+        """Обновляем активность владельца и метим собеседника как 'взял в свои руки'."""
         try:
             chat = message.chat
             if not chat or not chat.id or chat.id == ME_ID:
@@ -591,24 +800,32 @@ def register_user_handlers(client: Client) -> None:
             if chat.type != enums.ChatType.PRIVATE:
                 return
 
-            ai = STATE.get("ai_assistant") or {}
-            ai["last_user_activity"] = datetime.now().isoformat(timespec="seconds")
+            text = (message.text or "").strip()
 
-            paused = set(ai.get("paused_users") or [])
-            paused.add(str(chat.id))
-            ai["paused_users"] = list(paused)
-            log.info(f"[AI PAUSED] Владелец вмешался в диалог с {chat.id}")
+            # Если это сообщение отправил наш бот (ИИ или автоответчик) — не считаем
+            # это вмешательством владельца.
+            if _was_sent_by_bot(chat.id, text):
+                return
 
-            STATE["ai_assistant"] = ai
-            save_json(STATE_FILE, STATE)
+            # Настоящий исходящий от владельца:
+            _mark_owner_activity()
+            _mark_known_ar(chat.id)
+            _pause_ai(chat.id)
+            log.info(f"[OWNER ACTIVE] Владелец написал {chat.id} — ИИ приостановлен")
+
+            # Сохраняем в историю для контекста ИИ
+            if text:
+                await db_add_message(chat.id, "assistant", text)
         except Exception as e:
             log.exception(f"on_outgoing: {e}")
 
     @client.on_message(filters.private & filters.incoming)
     async def on_incoming(client, message):
+        """Приоритет: ИИ → автоответчик → передача владельцу."""
         try:
             if not USERBOT_READY:
                 return
+
             user = message.from_user
             if not user or user.is_bot or user.is_deleted:
                 return
@@ -618,22 +835,17 @@ def register_user_handlers(client: Client) -> None:
                 return
 
             ai = STATE.get("ai_assistant") or {}
-            if not ai.get("enabled"):
+            ar = STATE.get("autoreply") or {}
+            if not ai.get("enabled") and not ar.get("enabled"):
                 return
 
-            if not _is_owner_inactive_ai():
-                return
-
-            if str(user.id) in (ai.get("paused_users") or []):
-                return
-
-            # Голосовое -> уведомление
+            # Голосовые — только уведомление
             if message.voice or message.video_note or message.audio:
                 try:
                     await bot_client.send_message(
                         CFG["admin_id"],
-                        f"🔔 Клиент {user.first_name} (@{user.username or '—'}, id={user.id}) "
-                        f"прислал голосовое. Ответь сам."
+                        f"🔔 Клиент {user.first_name} (@{user.username or '—'}, "
+                        f"id={user.id}) прислал голосовое. Ответь сам."
                     )
                 except Exception:
                     pass
@@ -645,30 +857,44 @@ def register_user_handlers(client: Client) -> None:
 
             await db_add_message(user.id, "user", text)
 
-            reply = await ai_generate_reply(user.id, text)
-            if not reply:
-                try:
-                    await bot_client.send_message(
-                        CFG["admin_id"],
-                        f"❓ ИИ не смог ответить клиенту {user.first_name} (@{user.username or '—'}, id={user.id}).\n"
-                        f"Сообщение: {text[:200]}\nОтветь сам или нажми /pause {user.id}"
-                    )
-                except Exception:
-                    pass
-                return
+            # ---- 1. Пробуем ИИ ----
+            ai_tried = False
+            if ai.get("enabled") and not _is_paused_ai(user.id) and _owner_inactive_ai():
+                ai_tried = True
+                reply = await ai_generate_reply(user.id, text)
+                if reply:
+                    await _send_as_userbot(user.id, reply)
+                    STATE["stats"]["ai_replies"] = STATE["stats"].get("ai_replies", 0) + 1
+                    save_json(STATE_FILE, STATE)
+                    log.info(f"[AI REPLY] → {user.id}: {reply[:80]}")
+                    return
+                # ИИ не справился — пауза для этого юзера + уведомление владельцу
+                _pause_ai(user.id)
+                STATE["stats"]["ai_fallbacks"] = STATE["stats"].get("ai_fallbacks", 0) + 1
+                save_json(STATE_FILE, STATE)
+                await notify_ai_fallback(user.id, text, "DeepSeek не ответил")
 
-            await user_client.send_message(user.id, reply)
-            await db_add_message(user.id, "assistant", reply)
+            # ---- 2. Автоответчик (если включён) ----
+            if ar.get("enabled") and _owner_inactive_ar() and _cooldown_ok_ar(user.id):
+                known = _is_known_ar(user.id)
+                template = (ar.get("template_known") if known else ar.get("template_first")) or ""
+                template = template.strip()
+                if template:
+                    await _send_as_userbot(user.id, template)
+                    _mark_known_ar(user.id)
+                    _set_cooldown_ar(user.id)
+                    STATE["stats"]["autoreplies"] = STATE["stats"].get("autoreplies", 0) + 1
+                    save_json(STATE_FILE, STATE)
+                    log.info(f"[AUTOREPLY] → {user.id} ({'known' if known else 'new'})")
+                    return
 
-            STATE["stats"]["ai_replies"] = STATE["stats"].get("ai_replies", 0) + 1
-            save_json(STATE_FILE, STATE)
-            log.info(f"[AI REPLY] → {user.id}: {reply[:80]}")
+            # Если ИИ был выключен и автоответчик выключен/на cooldown — ничего не делаем.
 
         except FloodWait as fw:
-            log.warning(f"FloodWait ИИ: {fw.value}s")
+            log.warning(f"FloodWait: {fw.value}s")
             await asyncio.sleep(fw.value + 2)
         except Exception as e:
-            log.exception(f"ИИ-ответ: {e}")
+            log.exception(f"on_incoming: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -702,52 +928,11 @@ def register_handlers(bot: Client) -> None:
         pending.pop(message.from_user.id, None)
         await message.reply("✅ Авторизация успешна.", reply_markup=main_menu_kb())
 
-    @bot.on_message(filters.command("pause") & filters.private)
-    async def cmd_pause(client, message):
+    @bot.on_message(filters.command("panel") & filters.private)
+    async def cmd_panel(client, message):
         if message.from_user.id != CFG["admin_id"] or message.from_user.id not in authed:
             return
-        parts = (message.text or "").split(maxsplit=1)
-        if len(parts) < 2:
-            await message.reply("Использование: `/pause <user_id>` или `/pause @username`",
-                                parse_mode=enums.ParseMode.MARKDOWN)
-            return
-        target = parts[1].strip()
-        uid = None
-        try:
-            uid = int(target)
-        except ValueError:
-            try:
-                chat = await user_client.get_chat(target)
-                uid = chat.id
-            except Exception as e:
-                await message.reply(f"❌ Не смог найти: {e}")
-                return
-        ai = STATE.setdefault("ai_assistant", _default_ai())
-        paused = set(ai.get("paused_users") or [])
-        paused.add(str(uid))
-        ai["paused_users"] = list(paused)
-        save_json(STATE_FILE, STATE)
-        await message.reply(f"⏸ ИИ приостановлен для {uid}. Когда захочешь — /resume {uid}")
-
-    @bot.on_message(filters.command("resume") & filters.private)
-    async def cmd_resume(client, message):
-        if message.from_user.id != CFG["admin_id"] or message.from_user.id not in authed:
-            return
-        parts = (message.text or "").split(maxsplit=1)
-        if len(parts) < 2:
-            await message.reply("Использование: `/resume <user_id>`", parse_mode=enums.ParseMode.MARKDOWN)
-            return
-        try:
-            uid = str(int(parts[1].strip()))
-        except ValueError:
-            await message.reply("❌ user_id должен быть числом.")
-            return
-        ai = STATE.setdefault("ai_assistant", _default_ai())
-        paused = set(ai.get("paused_users") or [])
-        paused.discard(uid)
-        ai["paused_users"] = list(paused)
-        save_json(STATE_FILE, STATE)
-        await message.reply(f"▶️ ИИ снова общается с {uid}.")
+        await message.reply("🎛 Панель:", reply_markup=main_menu_kb())
 
     @bot.on_message(filters.command("cancel") & filters.private)
     async def cmd_cancel(client, message):
@@ -755,6 +940,41 @@ def register_handlers(bot: Client) -> None:
             return
         pending.pop(message.from_user.id, None)
         await message.reply("Отменено.", reply_markup=main_menu_kb())
+
+    @bot.on_message(filters.command("pause") & filters.private)
+    async def cmd_pause(client, message):
+        if message.from_user.id != CFG["admin_id"] or message.from_user.id not in authed:
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2:
+            await message.reply("Использование: `/pause <user_id>`",
+                                parse_mode=enums.ParseMode.MARKDOWN)
+            return
+        try:
+            uid = int(parts[1].strip())
+        except ValueError:
+            await message.reply("❌ user_id должен быть числом.")
+            return
+        _pause_ai(uid)
+        await message.reply(f"⏸ ИИ приостановлен для {uid}. Возобновить: `/resume {uid}`",
+                            parse_mode=enums.ParseMode.MARKDOWN)
+
+    @bot.on_message(filters.command("resume") & filters.private)
+    async def cmd_resume(client, message):
+        if message.from_user.id != CFG["admin_id"] or message.from_user.id not in authed:
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2:
+            await message.reply("Использование: `/resume <user_id>`",
+                                parse_mode=enums.ParseMode.MARKDOWN)
+            return
+        try:
+            uid = int(parts[1].strip())
+        except ValueError:
+            await message.reply("❌ user_id должен быть числом.")
+            return
+        _unpause_ai(uid)
+        await message.reply(f"▶️ ИИ снова общается с {uid}.")
 
     @bot.on_message(filters.command("login") & filters.private)
     async def cmd_login(client, message):
@@ -782,6 +1002,7 @@ def register_handlers(bot: Client) -> None:
             return
         data = cb.data or ""
         try:
+            # ---------- главное меню ----------
             if data == "menu":
                 await cb.message.edit_text("🎛 Панель управления:", reply_markup=main_menu_kb())
 
@@ -844,6 +1065,7 @@ def register_handlers(bot: Client) -> None:
                 save_json(STATE_FILE, STATE)
                 await cb.message.edit_text("🗑 Очищено.", reply_markup=main_menu_kb())
 
+            # ---------- тайминги ----------
             elif data == "timings":
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("⏱ Интервал круга (сек)", callback_data="set_interval")],
@@ -866,6 +1088,7 @@ def register_handlers(bot: Client) -> None:
                 pending[uid] = {"action": "set_delay_max"}
                 await cb.message.edit_text("Макс. задержка.\n/cancel")
 
+            # ---------- группы ----------
             elif data == "scan":
                 if not USERBOT_READY:
                     await cb.answer("Юзербот не готов.", show_alert=True)
@@ -922,16 +1145,19 @@ def register_handlers(bot: Client) -> None:
                 pending[uid] = {"action": "ai_style"}
                 await cb.message.edit_text(
                     "📝 Опиши стиль общения ИИ. Например:\n"
-                    "«Дружелюбно, неформально, с лёгкими эмодзи, короткие сообщения»\n\nОтправь текст:")
+                    "«Дружелюбно, неформально, короткие сообщения, лёгкие эмодзи»\n/cancel")
             elif data == "ai_about":
                 pending[uid] = {"action": "ai_about"}
-                await cb.message.edit_text("👤 Напиши информацию о себе (имя, чем занимаешься):")
+                await cb.message.edit_text(
+                    "👤 Напиши о себе (имя, чем занимаешься, как обращаться):\n/cancel")
             elif data == "ai_work":
                 pending[uid] = {"action": "ai_work"}
-                await cb.message.edit_text("💼 Опиши суть работы/продукта (что продаёшь, цены, схему):")
+                await cb.message.edit_text(
+                    "💼 Опиши суть работы/продукта (что продаёшь, цены, схему):\n/cancel")
             elif data == "ai_forbidden":
                 pending[uid] = {"action": "ai_forbidden"}
-                await cb.message.edit_text("🚫 Что ИИ НИКОГДА не должен говорить/делать:")
+                await cb.message.edit_text(
+                    "🚫 Что ИИ НИКОГДА не должен говорить/делать:\n/cancel")
             elif data == "ai_show_prompt":
                 prompt = (STATE.get("ai_assistant") or {}).get("system_prompt") or DEFAULT_SYSTEM_PROMPT
                 if len(prompt) > 3500:
@@ -951,11 +1177,65 @@ def register_handlers(bot: Client) -> None:
                 pending[uid] = {"action": "ai_inactive"}
                 await cb.message.edit_text(
                     f"Через сколько минут твоего отсутствия включать ИИ? "
-                    f"(сейчас {(STATE.get('ai_assistant') or {}).get('inactive_minutes', 5)})")
+                    f"(сейчас {(STATE.get('ai_assistant') or {}).get('inactive_minutes', 5)})\n/cancel")
+            elif data == "ai_paused":
+                ai = STATE.get("ai_assistant") or {}
+                if not (ai.get("paused_users") or []):
+                    await cb.answer("Список пуст.", show_alert=True)
+                    return
+                await cb.message.edit_text(
+                    "📋 Приостановленные диалоги (ИИ не отвечает):\n"
+                    "Нажми, чтобы возобновить.",
+                    reply_markup=ai_paused_kb())
+            elif data.startswith("ai_resume:"):
+                try:
+                    target = int(data.split(":", 1)[1])
+                except ValueError:
+                    await cb.answer("Ошибка.")
+                    return
+                _unpause_ai(target)
+                await cb.answer(f"▶️ {target} возобновлён.")
+                await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
 
+            # ---------- Автоответчик ----------
+            elif data == "ar_menu":
+                await cb.message.edit_text(autoreply_menu_text(), reply_markup=autoreply_menu_kb())
+            elif data == "ar_toggle":
+                ar = STATE.setdefault("autoreply", _default_autoreply())
+                ar["enabled"] = not ar.get("enabled", False)
+                save_json(STATE_FILE, STATE)
+                await cb.message.edit_text(autoreply_menu_text(), reply_markup=autoreply_menu_kb())
+            elif data == "ar_first":
+                pending[uid] = {"action": "ar_first"}
+                await cb.message.edit_text("Отправь текст шаблона для НОВЫХ собеседников.\n/cancel")
+            elif data == "ar_known":
+                pending[uid] = {"action": "ar_known"}
+                await cb.message.edit_text("Отправь текст шаблона для ЗНАКОМЫХ собеседников.\n/cancel")
+            elif data == "ar_inactive":
+                pending[uid] = {"action": "ar_inactive"}
+                await cb.message.edit_text(
+                    f"Через сколько минут отсутствия владельца включать автоответ? "
+                    f"(сейчас {STATE['autoreply'].get('inactive_minutes', 5)})\n/cancel")
+            elif data == "ar_cooldown":
+                pending[uid] = {"action": "ar_cooldown"}
+                await cb.message.edit_text(
+                    f"Cooldown на одного собеседника в минутах "
+                    f"(сейчас {STATE['autoreply'].get('cooldown_minutes', 60)})\n/cancel")
+            elif data == "ar_reset_known":
+                ar = STATE.setdefault("autoreply", _default_autoreply())
+                ar["known_users"] = []
+                ar["known_users_loaded"] = False
+                save_json(STATE_FILE, STATE)
+                await cb.message.edit_text(
+                    "♻️ Список знакомых сброшен. Он перезагрузится из диалогов "
+                    "(если юзербот подключён).",
+                    reply_markup=autoreply_menu_kb())
+
+            # ---------- статус ----------
             elif data == "status":
                 s = STATE["stats"]
                 ai = STATE.get("ai_assistant") or {}
+                ar = STATE.get("autoreply") or {}
                 txt = (
                     f"📊 Статистика\n"
                     f"• Юзербот: {'🟢' if USERBOT_READY else '🔴'}\n"
@@ -964,16 +1244,25 @@ def register_handlers(bot: Client) -> None:
                     f"• Отправлено: {s.get('sent', 0)}\n"
                     f"• Ошибок: {s.get('errors', 0)}\n"
                     f"• Кругов: {s.get('rounds', 0)}\n\n"
-                    f"🤖 ИИ-ассистент: {'🟢' if ai.get('enabled') else '🔴'}\n"
+                    f"🧠 ИИ-ассистент: {'🟢' if ai.get('enabled') else '🔴'}\n"
                     f"• Ответов ИИ: {s.get('ai_replies', 0)}\n"
+                    f"• Передач владельцу: {s.get('ai_fallbacks', 0)}\n"
                     f"• Приостановлено: {len(ai.get('paused_users') or [])}\n"
-                    f"• Офлайн-порог: {ai.get('inactive_minutes', 5)} мин"
+                    f"• Неактивность: {ai.get('inactive_minutes', 5)} мин\n\n"
+                    f"🤖 Автоответчик: {'🟢' if ar.get('enabled') else '🔴'}\n"
+                    f"• Автоответов: {s.get('autoreplies', 0)}\n"
+                    f"• Неактивность: {ar.get('inactive_minutes', 5)} мин\n"
+                    f"• Cooldown: {ar.get('cooldown_minutes', 60)} мин"
                 )
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Обновить", callback_data="status")],
+                    [InlineKeyboardButton("🗑 Очистить историю БД (30д)", callback_data="db_cleanup")],
                     [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
                 ])
                 await cb.message.edit_text(txt, reply_markup=kb)
+            elif data == "db_cleanup":
+                await db_cleanup(30)
+                await cb.answer("✅ История за 30 дней очищена.", show_alert=True)
             else:
                 await cb.answer("Неизвестная команда.")
         except Exception as e:
@@ -994,6 +1283,7 @@ def register_handlers(bot: Client) -> None:
         action = act.get("action")
         text = (message.text or "").strip()
         try:
+            # ---- логин ----
             if action == "login_phone":
                 phone = text
                 if not phone.startswith("+"):
@@ -1048,6 +1338,7 @@ def register_handlers(bot: Client) -> None:
                     return
                 await after_userbot_login(message)
 
+            # ---- сообщение рассылки ----
             elif action == "set_text":
                 if not text:
                     pending[uid] = {"action": "set_text"}
@@ -1078,6 +1369,7 @@ def register_handlers(bot: Client) -> None:
                 await message.reply(f"✅ Медиа сохранено ({STATE['media_type']}).",
                     reply_markup=main_menu_kb())
 
+            # ---- группы ----
             elif action == "add_group":
                 ref = parse_chat_ref(text)
                 if ref is None:
@@ -1101,6 +1393,7 @@ def register_handlers(bot: Client) -> None:
                 save_json(STATE_FILE, STATE)
                 await message.reply(f"✅ {title} ({gid})", reply_markup=main_menu_kb())
 
+            # ---- тайминги ----
             elif action == "set_interval":
                 try:
                     v = int(text)
@@ -1134,34 +1427,35 @@ def register_handlers(bot: Client) -> None:
                     pending[uid] = {"action": "set_delay_max"}
                     await message.reply(f"❌ {e}")
 
+            # ---- ИИ ----
             elif action in ("ai_style", "ai_about", "ai_work", "ai_forbidden"):
                 ai = STATE.setdefault("ai_assistant", _default_ai())
                 parts = ai.setdefault("prompt_parts", {})
                 parts[action] = message.text or ""
                 ai["prompt_parts"] = parts
 
-                style = parts.get("ai_style", "").strip()
-                about = parts.get("ai_about", "").strip()
-                work = parts.get("ai_work", "").strip()
-                forb = parts.get("ai_forbidden", "").strip()
+                style = (parts.get("ai_style") or "").strip()
+                about = (parts.get("ai_about") or "").strip()
+                work = (parts.get("ai_work") or "").strip()
+                forb = (parts.get("ai_forbidden") or "").strip()
 
-                prompt_lines = []
+                lines = []
                 if style:
-                    prompt_lines.append(f"СТИЛЬ ОБЩЕНИЯ:\n{style}")
+                    lines.append(f"СТИЛЬ ОБЩЕНИЯ:\n{style}")
                 if about:
-                    prompt_lines.append(f"ИНФОРМАЦИЯ ОБО МНЕ:\n{about}")
+                    lines.append(f"ИНФОРМАЦИЯ ОБО МНЕ:\n{about}")
                 if work:
-                    prompt_lines.append(f"СУТЬ РАБОТЫ:\n{work}")
+                    lines.append(f"СУТЬ РАБОТЫ:\n{work}")
                 if forb:
-                    prompt_lines.append(f"ЗАПРЕЩЕНО:\n{forb}")
-                prompt_lines.append(
+                    lines.append(f"ЗАПРЕЩЕНО:\n{forb}")
+                lines.append(
                     "ОБЩИЕ ПРАВИЛА:\n"
                     "- Пиши как живой человек, не как робот.\n"
                     "- Не пиши слишком длинные или слишком короткие сообщения.\n"
                     "- Если клиент запутан или сложный вопрос — передай владельцу.\n"
                     "- Никогда не говори, что ты бот или ИИ."
                 )
-                ai["system_prompt"] = "\n\n".join(prompt_lines)
+                ai["system_prompt"] = "\n\n".join(lines)
                 save_json(STATE_FILE, STATE)
                 await message.reply("✅ Сохранено. Промпт обновлён.",
                                     reply_markup=ai_menu_kb())
@@ -1172,10 +1466,47 @@ def register_handlers(bot: Client) -> None:
                     if v < 1: raise ValueError("мин. 1")
                     STATE["ai_assistant"]["inactive_minutes"] = v
                     save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ Офлайн-порог: {v} мин.",
+                    await message.reply(f"✅ Неактивность ИИ: {v} мин.",
                                         reply_markup=ai_menu_kb())
                 except Exception as e:
                     pending[uid] = {"action": "ai_inactive"}
+                    await message.reply(f"❌ {e}")
+
+            # ---- Автоответчик ----
+            elif action == "ar_first":
+                STATE.setdefault("autoreply", _default_autoreply())["template_first"] = message.text or ""
+                save_json(STATE_FILE, STATE)
+                await message.reply("✅ Шаблон для новых сохранён.",
+                                    reply_markup=autoreply_menu_kb())
+
+            elif action == "ar_known":
+                STATE.setdefault("autoreply", _default_autoreply())["template_known"] = message.text or ""
+                save_json(STATE_FILE, STATE)
+                await message.reply("✅ Шаблон для знакомых сохранён.",
+                                    reply_markup=autoreply_menu_kb())
+
+            elif action == "ar_inactive":
+                try:
+                    v = int(text)
+                    if v < 1: raise ValueError("мин. 1")
+                    STATE["autoreply"]["inactive_minutes"] = v
+                    save_json(STATE_FILE, STATE)
+                    await message.reply(f"✅ Неактивность автоответчика: {v} мин.",
+                                        reply_markup=autoreply_menu_kb())
+                except Exception as e:
+                    pending[uid] = {"action": "ar_inactive"}
+                    await message.reply(f"❌ {e}")
+
+            elif action == "ar_cooldown":
+                try:
+                    v = int(text)
+                    if v < 0: raise ValueError("мин. 0")
+                    STATE["autoreply"]["cooldown_minutes"] = v
+                    save_json(STATE_FILE, STATE)
+                    await message.reply(f"✅ Cooldown: {v} мин.",
+                                        reply_markup=autoreply_menu_kb())
+                except Exception as e:
+                    pending[uid] = {"action": "ar_cooldown"}
                     await message.reply(f"❌ {e}")
 
         except Exception as e:
@@ -1212,7 +1543,7 @@ async def main():
         except Exception as e:
             log.warning(f"DeepSeek не инициализирован: {e}")
     else:
-        log.warning("DEEPSEEK_API_KEY не задан — ИИ не будет работать.")
+        log.warning("DEEPSEEK_API_KEY не задан — ИИ работать не будет.")
 
     # --- Юзербот ---
     user_client = Client(name=SESSION_USER, api_id=CFG["api_id"], api_hash=CFG["api_hash"])
@@ -1240,6 +1571,7 @@ async def main():
             ME_ID = me.id
             USERBOT_READY = True
             log.info(f"✅ Юзербот авторизован: {me.first_name} (@{me.username}) id={me.id}")
+            asyncio.create_task(populate_known_users())
     except Exception as e:
         log.warning(f"Юзербот не авторизован: {e}")
         try:
@@ -1252,14 +1584,16 @@ async def main():
     # --- Приветствие ---
     try:
         ai_status = "🟢 вкл" if (STATE.get("ai_assistant") or {}).get("enabled") else "🔴 выкл"
+        ar_status = "🟢 вкл" if (STATE.get("autoreply") or {}).get("enabled") else "🔴 выкл"
         ds_status = "🟢 подключён" if deepseek_client else "🔴 нет ключа"
-        status = "🟢 готов" if USERBOT_READY else "🔴 не авторизован (/login)"
+        ub_status = "🟢 готов" if USERBOT_READY else "🔴 не авторизован (/login)"
         await bot_client.send_message(
             CFG["admin_id"],
             f"🤖 Автопостер запущен.\n"
-            f"Юзербот: {status}\n"
-            f"DeepSeek: {ds_status}\n"
-            f"ИИ-ассистент: {ai_status}\n"
+            f"• Юзербот: {ub_status}\n"
+            f"• DeepSeek: {ds_status}\n"
+            f"• ИИ-ассистент: {ai_status}\n"
+            f"• Автоответчик: {ar_status}\n"
             f"Для доступа: `/auth <PIN>`",
             parse_mode=enums.ParseMode.MARKDOWN)
     except Exception as e:
