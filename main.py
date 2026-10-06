@@ -1,13 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Автопостер + автоответчик + ИИ-ассистент (Cloudflare Workers AI).
-Сессии: /data/userbot.session, /data/control_bot.session
-История диалогов: /data/chat_history.db (SQLite)
-
-Приоритет ответа клиенту:
-    1) ИИ (Cloudflare Workers AI) — если включён, владелец неактивен (или тест-режим), юзер не на паузе
-    2) Автоответчик — если включён, владелец неактивен, cooldown ок
-    3) Передача клиента владельцу — если ИИ не смог ответить
++ Имитация набора текста (typing) при отправке ответов ИИ/автоответчика.
 """
 
 import asyncio
@@ -77,14 +71,13 @@ ME_ID: int = 0
 authed: set = set()
 pending: dict = {}
 BOT_LAST_SENT: dict = {}
+await_count_cache = 0
 
 # ---------------------------------------------------------------------------
-# Утилита очистки строк от пробелов/переносов
+# Утилиты
 # ---------------------------------------------------------------------------
 
 def clean_secret(s) -> str:
-    """Удаляет ВСЕ пробелы, табы, переносы строк из строки.
-    Нужно для токенов/ID, которые пользователь копирует из браузера."""
     if s is None:
         return ""
     return "".join(str(s).split())
@@ -106,6 +99,15 @@ async def db_init():
             )
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_user_id ON messages(user_id)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ai_examples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_msg TEXT NOT NULL,
+                bad_reply TEXT,
+                good_reply TEXT NOT NULL,
+                timestamp TEXT NOT NULL
+            )
+        """)
         await db.commit()
 
 
@@ -134,6 +136,65 @@ async def db_get_history(user_id: int, limit: int = 30) -> list:
     except Exception as e:
         log.error(f"DB history error: {e}")
         return []
+
+
+async def db_get_last_user_msg(user_id: int):
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            async with db.execute(
+                "SELECT content FROM messages WHERE user_id = ? AND role = 'user' "
+                "ORDER BY id DESC LIMIT 1", (user_id,)) as cursor:
+                row = await cursor.fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+async def db_save_example(user_msg: str, bad_reply: str, good_reply: str):
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "INSERT INTO ai_examples (user_msg, bad_reply, good_reply, timestamp) "
+                "VALUES (?, ?, ?, ?)",
+                (user_msg or "", bad_reply or "", good_reply,
+                 datetime.now().isoformat(timespec="seconds")))
+            await db.execute(
+                "DELETE FROM ai_examples WHERE id NOT IN "
+                "(SELECT id FROM ai_examples ORDER BY id DESC LIMIT 200)")
+            await db.commit()
+    except Exception as e:
+        log.error(f"DB save example error: {e}")
+
+
+async def db_get_examples(limit: int = 5) -> list:
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            async with db.execute(
+                "SELECT user_msg, good_reply FROM ai_examples ORDER BY id DESC LIMIT ?",
+                (limit,)) as cursor:
+                rows = await cursor.fetchall()
+        return [{"user_msg": r[0], "good_reply": r[1]} for r in rows]
+    except Exception:
+        return []
+
+
+async def db_count_examples() -> int:
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            async with db.execute("SELECT COUNT(*) FROM ai_examples") as cursor:
+                row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+async def db_clear_examples():
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute("DELETE FROM ai_examples")
+            await db.commit()
+    except Exception as e:
+        log.error(f"DB clear examples error: {e}")
 
 
 async def db_cleanup(days: int = 30):
@@ -205,7 +266,7 @@ def cfg_ok(cfg: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Дефолтный промпт ИИ
+# Дефолтный промпт
 # ---------------------------------------------------------------------------
 
 DEFAULT_SYSTEM_PROMPT = """Ты — Алексей (можно Леха), менеджер по продажам. Общаешься с потенциальными клиентами в Telegram.
@@ -229,10 +290,10 @@ DEFAULT_SYSTEM_PROMPT = """Ты — Алексей (можно Леха), мен
 5. Мягко подводи к покупке.
 
 ЗАПРЕЩЕНО:
-- Называть точные цены без согласования (можешь сказать "около 14$").
+- Называть точные цены без согласования.
 - Обещать конкретные сроки или доход.
 - Давить на клиента.
-- Говорить, что ты бот или ИИ. Ты — Алексей, живой человек.
+- Говорить, что ты бот или ИИ.
 - Отвечать на голосовые сообщения (передай владельцу).
 """
 
@@ -244,7 +305,7 @@ DEFAULT_SYSTEM_PROMPT = """Ты — Алексей (можно Леха), мен
 def _default_ai() -> dict:
     return {
         "enabled": False,
-        "test_mode": False,               # 🧪 тест: отвечать сразу, без ожидания неактивности
+        "test_mode": False,
         "inactive_minutes": 5,
         "system_prompt": DEFAULT_SYSTEM_PROMPT,
         "prompt_parts": {},
@@ -252,6 +313,15 @@ def _default_ai() -> dict:
         "cf_account_id": "",
         "cf_api_token": "",
         "cf_model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "rules": [],
+        "examples_enabled": True,
+        "examples_limit": 5,
+        "auto_examples_enabled": True,
+        # ---- Имитация набора ----
+        "typing_enabled": True,
+        "typing_min_delay": 1.5,
+        "typing_max_delay": 10.0,
+        "typing_cps": 12.0,     # символов в секунду
     }
 
 
@@ -300,12 +370,13 @@ def load_state() -> dict:
             merged.setdefault(k, v)
         st[key] = merged
 
-    # Чистим креды от возможного мусора (переносы, пробелы), если они там были сохранены
     ai = st.get("ai_assistant") or {}
     if ai.get("cf_account_id"):
         ai["cf_account_id"] = clean_secret(ai["cf_account_id"])
     if ai.get("cf_api_token"):
         ai["cf_api_token"] = clean_secret(ai["cf_api_token"])
+    if not isinstance(ai.get("rules"), list):
+        ai["rules"] = []
 
     if not isinstance(st.get("stats"), dict):
         st["stats"] = default_state()["stats"]
@@ -315,7 +386,7 @@ def load_state() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Утилиты
+# Прочие утилиты
 # ---------------------------------------------------------------------------
 
 def parse_chat_ref(text: str):
@@ -349,13 +420,11 @@ def _owner_inactive(minutes: int) -> bool:
 
 
 def _owner_inactive_ai() -> bool:
-    ai = STATE.get("ai_assistant") or {}
-    return _owner_inactive(int(ai.get("inactive_minutes", 5)))
+    return _owner_inactive(int((STATE.get("ai_assistant") or {}).get("inactive_minutes", 5)))
 
 
 def _owner_inactive_ar() -> bool:
-    ar = STATE.get("autoreply") or {}
-    return _owner_inactive(int(ar.get("inactive_minutes", 5)))
+    return _owner_inactive(int((STATE.get("autoreply") or {}).get("inactive_minutes", 5)))
 
 
 def _mark_owner_activity():
@@ -380,8 +449,7 @@ def _mark_known_ar(user_id: int):
 
 def _cooldown_ok_ar(user_id: int) -> bool:
     ar = STATE.get("autoreply") or {}
-    lr = ar.get("last_reply") or {}
-    last = lr.get(str(user_id))
+    last = (ar.get("last_reply") or {}).get(str(user_id))
     if not last:
         return True
     try:
@@ -427,7 +495,54 @@ def _was_sent_by_bot(user_id: int, text: str) -> bool:
     return BOT_LAST_SENT.get(user_id) == (text or "").strip()
 
 
-async def _send_as_userbot(user_id: int, text: str, save_to_db: bool = True):
+# ---------------------------------------------------------------------------
+# Имитация набора текста
+# ---------------------------------------------------------------------------
+
+async def simulate_typing(user_id: int, text: str) -> None:
+    """Показывает 'печатает…' столько, сколько занял бы реальный набор."""
+    ai = STATE.get("ai_assistant") or {}
+    if not ai.get("typing_enabled", True):
+        return
+    if not text:
+        return
+
+    try:
+        min_delay = float(ai.get("typing_min_delay", 1.5))
+        max_delay = float(ai.get("typing_max_delay", 10.0))
+        cps = float(ai.get("typing_cps", 12.0)) or 12.0
+    except Exception:
+        min_delay, max_delay, cps = 1.5, 10.0, 12.0
+
+    if max_delay < min_delay:
+        max_delay = min_delay
+
+    base = len(text) / cps
+    jitter = random.uniform(0.7, 1.3)
+    delay = base * jitter
+    delay = max(min_delay, min(max_delay, delay))
+
+    log.info(f"[TYPING] {user_id}: {delay:.1f}s ({len(text)} симв.)")
+
+    loop = asyncio.get_event_loop()
+    end_time = loop.time() + delay
+    try:
+        while loop.time() < end_time:
+            await user_client.send_chat_action(user_id, enums.ChatAction.TYPING)
+            remain = end_time - loop.time()
+            await asyncio.sleep(min(4.0, max(0.2, remain)))
+    except FloodWait as fw:
+        log.warning(f"[TYPING] FloodWait {fw.value}s")
+        await asyncio.sleep(fw.value + 1)
+    except Exception as e:
+        log.warning(f"[TYPING] {e}")
+
+
+async def _send_as_userbot(user_id: int, text: str, save_to_db: bool = True,
+                            with_typing: bool = True):
+    """Отправка от юзербота с (опциональной) имитацией набора."""
+    if with_typing:
+        await simulate_typing(user_id, text)
     _register_bot_sent(user_id, text)
     await user_client.send_message(user_id, text)
     if save_to_db:
@@ -447,30 +562,78 @@ CF_MODELS = [
 def _get_cf_creds():
     ai = STATE.get("ai_assistant") or {}
     account_id = clean_secret(
-        ai.get("cf_account_id") or CFG.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID") or ""
-    )
+        ai.get("cf_account_id") or CFG.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID") or "")
     api_token = clean_secret(
-        ai.get("cf_api_token") or CFG.get("cf_api_token") or os.getenv("CF_API_TOKEN") or ""
-    )
+        ai.get("cf_api_token") or CFG.get("cf_api_token") or os.getenv("CF_API_TOKEN") or "")
     return account_id, api_token
 
 
+async def build_system_prompt() -> str:
+    ai = STATE.get("ai_assistant") or {}
+    base = ai.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
+    parts = [base]
+
+    rules = ai.get("rules") or []
+    if rules:
+        rules_lines = "\n".join(f"- {r}" for r in rules)
+        parts.append(
+            "⚠️ ВАЖНЫЕ ПРАВИЛА ОТ ВЛАДЕЛЬЦА (соблюдай СТРОГО):\n" + rules_lines)
+
+    if ai.get("examples_enabled", True):
+        limit = int(ai.get("examples_limit", 5))
+        examples = await db_get_examples(limit=limit)
+        if examples:
+            ex_blocks = []
+            for ex in examples:
+                u = (ex.get("user_msg") or "").strip()
+                g = (ex.get("good_reply") or "").strip()
+                if u and g:
+                    ex_blocks.append(f"Клиент: {u}\nОтвет: {g}")
+            if ex_blocks:
+                parts.append(
+                    "📚 ПРИМЕРЫ ПРАВИЛЬНОГО СТИЛЯ (изучай манеру, НЕ копируй дословно):\n\n"
+                    + "\n\n".join(ex_blocks))
+
+    return "\n\n".join(parts)
+
+
+async def verify_cf_token() -> tuple:
+    _, api_token = _get_cf_creds()
+    if not api_token:
+        return False, "Токен не задан."
+    try:
+        url = "https://api.cloudflare.com/client/v4/user/tokens/verify"
+        headers = {"Authorization": f"Bearer {api_token}"}
+        async with http_session.get(url, headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            body = await resp.text()
+            try:
+                data = json.loads(body)
+            except Exception:
+                return False, f"HTTP {resp.status}: {body[:200]}"
+            if data.get("success"):
+                res = data.get("result") or {}
+                return True, f"✅ Токен активен (status: {res.get('status', 'unknown')})"
+            errs = data.get("errors") or []
+            msg = errs[0].get("message") if errs else body[:200]
+            return False, f"❌ Токен не принят: {msg}"
+    except asyncio.TimeoutError:
+        return False, "⏱ Таймаут."
+    except Exception as e:
+        return False, f"❌ Ошибка: {e}"
+
+
 async def ask_ai(user_id: int, user_message: str):
-    """Возвращает (reply | None, reason | None). reason='api_error' если временный сбой."""
     ai_cfg = STATE.get("ai_assistant") or {}
     if not ai_cfg.get("enabled"):
         return None, "disabled"
 
     account_id, api_token = _get_cf_creds()
     if not account_id or not api_token:
-        log.warning("[AI] Cloudflare: не заданы account_id или api_token")
         return None, "no_credentials"
 
-    model = clean_secret(ai_cfg.get("cf_model") or CFG.get("cf_model") or CF_MODELS[0])
-    if not model:
-        model = CF_MODELS[0]
-
-    system_prompt = ai_cfg.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
+    model = clean_secret(ai_cfg.get("cf_model") or CFG.get("cf_model") or CF_MODELS[0]) or CF_MODELS[0]
+    system_prompt = await build_system_prompt()
     history = await db_get_history(user_id, limit=30)
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -478,31 +641,21 @@ async def ask_ai(user_id: int, user_message: str):
     if not history or history[-1].get("content") != user_message:
         messages.append({"role": "user", "content": user_message})
 
-    headers = {
-        "Authorization": f"Bearer {api_token}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "messages": messages,
-        "max_tokens": 1024,
-        "temperature": 0.7,
-    }
+    headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
+    payload = {"messages": messages, "max_tokens": 1024, "temperature": 0.7}
 
     models_to_try = [model] + [m for m in CF_MODELS if m != model]
-
     last_error = None
+
     for m in models_to_try:
         url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{m}"
         try:
-            log.info(f"[AI] Запрос в Cloudflare ({m}) для {user_id}")
-            async with http_session.post(
-                url, json=payload, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=45),
-            ) as resp:
+            log.info(f"[AI] Запрос ({m}) для {user_id}")
+            async with http_session.post(url, json=payload, headers=headers,
+                                         timeout=aiohttp.ClientTimeout(total=45)) as resp:
                 status = resp.status
                 body = await resp.text()
                 if status == 429:
-                    log.warning(f"[AI] {m}: rate limit")
                     last_error = "rate_limit"
                     continue
                 if status != 200:
@@ -514,28 +667,21 @@ async def ask_ai(user_id: int, user_message: str):
                 try:
                     data = json.loads(body)
                 except Exception:
-                    log.error(f"[AI] Не распарсил JSON: {body[:300]}")
                     last_error = "bad_json"
                     continue
                 if not data.get("success"):
-                    errs = data.get("errors") or []
-                    log.error(f"[AI] {m} success=false: {errs}")
+                    log.error(f"[AI] {m} errors: {data.get('errors')}")
                     last_error = "api_error"
                     continue
                 reply = (data.get("result", {}).get("response") or "").strip()
                 if reply and len(reply) > 2:
-                    log.info(f"[AI] ✅ {m} ответ ({len(reply)} симв.)")
                     return reply, None
-                log.warning(f"[AI] {m} вернул пустой ответ")
                 last_error = "empty"
         except asyncio.TimeoutError:
-            log.warning(f"[AI] {m}: timeout")
             last_error = "timeout"
-            continue
         except Exception as e:
             log.exception(f"[AI] {m} exception: {e}")
             last_error = "exception"
-            continue
 
     return None, (last_error or "unknown")
 
@@ -554,26 +700,21 @@ async def notify_ai_fallback(user_id: int, user_message: str, reason: str = ""):
         await bot_client.send_message(
             CFG["admin_id"],
             f"⚠️ **ИИ не смог ответить клиенту**\n\n"
-            f"👤 {name}{username}\n"
-            f"🆔 `{user_id}`\n"
-            f"💬 Сообщение: {user_message[:300]}\n"
-            f"❓ Причина: {reason or 'неизвестно'}\n\n"
-            f"ИИ приостановлен для этого клиента. Возобновить: `/resume {user_id}`",
-            parse_mode=enums.ParseMode.MARKDOWN,
-        )
+            f"👤 {name}{username}\n🆔 `{user_id}`\n"
+            f"💬 {user_message[:300]}\n❓ Причина: {reason}\n\n"
+            f"Возобновить: `/resume {user_id}`",
+            parse_mode=enums.ParseMode.MARKDOWN)
     except Exception as e:
-        log.error(f"Не удалось уведомить админа: {e}")
+        log.error(f"notify_ai_fallback: {e}")
 
 
 async def notify_ai_temp_error(user_id: int, user_message: str, reason: str):
     try:
         await bot_client.send_message(
             CFG["admin_id"],
-            f"⚠️ Временный сбой ИИ ({reason}). Клиент `{user_id}` не получил ответ.\n"
-            f"💬 {user_message[:200]}\n"
-            f"(ИИ НЕ приостановлен для этого клиента.)",
-            parse_mode=enums.ParseMode.MARKDOWN,
-        )
+            f"⚠️ Временный сбой ИИ ({reason}). Клиент `{user_id}` без ответа.\n"
+            f"💬 {user_message[:200]}",
+            parse_mode=enums.ParseMode.MARKDOWN)
     except Exception:
         pass
 
@@ -610,17 +751,12 @@ async def scan_groups() -> list:
                 continue
             if getattr(chat, "is_broadcast", False):
                 continue
-            found.append({
-                "id": chat.id,
-                "title": chat.title or str(chat.id),
-                "type": chat.type.name,
-                "manual": False,
-            })
+            found.append({"id": chat.id, "title": chat.title or str(chat.id),
+                          "type": chat.type.name, "manual": False})
     except FloodWait as e:
-        log.warning(f"FloodWait: {e.value}s")
         await asyncio.sleep(e.value + 2)
     except Exception as e:
-        log.exception(f"Ошибка скана: {e}")
+        log.exception(f"scan: {e}")
     return found
 
 
@@ -636,14 +772,11 @@ async def mailing_loop():
             if not STATE.get("running"):
                 break
             gid = g.get("id")
-            title = g.get("title") or gid
             try:
                 await send_post(gid)
                 sent += 1
                 STATE["stats"]["sent"] += 1
-                log.info(f"[OK] {title} ({gid})")
             except FloodWait as fw:
-                log.warning(f"[FLOOD] {fw.value}s {title}")
                 await asyncio.sleep(fw.value + 2)
                 try:
                     await send_post(gid)
@@ -659,7 +792,7 @@ async def mailing_loop():
             except Exception as e:
                 errors += 1
                 STATE["stats"]["errors"] += 1
-                log.exception(f"[ERR] {title}: {e}")
+                log.exception(f"[ERR] {gid}: {e}")
             try:
                 lo = int(STATE.get("delay_min", 5))
                 hi = int(STATE.get("delay_max", 15))
@@ -681,9 +814,7 @@ async def mailing_loop():
         save_json(STATE_FILE, STATE)
         try:
             await bot_client.send_message(CFG["admin_id"],
-                f"✅ Круг №{STATE['stats']['rounds']}.\n"
-                f"• Отправлено: {sent}\n• Ошибок: {errors}\n"
-                f"• Следующий через {interval // 60} мин.")
+                f"✅ Круг №{STATE['stats']['rounds']}. Отправлено {sent}, ошибок {errors}.")
         except Exception:
             pass
         remaining = interval
@@ -700,10 +831,6 @@ def start_mailing() -> None:
     mailing_task = asyncio.create_task(mailing_loop())
 
 
-# ---------------------------------------------------------------------------
-# Обновление кэша пиров
-# ---------------------------------------------------------------------------
-
 async def peer_refresh_loop():
     while True:
         await asyncio.sleep(1800)
@@ -715,12 +842,10 @@ async def peer_refresh_loop():
                 count += 1
                 if count >= 500:
                     break
-            log.info(f"[PEERS] Кэш обновлён ({count} диалогов)")
         except FloodWait as e:
-            log.warning(f"[PEERS] FloodWait {e.value}s")
             await asyncio.sleep(e.value + 5)
         except Exception as e:
-            log.warning(f"[PEERS] Ошибка обновления кэша: {e}")
+            log.warning(f"[PEERS] {e}")
 
 
 def start_peer_refresh():
@@ -737,7 +862,7 @@ def start_peer_refresh():
 def main_menu_kb() -> InlineKeyboardMarkup:
     rows = []
     if not USERBOT_READY:
-        rows.append([InlineKeyboardButton("🔐 Авторизовать юзербота (/login)", callback_data="login")])
+        rows.append([InlineKeyboardButton("🔐 Авторизовать (/login)", callback_data="login")])
     else:
         rows.append([InlineKeyboardButton(
             "🚀 Запустить рассылку" if not STATE.get("running") else "🚀 Рассылка идёт…",
@@ -749,6 +874,9 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     ar_state = "🟢" if ar.get("enabled") else "🔴"
     ai_state = "🟢" if ai.get("enabled") else "🔴"
     test_mark = " 🧪" if ai.get("test_mode") else ""
+    typing_mark = " ⌨️" if ai.get("typing_enabled", True) else ""
+    rules_count = len(ai.get("rules") or [])
+    rules_mark = f" ({rules_count})" if rules_count else ""
 
     rows += [
         [InlineKeyboardButton("📝 Изменить сообщение", callback_data="edit_msg")],
@@ -756,7 +884,9 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔍 Обновить список групп", callback_data="scan")],
         [InlineKeyboardButton("➕ Добавить группу", callback_data="add_grp"),
          InlineKeyboardButton("➖ Удалить группу", callback_data="del_grp")],
-        [InlineKeyboardButton(f"🧠 ИИ-ассистент ({ai_state}){test_mark}", callback_data="ai_menu")],
+        [InlineKeyboardButton(f"🧠 ИИ-ассистент ({ai_state}){test_mark}{typing_mark}",
+                              callback_data="ai_menu")],
+        [InlineKeyboardButton(f"📚 Правила и обучение{rules_mark}", callback_data="ai_train")],
         [InlineKeyboardButton(f"🤖 Автоответчик ({ar_state})", callback_data="ar_menu")],
         [InlineKeyboardButton("📊 Статус и статистика", callback_data="status")],
     ]
@@ -778,15 +908,17 @@ def ai_menu_kb() -> InlineKeyboardMarkup:
     ai = STATE.get("ai_assistant") or {}
     enabled = ai.get("enabled", False)
     test = ai.get("test_mode", False)
+    typing = ai.get("typing_enabled", True)
     has_cf = bool((ai.get("cf_account_id") or CFG.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID")))
     has_tok = bool((ai.get("cf_api_token") or CFG.get("cf_api_token") or os.getenv("CF_API_TOKEN")))
     cred_state = "✅" if (has_cf and has_tok) else "❌"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔴 Выключить ИИ" if enabled else "🟢 Включить ИИ",
                               callback_data="ai_toggle")],
-        [InlineKeyboardButton(
-            f"🧪 Тест-режим: {'🟢 ВКЛ' if test else '🔴 выкл'}",
-            callback_data="ai_test_toggle")],
+        [InlineKeyboardButton(f"🧪 Тест-режим: {'🟢 ВКЛ' if test else '🔴 выкл'}",
+                              callback_data="ai_test_toggle")],
+        [InlineKeyboardButton(f"⌨️ Имитация набора: {'🟢 ВКЛ' if typing else '🔴 выкл'}",
+                              callback_data="ai_typing_menu")],
         [InlineKeyboardButton("📝 Стиль общения", callback_data="ai_style")],
         [InlineKeyboardButton("👤 Информация обо мне", callback_data="ai_about")],
         [InlineKeyboardButton("💼 Описание работы", callback_data="ai_work")],
@@ -803,10 +935,42 @@ def ai_menu_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def ai_typing_kb() -> InlineKeyboardMarkup:
+    ai = STATE.get("ai_assistant") or {}
+    enabled = ai.get("typing_enabled", True)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔴 Выключить" if enabled else "🟢 Включить",
+                              callback_data="ai_typing_toggle")],
+        [InlineKeyboardButton(f"⏱ Мин. задержка: {ai.get('typing_min_delay', 1.5)} сек",
+                              callback_data="ai_typing_min")],
+        [InlineKeyboardButton(f"⏱ Макс. задержка: {ai.get('typing_max_delay', 10.0)} сек",
+                              callback_data="ai_typing_max")],
+        [InlineKeyboardButton(f"⚡ Скорость: {ai.get('typing_cps', 12.0)} симв/сек",
+                              callback_data="ai_typing_cps")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="ai_menu")],
+    ])
+
+
+def ai_typing_text() -> str:
+    ai = STATE.get("ai_assistant") or {}
+    enabled = ai.get("typing_enabled", True)
+    return (
+        "⌨️ Имитация набора текста\n\n"
+        "Перед отправкой ответа бот показывает «печатает…» столько, сколько занял бы реальный набор. "
+        "Так клиент не видит мгновенный ответ от робота.\n\n"
+        f"• Статус: {'🟢 вкл' if enabled else '🔴 выкл'}\n"
+        f"• Мин. задержка: {ai.get('typing_min_delay', 1.5)} сек\n"
+        f"• Макс. задержка: {ai.get('typing_max_delay', 10.0)} сек\n"
+        f"• Скорость: {ai.get('typing_cps', 12.0)} симв/сек\n\n"
+        f"Формула: длина_текста / скорость × (0.7…1.3), в пределах min…max."
+    )
+
+
 def ai_cf_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔑 CF Account ID", callback_data="ai_cf_account")],
         [InlineKeyboardButton("🔑 CF API Token", callback_data="ai_cf_token")],
+        [InlineKeyboardButton("🔍 Проверить токен", callback_data="ai_cf_verify")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="ai_menu")],
     ])
 
@@ -817,34 +981,30 @@ def ai_cf_menu_text() -> str:
     cf_tok = ai.get("cf_api_token") or CFG.get("cf_api_token") or os.getenv("CF_API_TOKEN", "")
     return (
         "🔑 Cloudflare Workers AI — ключи\n\n"
-        f"• Account ID: {'✅ ' + cf_id[:12] + '…' if cf_id else '❌ не задан'}\n"
-        f"• API Token: {'✅ задан' if cf_tok else '❌ не задан'}\n\n"
-        "Где взять:\n"
-        "1. https://dash.cloudflare.com → AI → Workers AI\n"
-        "2. 'Use REST API' → Create Token\n"
-        "3. Скопируй Account ID и API Token\n"
-        "4. Вставь сюда (бот сам вычистит переносы строк)."
+        f"• Account ID: {'✅ ' + cf_id[:12] + '…' if cf_id else '❌'}\n"
+        f"• API Token: {'✅ задан' if cf_tok else '❌'}\n\n"
+        "Создай токен в разделе AI → Workers AI."
     )
 
 
 def ai_menu_text() -> str:
     ai = STATE.get("ai_assistant") or {}
     paused = len(ai.get("paused_users") or [])
-    cf_id = ai.get("cf_account_id") or CFG.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID", "")
-    cf_tok = ai.get("cf_api_token") or CFG.get("cf_api_token") or os.getenv("CF_API_TOKEN", "")
+    cf_id, cf_tok = _get_cf_creds()
     test = ai.get("test_mode", False)
+    typing = ai.get("typing_enabled", True)
+    rules = len(ai.get("rules") or [])
     return (
         "🧠 ИИ-ассистент (Cloudflare Workers AI)\n"
         f"• Статус: {'🟢 вкл' if ai.get('enabled') else '🔴 выкл'}\n"
-        f"• Тест-режим: {'🟢 ВКЛ (отвечает сразу)' if test else '🔴 выкл'}\n"
+        f"• Тест-режим: {'🟢 ВКЛ' if test else '🔴 выкл'}\n"
+        f"• Имитация набора: {'🟢 вкл' if typing else '🔴 выкл'}\n"
         f"• Неактивность: {ai.get('inactive_minutes', 5)} мин\n"
         f"• Модель: {ai.get('cf_model')}\n"
         f"• Ключи CF: {'✅' if (cf_id and cf_tok) else '❌'}\n"
-        f"• Ответов ИИ: {STATE['stats'].get('ai_replies', 0)}\n"
-        f"• Передач владельцу: {STATE['stats'].get('ai_fallbacks', 0)}\n"
-        f"• Приостановлено диалогов: {paused}\n\n"
-        "🧪 Тест-режим — ИИ отвечает сразу, даже если ты онлайн.\n"
-        "Выключи его, когда закончишь тесты."
+        f"• Правил: {rules}\n"
+        f"• Ответов: {STATE['stats'].get('ai_replies', 0)}\n"
+        f"• Приостановлено: {paused}"
     )
 
 
@@ -854,6 +1014,64 @@ def ai_paused_kb() -> InlineKeyboardMarkup:
     for uid in (ai.get("paused_users") or [])[:25]:
         rows.append([InlineKeyboardButton(f"▶️ Возобновить {uid}", callback_data=f"ai_resume:{uid}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="ai_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ---- Обучение ----
+
+def ai_train_kb() -> InlineKeyboardMarkup:
+    ai = STATE.get("ai_assistant") or {}
+    ex_on = ai.get("examples_enabled", True)
+    auto_on = ai.get("auto_examples_enabled", True)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Список правил", callback_data="ai_rules_list")],
+        [InlineKeyboardButton("➕ Добавить правило", callback_data="ai_rules_add")],
+        [InlineKeyboardButton("🗑 Удалить правило", callback_data="ai_rules_del")],
+        [InlineKeyboardButton(f"📚 Примеры: {'🟢 вкл' if ex_on else '🔴 выкл'}",
+                              callback_data="ai_ex_toggle")],
+        [InlineKeyboardButton(f"🎓 Автосбор правок: {'🟢 вкл' if auto_on else '🔴 выкл'}",
+                              callback_data="ai_ex_auto_toggle")],
+        [InlineKeyboardButton(f"📊 Смотреть примеры ({await_count_cache})", callback_data="ai_ex_show")],
+        [InlineKeyboardButton("🧹 Очистить примеры", callback_data="ai_ex_clear")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
+    ])
+
+
+def ai_train_text() -> str:
+    ai = STATE.get("ai_assistant") or {}
+    rules = ai.get("rules") or []
+    ex_on = ai.get("examples_enabled", True)
+    auto_on = ai.get("auto_examples_enabled", True)
+    limit = int(ai.get("examples_limit", 5))
+    return (
+        "📚 Обучение ИИ\n\n"
+        "🔹 Правила — жёсткие инструкции в промпт.\n"
+        "🔹 Примеры — пары «сообщение клиента → твой ответ».\n\n"
+        f"• Правил: {len(rules)}\n"
+        f"• Примеры: {'🟢 да' if ex_on else '🔴 нет'}\n"
+        f"• Автосбор правок: {'🟢 да' if auto_on else '🔴 нет'}\n"
+        f"• Примеров в промпт: {limit}\n\n"
+        "Когда ты пишешь клиенту после ИИ — это сохраняется как пример."
+    )
+
+
+def ai_rules_list_kb() -> InlineKeyboardMarkup:
+    ai = STATE.get("ai_assistant") or {}
+    rows = []
+    for i, r in enumerate((ai.get("rules") or [])[:25]):
+        t = r[:50] + ("…" if len(r) > 50 else "")
+        rows.append([InlineKeyboardButton(f"#{i+1} {t}", callback_data=f"ai_rule_show:{i}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="ai_train")])
+    return InlineKeyboardMarkup(rows)
+
+
+def ai_rules_del_kb() -> InlineKeyboardMarkup:
+    ai = STATE.get("ai_assistant") or {}
+    rows = []
+    for i, r in enumerate((ai.get("rules") or [])[:25]):
+        t = r[:50] + ("…" if len(r) > 50 else "")
+        rows.append([InlineKeyboardButton(f"❌ #{i+1} {t}", callback_data=f"ai_rule_del:{i}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="ai_train")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -884,16 +1102,14 @@ def autoreply_menu_text() -> str:
         "🤖 Автоответчик\n"
         f"• Статус: {'🟢 вкл' if ar.get('enabled') else '🔴 выкл'}\n"
         f"• Неактивность: {ar.get('inactive_minutes', 5)} мин\n"
-        f"• Cooldown: {ar.get('cooldown_minutes', 60)} мин\n"
-        f"• Знакомых: {len(ar.get('known_users') or [])}\n\n"
-        f"📩 Шаблон для новых:\n{tf if tf else '— (не задан)'}\n\n"
-        f"📩 Шаблон для знакомых:\n{tk if tk else '— (не задан)'}\n\n"
-        "Срабатывает, если ИИ выключен или не смог ответить."
+        f"• Cooldown: {ar.get('cooldown_minutes', 60)} мин\n\n"
+        f"📩 Новым:\n{tf if tf else '—'}\n\n"
+        f"📩 Знакомым:\n{tk if tk else '—'}"
     )
 
 
 # ---------------------------------------------------------------------------
-# Заполнение known_users + логин
+# Логин
 # ---------------------------------------------------------------------------
 
 async def populate_known_users():
@@ -903,7 +1119,6 @@ async def populate_known_users():
     ar = STATE.get("autoreply") or {}
     if ar.get("known_users_loaded"):
         return
-    log.info("Загружаю известных юзеров…")
     known = set(ar.get("known_users") or [])
     try:
         async for dialog in user_client.get_dialogs():
@@ -911,12 +1126,11 @@ async def populate_known_users():
             if c and c.type == enums.ChatType.PRIVATE and c.id > 0:
                 known.add(str(c.id))
     except Exception as e:
-        log.warning(f"Не смог получить диалоги: {e}")
+        log.warning(f"known_users: {e}")
     ar["known_users"] = list(known)
     ar["known_users_loaded"] = True
     STATE["autoreply"] = ar
     save_json(STATE_FILE, STATE)
-    log.info(f"Известных юзеров: {len(known)}")
 
 
 async def after_userbot_login(message=None):
@@ -925,20 +1139,19 @@ async def after_userbot_login(message=None):
     try:
         me = await user_client.get_me()
         ME_ID = me.id
-        log.info(f"Юзербот авторизован: {me.first_name} (@{me.username}) id={me.id}")
+        log.info(f"Юзербот: {me.first_name} id={me.id}")
         try:
             if not user_client.is_connected:
                 await user_client.connect()
             await user_client.start()
-        except Exception as e:
-            log.warning(f"Не удалось запустить dispatcher: {e}")
+        except Exception:
+            pass
         asyncio.create_task(populate_known_users())
         if message is not None:
             await message.reply(
                 f"✅ Юзербот: {me.first_name} (@{me.username or '—'}).",
                 reply_markup=main_menu_kb())
-    except Exception as e:
-        log.warning(f"Ошибка после логина: {e}")
+    except Exception:
         if message is not None:
             await message.reply("✅ Юзербот авторизован.", reply_markup=main_menu_kb())
 
@@ -960,15 +1173,20 @@ def register_user_handlers(client: Client) -> None:
             text = (message.text or "").strip()
             if _was_sent_by_bot(chat.id, text):
                 return
+
+            ai = STATE.get("ai_assistant") or {}
+            if ai.get("auto_examples_enabled", True):
+                last_bot = BOT_LAST_SENT.get(chat.id)
+                if last_bot and text:
+                    last_user = await db_get_last_user_msg(chat.id)
+                    if last_user:
+                        await db_save_example(last_user, last_bot, text)
+                        log.info(f"[LEARN] Пример сохранён для {chat.id}")
+
             _mark_owner_activity()
             _mark_known_ar(chat.id)
-            # В тест-режиме не ставим на паузу — чтобы удобно было тестировать
-            ai = STATE.get("ai_assistant") or {}
             if not ai.get("test_mode"):
                 _pause_ai(chat.id)
-                log.info(f"[OWNER ACTIVE] Владелец написал {chat.id} — ИИ на паузе")
-            else:
-                log.info(f"[OWNER ACTIVE] {chat.id} — тест-режим, пауза не ставится")
             if text:
                 await db_add_message(chat.id, "assistant", text)
         except Exception as e:
@@ -992,14 +1210,11 @@ def register_user_handlers(client: Client) -> None:
             if not ai.get("enabled") and not ar.get("enabled"):
                 return
 
-            # Голосовые — уведомляем
             if message.voice or message.video_note or message.audio:
                 try:
                     await bot_client.send_message(
                         CFG["admin_id"],
-                        f"🔔 Клиент {user.first_name} (@{user.username or '—'}, "
-                        f"id={user.id}) прислал голосовое. Ответь сам."
-                    )
+                        f"🔔 {user.first_name} (@{user.username or '—'}, id={user.id}) — голосовое.")
                 except Exception:
                     pass
                 return
@@ -1010,25 +1225,24 @@ def register_user_handlers(client: Client) -> None:
 
             await db_add_message(user.id, "user", text)
 
-            # ---- 1. ИИ ----
             test_mode = bool(ai.get("test_mode"))
             ai_should_run = (
                 ai.get("enabled")
                 and (test_mode or not _is_paused_ai(user.id))
                 and (test_mode or _owner_inactive_ai())
             )
+
             if ai_should_run:
                 reply, reason = await ask_ai(user.id, text)
                 if reply:
-                    await _send_as_userbot(user.id, reply)
+                    # ⌨️ Имитация набора + отправка
+                    await _send_as_userbot(user.id, reply, with_typing=True)
                     STATE["stats"]["ai_replies"] = STATE["stats"].get("ai_replies", 0) + 1
                     save_json(STATE_FILE, STATE)
-                    log.info(f"[AI REPLY] → {user.id}: {reply[:80]}")
                     return
 
                 hard_fail = reason in ("no_credentials", "auth_error", "disabled", "empty")
                 soft_fail = reason in ("timeout", "rate_limit", "exception", "bad_json")
-
                 if hard_fail:
                     _pause_ai(user.id)
                     STATE["stats"]["ai_fallbacks"] = STATE["stats"].get("ai_fallbacks", 0) + 1
@@ -1038,26 +1252,19 @@ def register_user_handlers(client: Client) -> None:
                     await notify_ai_temp_error(user.id, text, reason)
                 else:
                     _pause_ai(user.id)
-                    STATE["stats"]["ai_fallbacks"] = STATE["stats"].get("ai_fallbacks", 0) + 1
-                    save_json(STATE_FILE, STATE)
                     await notify_ai_fallback(user.id, text, reason)
 
-            # ---- 2. Автоответчик ----
             if (not test_mode) and ar.get("enabled") and _owner_inactive_ar() and _cooldown_ok_ar(user.id):
                 known = _is_known_ar(user.id)
                 template = (ar.get("template_known") if known else ar.get("template_first")) or ""
                 template = template.strip()
                 if template:
-                    await _send_as_userbot(user.id, template)
+                    await _send_as_userbot(user.id, template, with_typing=True)
                     _mark_known_ar(user.id)
                     _set_cooldown_ar(user.id)
                     STATE["stats"]["autoreplies"] = STATE["stats"].get("autoreplies", 0) + 1
                     save_json(STATE_FILE, STATE)
-                    log.info(f"[AUTOREPLY] → {user.id} ({'known' if known else 'new'})")
-                    return
-
         except FloodWait as fw:
-            log.warning(f"FloodWait: {fw.value}s")
             await asyncio.sleep(fw.value + 2)
         except Exception as e:
             log.exception(f"on_incoming: {e}")
@@ -1077,10 +1284,7 @@ def register_handlers(bot: Client) -> None:
         if message.from_user.id not in authed:
             await message.reply("🔒 `/auth <PIN>`", parse_mode=enums.ParseMode.MARKDOWN)
             return
-        txt = "🎛 Панель управления:"
-        if not USERBOT_READY:
-            txt += "\n\n⚠️ Юзербот не авторизован."
-        await message.reply(txt, reply_markup=main_menu_kb())
+        await message.reply("🎛 Панель:", reply_markup=main_menu_kb())
 
     @bot.on_message(filters.command("auth") & filters.private)
     async def cmd_auth(client, message):
@@ -1113,13 +1317,12 @@ def register_handlers(bot: Client) -> None:
             return
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) < 2:
-            await message.reply("Использование: `/pause <user_id>`",
-                                parse_mode=enums.ParseMode.MARKDOWN)
+            await message.reply("Использование: `/pause <user_id>`")
             return
         try:
             uid = int(parts[1].strip())
         except ValueError:
-            await message.reply("❌ user_id должен быть числом.")
+            await message.reply("❌ user_id — число.")
             return
         _pause_ai(uid)
         await message.reply(f"⏸ ИИ приостановлен для {uid}.")
@@ -1130,16 +1333,43 @@ def register_handlers(bot: Client) -> None:
             return
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) < 2:
-            await message.reply("Использование: `/resume <user_id>`",
-                                parse_mode=enums.ParseMode.MARKDOWN)
+            await message.reply("Использование: `/resume <user_id>`")
             return
         try:
             uid = int(parts[1].strip())
         except ValueError:
-            await message.reply("❌ user_id должен быть числом.")
+            await message.reply("❌ user_id — число.")
             return
         _unpause_ai(uid)
         await message.reply(f"▶️ ИИ снова общается с {uid}.")
+
+    @bot.on_message(filters.command("fix") & filters.private)
+    async def cmd_fix(client, message):
+        if message.from_user.id != CFG["admin_id"] or message.from_user.id not in authed:
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.reply("Использование: `/fix <правило>`")
+            return
+        rule = parts[1].strip()
+        ai = STATE.setdefault("ai_assistant", _default_ai())
+        rules = ai.setdefault("rules", [])
+        rules.append(rule)
+        save_json(STATE_FILE, STATE)
+        await message.reply(f"✅ Правило #{len(rules)}: _{rule}_",
+                            parse_mode=enums.ParseMode.MARKDOWN)
+
+    @bot.on_message(filters.command("rules") & filters.private)
+    async def cmd_rules(client, message):
+        if message.from_user.id != CFG["admin_id"] or message.from_user.id not in authed:
+            return
+        rules = (STATE.get("ai_assistant") or {}).get("rules") or []
+        if not rules:
+            await message.reply("📋 Правил нет.")
+            return
+        lines = [f"{i+1}. {r}" for i, r in enumerate(rules)]
+        await message.reply("📋 **Правила:**\n\n" + "\n".join(lines),
+                            parse_mode=enums.ParseMode.MARKDOWN)
 
     @bot.on_message(filters.command("login") & filters.private)
     async def cmd_login(client, message):
@@ -1149,12 +1379,10 @@ def register_handlers(bot: Client) -> None:
             await message.reply("🔒 /auth <PIN>")
             return
         if USERBOT_READY:
-            await message.reply("ℹ️ Юзербот уже авторизован.")
+            await message.reply("ℹ️ Уже авторизован.")
             return
         pending[message.from_user.id] = {"action": "login_phone"}
-        await message.reply(
-            "📱 Введите номер телефона юзербота в формате `+79991234567`.\n"
-            "Отмена — /cancel", parse_mode=enums.ParseMode.MARKDOWN)
+        await message.reply("📱 Номер в формате `+79991234567`.\n/cancel")
 
     @bot.on_callback_query()
     async def on_cb(client, cb):
@@ -1175,22 +1403,12 @@ def register_handlers(bot: Client) -> None:
                     await cb.answer("Уже авторизован.")
                     return
                 pending[uid] = {"action": "login_phone"}
-                await cb.message.edit_text(
-                    "📱 Введите номер телефона в формате `+79991234567`.\n/cancel — отмена",
-                    parse_mode=enums.ParseMode.MARKDOWN)
+                await cb.message.edit_text("📱 Номер в формате `+79991234567`.")
 
             elif data == "start":
-                if not USERBOT_READY:
-                    await cb.answer("Сначала /login.", show_alert=True)
-                    return
-                if STATE.get("running"):
-                    await cb.answer("Уже запущено.")
-                    return
-                if not STATE.get("groups"):
-                    await cb.answer("Нет групп.", show_alert=True)
-                    return
-                if not (STATE.get("text") or STATE.get("media_path")):
-                    await cb.answer("Не задано сообщение!", show_alert=True)
+                if not USERBOT_READY or STATE.get("running") or not STATE.get("groups") \
+                        or not (STATE.get("text") or STATE.get("media_path")):
+                    await cb.answer("Не готово.", show_alert=True)
                     return
                 STATE["running"] = True
                 save_json(STATE_FILE, STATE)
@@ -1203,24 +1421,23 @@ def register_handlers(bot: Client) -> None:
                 await cb.message.edit_text("⏸ Остановлено.", reply_markup=main_menu_kb())
 
             elif data == "edit_msg":
-                cur = "— (пусто)"
+                cur = "—"
                 if STATE.get("media_path"):
-                    cur = f"Медиа: {STATE.get('media_type')}\nCaption: {(STATE.get('caption') or '')[:150]}"
+                    cur = f"Медиа: {STATE.get('media_type')}"
                 elif STATE.get("text"):
                     cur = f"Текст: {STATE['text'][:200]}"
                 kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📝 Задать текст", callback_data="set_text")],
-                    [InlineKeyboardButton("🖼 Задать медиа", callback_data="set_media")],
+                    [InlineKeyboardButton("📝 Текст", callback_data="set_text")],
+                    [InlineKeyboardButton("🖼 Медиа", callback_data="set_media")],
                     [InlineKeyboardButton("🗑 Очистить", callback_data="clear_msg")],
-                    [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
-                ])
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="menu")]])
                 await cb.message.edit_text(f"📝 Текущее:\n{cur}", reply_markup=kb)
             elif data == "set_text":
                 pending[uid] = {"action": "set_text"}
-                await cb.message.edit_text("Отправьте текст.\n/cancel")
+                await cb.message.edit_text("Текст:\n/cancel")
             elif data == "set_media":
                 pending[uid] = {"action": "set_media"}
-                await cb.message.edit_text("Отправьте фото или видео.\n/cancel")
+                await cb.message.edit_text("Фото или видео:\n/cancel")
             elif data == "clear_msg":
                 STATE["text"] = None
                 STATE["media_path"] = None
@@ -1231,25 +1448,23 @@ def register_handlers(bot: Client) -> None:
 
             elif data == "timings":
                 kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⏱ Интервал круга (сек)", callback_data="set_interval")],
-                    [InlineKeyboardButton("⏳ Мин. задержка", callback_data="set_delay_min")],
-                    [InlineKeyboardButton("⏳ Макс. задержка", callback_data="set_delay_max")],
-                    [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
-                ])
+                    [InlineKeyboardButton("⏱ Интервал", callback_data="set_interval")],
+                    [InlineKeyboardButton("⏳ Мин.", callback_data="set_delay_min")],
+                    [InlineKeyboardButton("⏳ Макс.", callback_data="set_delay_max")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="menu")]])
                 await cb.message.edit_text(
-                    f"⏱ Настройки:\n"
-                    f"• Интервал: {STATE['interval']} сек\n"
-                    f"• Задержка: {STATE['delay_min']}–{STATE['delay_max']} сек",
+                    f"⏱ Интервал: {STATE['interval']} сек\n"
+                    f"Задержка: {STATE['delay_min']}–{STATE['delay_max']}",
                     reply_markup=kb)
             elif data == "set_interval":
                 pending[uid] = {"action": "set_interval"}
-                await cb.message.edit_text("Интервал в секундах (мин. 60).\n/cancel")
+                await cb.message.edit_text("Интервал (>=60):\n/cancel")
             elif data == "set_delay_min":
                 pending[uid] = {"action": "set_delay_min"}
-                await cb.message.edit_text("Мин. задержка (>=1).\n/cancel")
+                await cb.message.edit_text("Мин. задержка (>=1):\n/cancel")
             elif data == "set_delay_max":
                 pending[uid] = {"action": "set_delay_max"}
-                await cb.message.edit_text("Макс. задержка.\n/cancel")
+                await cb.message.edit_text("Макс. задержка:\n/cancel")
 
             elif data == "scan":
                 if not USERBOT_READY:
@@ -1264,16 +1479,14 @@ def register_handlers(bot: Client) -> None:
                 STATE["groups"] = found + manual
                 save_json(STATE_FILE, STATE)
                 await cb.message.edit_text(
-                    f"✅ Найдено: {len(found)}\n• Всего: {len(STATE['groups'])}",
+                    f"✅ Найдено {len(found)}. Всего {len(STATE['groups'])}.",
                     reply_markup=main_menu_kb())
             elif data == "add_grp":
                 if not USERBOT_READY:
                     await cb.answer("Юзербот не готов.", show_alert=True)
                     return
                 pending[uid] = {"action": "add_group"}
-                await cb.message.edit_text(
-                    "Отправьте `@username`, `t.me/...` или ID.\n/cancel",
-                    parse_mode=enums.ParseMode.MARKDOWN)
+                await cb.message.edit_text("@username / t.me/... / ID:\n/cancel")
             elif data == "del_grp":
                 if not STATE.get("groups"):
                     await cb.answer("Пусто.", show_alert=True)
@@ -1283,112 +1496,198 @@ def register_handlers(bot: Client) -> None:
                 try:
                     gid = int(data.split(":", 1)[1])
                 except ValueError:
-                    await cb.answer("Ошибка.")
                     return
                 STATE["groups"] = [g for g in STATE["groups"] if g["id"] != gid]
                 save_json(STATE_FILE, STATE)
-                if STATE["groups"]:
-                    await cb.message.edit_text(f"➖ Осталось {len(STATE['groups'])}.",
-                        reply_markup=groups_kb())
-                else:
-                    await cb.message.edit_text("➖ Пусто.", reply_markup=main_menu_kb())
+                await cb.message.edit_text(
+                    f"➖ Осталось {len(STATE['groups'])}.",
+                    reply_markup=groups_kb() if STATE["groups"] else main_menu_kb())
 
             # ---------- ИИ ----------
             elif data == "ai_menu":
                 await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
-
             elif data == "ai_toggle":
                 ai = STATE.setdefault("ai_assistant", _default_ai())
                 ai["enabled"] = not ai.get("enabled", False)
                 save_json(STATE_FILE, STATE)
                 await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
-
             elif data == "ai_test_toggle":
                 ai = STATE.setdefault("ai_assistant", _default_ai())
                 ai["test_mode"] = not ai.get("test_mode", False)
                 save_json(STATE_FILE, STATE)
-                st = "🟢 ВКЛ" if ai["test_mode"] else "🔴 выкл"
-                await cb.answer(f"Тест-режим: {st}", show_alert=False)
                 await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
+
+            # ⌨️ Имитация набора
+            elif data == "ai_typing_menu":
+                await cb.message.edit_text(ai_typing_text(), reply_markup=ai_typing_kb())
+            elif data == "ai_typing_toggle":
+                ai = STATE.setdefault("ai_assistant", _default_ai())
+                ai["typing_enabled"] = not ai.get("typing_enabled", True)
+                save_json(STATE_FILE, STATE)
+                await cb.message.edit_text(ai_typing_text(), reply_markup=ai_typing_kb())
+            elif data == "ai_typing_min":
+                pending[uid] = {"action": "ai_typing_min"}
+                await cb.message.edit_text(
+                    "Мин. задержка (сек, >=0.5). Пример: `1.5`\n/cancel",
+                    parse_mode=enums.ParseMode.MARKDOWN)
+            elif data == "ai_typing_max":
+                pending[uid] = {"action": "ai_typing_max"}
+                await cb.message.edit_text(
+                    "Макс. задержка (сек). Пример: `10`\n/cancel",
+                    parse_mode=enums.ParseMode.MARKDOWN)
+            elif data == "ai_typing_cps":
+                pending[uid] = {"action": "ai_typing_cps"}
+                await cb.message.edit_text(
+                    "Скорость набора (символов/сек). Реалистично 8–20. Пример: `12`\n/cancel",
+                    parse_mode=enums.ParseMode.MARKDOWN)
 
             elif data == "ai_style":
                 pending[uid] = {"action": "ai_style"}
-                await cb.message.edit_text(
-                    "📝 Опиши стиль общения ИИ. Например:\n"
-                    "«Дружелюбно, неформально, короткие сообщения, лёгкие эмодзи»\n/cancel")
+                await cb.message.edit_text("📝 Стиль общения:\n/cancel")
             elif data == "ai_about":
                 pending[uid] = {"action": "ai_about"}
-                await cb.message.edit_text(
-                    "👤 Напиши о себе (имя, чем занимаешься, как обращаться):\n/cancel")
+                await cb.message.edit_text("👤 Информация о тебе:\n/cancel")
             elif data == "ai_work":
                 pending[uid] = {"action": "ai_work"}
-                await cb.message.edit_text(
-                    "💼 Опиши суть работы/продукта (что продаёшь, цены, схему):\n/cancel")
+                await cb.message.edit_text("💼 Суть работы:\n/cancel")
             elif data == "ai_forbidden":
                 pending[uid] = {"action": "ai_forbidden"}
-                await cb.message.edit_text(
-                    "🚫 Что ИИ НИКОГДА не должен говорить/делать:\n/cancel")
+                await cb.message.edit_text("🚫 Запреты:\n/cancel")
             elif data == "ai_show_prompt":
-                prompt = (STATE.get("ai_assistant") or {}).get("system_prompt") or DEFAULT_SYSTEM_PROMPT
+                prompt = await build_system_prompt()
                 if len(prompt) > 3500:
                     prompt = prompt[:3500] + "\n…(обрезано)"
                 await cb.message.edit_text(
-                    f"📋 Текущий системный промпт:\n\n{prompt}",
+                    f"📋 Полный промпт:\n\n{prompt}",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⬅️ Назад", callback_data="ai_menu")],
-                    ]))
+                        [InlineKeyboardButton("⬅️ Назад", callback_data="ai_menu")]]))
             elif data == "ai_reset_prompt":
                 ai = STATE.setdefault("ai_assistant", _default_ai())
                 ai["system_prompt"] = DEFAULT_SYSTEM_PROMPT
                 ai["prompt_parts"] = {}
                 save_json(STATE_FILE, STATE)
-                await cb.message.edit_text("♻️ Промпт сброшен к дефолту.", reply_markup=ai_menu_kb())
+                await cb.message.edit_text("♻️ Сброшено.", reply_markup=ai_menu_kb())
             elif data == "ai_inactive":
                 pending[uid] = {"action": "ai_inactive"}
                 await cb.message.edit_text(
-                    f"Через сколько минут твоего отсутствия включать ИИ? "
-                    f"(сейчас {(STATE.get('ai_assistant') or {}).get('inactive_minutes', 5)})\n/cancel")
-
+                    f"Минут неактивности (сейчас "
+                    f"{(STATE.get('ai_assistant') or {}).get('inactive_minutes', 5)}):")
             elif data == "ai_cf_menu":
                 await cb.message.edit_text(ai_cf_menu_text(), reply_markup=ai_cf_menu_kb())
-
             elif data == "ai_cf_account":
                 pending[uid] = {"action": "ai_cf_account"}
-                await cb.message.edit_text(
-                    "Отправь Cloudflare Account ID.\n"
-                    "(Бот сам уберёт переносы строк, если они попадут при копировании.)\n/cancel")
-
+                await cb.message.edit_text("Account ID:\n/cancel")
             elif data == "ai_cf_token":
                 pending[uid] = {"action": "ai_cf_token"}
-                await cb.message.edit_text(
-                    "Отправь Cloudflare API Token.\n"
-                    "(Бот сам уберёт переносы строк, если они попадут при копировании.)\n/cancel")
-
+                await cb.message.edit_text("API Token:\n/cancel")
+            elif data == "ai_cf_verify":
+                await cb.answer("Проверяю…")
+                ok, msg = await verify_cf_token()
+                await cb.message.edit_text(f"🔍 {msg}", reply_markup=ai_cf_menu_kb())
             elif data == "ai_cf_model":
                 models_text = "\n".join(f"`{m}`" for m in CF_MODELS)
                 pending[uid] = {"action": "ai_cf_model"}
-                await cb.message.edit_text(
-                    f"Отправь ID модели Cloudflare Workers AI.\n\n"
-                    f"Популярные:\n{models_text}\n\n/cancel",
+                await cb.message.edit_text(f"Модель:\n{models_text}\n/cancel",
                     parse_mode=enums.ParseMode.MARKDOWN)
-
             elif data == "ai_paused":
                 ai = STATE.get("ai_assistant") or {}
                 if not (ai.get("paused_users") or []):
-                    await cb.answer("Список пуст.", show_alert=True)
+                    await cb.answer("Пусто.", show_alert=True)
                     return
-                await cb.message.edit_text(
-                    "📋 Приостановленные (ИИ не отвечает):",
-                    reply_markup=ai_paused_kb())
+                await cb.message.edit_text("📋 Приостановленные:", reply_markup=ai_paused_kb())
             elif data.startswith("ai_resume:"):
                 try:
                     target = int(data.split(":", 1)[1])
                 except ValueError:
-                    await cb.answer("Ошибка.")
                     return
                 _unpause_ai(target)
                 await cb.answer(f"▶️ {target} возобновлён.")
                 await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
+
+            # ---------- Обучение ----------
+            elif data == "ai_train":
+                global await_count_cache
+                await_count_cache = await db_count_examples()
+                await cb.message.edit_text(ai_train_text(), reply_markup=ai_train_kb())
+            elif data == "ai_rules_list":
+                ai = STATE.get("ai_assistant") or {}
+                if not (ai.get("rules") or []):
+                    await cb.answer("Правил нет.", show_alert=True)
+                    return
+                await cb.message.edit_text("📋 Список правил:", reply_markup=ai_rules_list_kb())
+            elif data.startswith("ai_rule_show:"):
+                try:
+                    idx = int(data.split(":", 1)[1])
+                except ValueError:
+                    return
+                rules = (STATE.get("ai_assistant") or {}).get("rules") or []
+                if idx >= len(rules):
+                    await cb.answer("Не найдено.")
+                    return
+                await cb.message.edit_text(
+                    f"📝 Правило #{idx+1}:\n\n{rules[idx]}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🗑 Удалить", callback_data=f"ai_rule_del:{idx}")],
+                        [InlineKeyboardButton("⬅️ Назад", callback_data="ai_rules_list")]]))
+            elif data == "ai_rules_add":
+                pending[uid] = {"action": "ai_rule_add"}
+                await cb.message.edit_text(
+                    "📝 Отправь правило. Пример:\n"
+                    "«Не называй цену, пока не спросил про опыт клиента»\n/cancel")
+            elif data == "ai_rules_del":
+                ai = STATE.get("ai_assistant") or {}
+                if not (ai.get("rules") or []):
+                    await cb.answer("Правил нет.", show_alert=True)
+                    return
+                await cb.message.edit_text("Выбери для удаления:", reply_markup=ai_rules_del_kb())
+            elif data.startswith("ai_rule_del:"):
+                try:
+                    idx = int(data.split(":", 1)[1])
+                except ValueError:
+                    return
+                ai = STATE.setdefault("ai_assistant", _default_ai())
+                rules = ai.get("rules") or []
+                if 0 <= idx < len(rules):
+                    rules.pop(idx)
+                    ai["rules"] = rules
+                    save_json(STATE_FILE, STATE)
+                    await cb.answer("Удалено.")
+                else:
+                    await cb.answer("Не найдено.")
+                    return
+                if rules:
+                    await cb.message.edit_text("📋 Правила:", reply_markup=ai_rules_del_kb())
+                else:
+                    await cb.message.edit_text(ai_train_text(), reply_markup=ai_train_kb())
+            elif data == "ai_ex_toggle":
+                ai = STATE.setdefault("ai_assistant", _default_ai())
+                ai["examples_enabled"] = not ai.get("examples_enabled", True)
+                save_json(STATE_FILE, STATE)
+                await cb.message.edit_text(ai_train_text(), reply_markup=ai_train_kb())
+            elif data == "ai_ex_auto_toggle":
+                ai = STATE.setdefault("ai_assistant", _default_ai())
+                ai["auto_examples_enabled"] = not ai.get("auto_examples_enabled", True)
+                save_json(STATE_FILE, STATE)
+                await cb.message.edit_text(ai_train_text(), reply_markup=ai_train_kb())
+            elif data == "ai_ex_show":
+                examples = await db_get_examples(limit=20)
+                if not examples:
+                    await cb.answer("Примеров нет.", show_alert=True)
+                    return
+                lines = []
+                for i, ex in enumerate(examples[:10], 1):
+                    u = (ex.get("user_msg") or "")[:100]
+                    g = (ex.get("good_reply") or "")[:150]
+                    lines.append(f"{i}. 👤 {u}\n   ✅ {g}")
+                text = "📚 Примеры:\n\n" + "\n\n".join(lines)
+                if len(text) > 3500:
+                    text = text[:3500] + "\n…(обрезано)"
+                await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="ai_train")]]))
+            elif data == "ai_ex_clear":
+                await db_clear_examples()
+                await cb.answer("🧹 Очищено.", show_alert=True)
+                await cb.message.edit_text(ai_train_text(), reply_markup=ai_train_kb())
 
             # ---------- Автоответчик ----------
             elif data == "ar_menu":
@@ -1400,66 +1699,54 @@ def register_handlers(bot: Client) -> None:
                 await cb.message.edit_text(autoreply_menu_text(), reply_markup=autoreply_menu_kb())
             elif data == "ar_first":
                 pending[uid] = {"action": "ar_first"}
-                await cb.message.edit_text("Отправь текст шаблона для НОВЫХ собеседников.\n/cancel")
+                await cb.message.edit_text("Текст для НОВЫХ:\n/cancel")
             elif data == "ar_known":
                 pending[uid] = {"action": "ar_known"}
-                await cb.message.edit_text("Отправь текст шаблона для ЗНАКОМЫХ собеседников.\n/cancel")
+                await cb.message.edit_text("Текст для ЗНАКОМЫХ:\n/cancel")
             elif data == "ar_inactive":
                 pending[uid] = {"action": "ar_inactive"}
-                await cb.message.edit_text(
-                    f"Через сколько минут отсутствия включать автоответ? "
-                    f"(сейчас {STATE['autoreply'].get('inactive_minutes', 5)})\n/cancel")
+                await cb.message.edit_text("Минут неактивности:\n/cancel")
             elif data == "ar_cooldown":
                 pending[uid] = {"action": "ar_cooldown"}
-                await cb.message.edit_text(
-                    f"Cooldown на собеседника в минутах "
-                    f"(сейчас {STATE['autoreply'].get('cooldown_minutes', 60)})\n/cancel")
+                await cb.message.edit_text("Cooldown (мин):\n/cancel")
             elif data == "ar_reset_known":
                 ar = STATE.setdefault("autoreply", _default_autoreply())
                 ar["known_users"] = []
                 ar["known_users_loaded"] = False
                 save_json(STATE_FILE, STATE)
-                await cb.message.edit_text(
-                    "♻️ Список знакомых сброшен.",
-                    reply_markup=autoreply_menu_kb())
+                await cb.message.edit_text("♻️ Сброшено.", reply_markup=autoreply_menu_kb())
 
             # ---------- Статус ----------
             elif data == "status":
                 s = STATE["stats"]
                 ai = STATE.get("ai_assistant") or {}
                 ar = STATE.get("autoreply") or {}
-                cf_id = ai.get("cf_account_id") or CFG.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID", "")
-                cf_tok = ai.get("cf_api_token") or CFG.get("cf_api_token") or os.getenv("CF_API_TOKEN", "")
+                cf_id, cf_tok = _get_cf_creds()
+                ex_count = await db_count_examples()
+                rules_count = len(ai.get("rules") or [])
                 txt = (
                     f"📊 Статистика\n"
                     f"• Юзербот: {'🟢' if USERBOT_READY else '🔴'}\n"
                     f"• Рассылка: {'🟢' if STATE.get('running') else '🔴'}\n"
                     f"• Групп: {len(STATE.get('groups') or [])}\n"
                     f"• Отправлено: {s.get('sent', 0)}\n"
-                    f"• Ошибок: {s.get('errors', 0)}\n"
-                    f"• Кругов: {s.get('rounds', 0)}\n\n"
-                    f"🧠 ИИ (Cloudflare): {'🟢' if ai.get('enabled') else '🔴'}\n"
-                    f"• Тест-режим: {'🟢' if ai.get('test_mode') else '🔴'}\n"
+                    f"• Ошибок: {s.get('errors', 0)}\n\n"
+                    f"🧠 ИИ: {'🟢' if ai.get('enabled') else '🔴'}\n"
+                    f"• Тест: {'🟢' if ai.get('test_mode') else '🔴'}\n"
+                    f"• Имитация набора: {'🟢' if ai.get('typing_enabled', True) else '🔴'}\n"
                     f"• Ключи CF: {'✅' if (cf_id and cf_tok) else '❌'}\n"
-                    f"• Модель: {ai.get('cf_model')}\n"
-                    f"• Ответов ИИ: {s.get('ai_replies', 0)}\n"
-                    f"• Передач владельцу: {s.get('ai_fallbacks', 0)}\n"
-                    f"• Приостановлено: {len(ai.get('paused_users') or [])}\n"
-                    f"• Неактивность: {ai.get('inactive_minutes', 5)} мин\n\n"
+                    f"• Ответов: {s.get('ai_replies', 0)}\n"
+                    f"• Правил: {rules_count} | Примеров: {ex_count}\n\n"
                     f"🤖 Автоответчик: {'🟢' if ar.get('enabled') else '🔴'}\n"
-                    f"• Автоответов: {s.get('autoreplies', 0)}\n"
-                    f"• Неактивность: {ar.get('inactive_minutes', 5)} мин\n"
-                    f"• Cooldown: {ar.get('cooldown_minutes', 60)} мин"
+                    f"• Автоответов: {s.get('autoreplies', 0)}"
                 )
-                kb = InlineKeyboardMarkup([
+                await cb.message.edit_text(txt, reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Обновить", callback_data="status")],
-                    [InlineKeyboardButton("🗑 Очистить историю БД (30д)", callback_data="db_cleanup")],
-                    [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
-                ])
-                await cb.message.edit_text(txt, reply_markup=kb)
+                    [InlineKeyboardButton("🗑 Очистить БД (30д)", callback_data="db_cleanup")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="menu")]]))
             elif data == "db_cleanup":
                 await db_cleanup(30)
-                await cb.answer("✅ История за 30 дней очищена.", show_alert=True)
+                await cb.answer("✅ Очищено.", show_alert=True)
             else:
                 await cb.answer("Неизвестная команда.")
         except Exception as e:
@@ -1480,7 +1767,6 @@ def register_handlers(bot: Client) -> None:
         action = act.get("action")
         text = (message.text or "").strip()
         try:
-            # логин
             if action == "login_phone":
                 phone = text
                 if not phone.startswith("+"):
@@ -1491,7 +1777,7 @@ def register_handlers(bot: Client) -> None:
                     try:
                         await user_client.connect()
                     except Exception as e:
-                        await message.reply(f"❌ Не подключиться: {e}")
+                        await message.reply(f"❌ {e}")
                         return
                 try:
                     sent = await user_client.send_code(phone)
@@ -1499,24 +1785,20 @@ def register_handlers(bot: Client) -> None:
                     await message.reply(f"❌ send_code: {e}")
                     return
                 pending[uid] = {"action": "login_code", "phone": phone, "hash": sent.phone_code_hash}
-                await message.reply("📩 Введите код из Telegram (только цифры):")
+                await message.reply("📩 Код:")
 
             elif action == "login_code":
-                phone = act["phone"]
-                hash_ = act["hash"]
-                code = text.replace(" ", "")
                 try:
-                    await user_client.sign_in(phone_number=phone, phone_code_hash=hash_, phone_code=code)
+                    await user_client.sign_in(phone_number=act["phone"],
+                                              phone_code_hash=act["hash"],
+                                              phone_code=text.replace(" ", ""))
                 except SessionPasswordNeeded:
                     pending[uid] = {"action": "login_password"}
-                    await message.reply("🔐 Введите пароль 2FA:")
+                    await message.reply("🔐 Пароль 2FA:")
                     return
                 except PhoneCodeInvalid:
                     pending[uid] = act
-                    await message.reply("❌ Неверный код. Повторите или /cancel")
-                    return
-                except PhoneCodeExpired:
-                    await message.reply("⚠️ Код истёк. /login заново.")
+                    await message.reply("❌ Неверный код.")
                     return
                 except Exception as e:
                     await message.reply(f"❌ {e}")
@@ -1526,32 +1808,26 @@ def register_handlers(bot: Client) -> None:
             elif action == "login_password":
                 try:
                     await user_client.check_password(text)
-                except PasswordHashInvalid:
-                    pending[uid] = {"action": "login_password"}
-                    await message.reply("❌ Неверный пароль. Повторите или /cancel")
-                    return
                 except Exception as e:
+                    pending[uid] = {"action": "login_password"}
                     await message.reply(f"❌ {e}")
                     return
                 await after_userbot_login(message)
 
-            # сообщение рассылки
             elif action == "set_text":
                 if not text:
                     pending[uid] = {"action": "set_text"}
-                    await message.reply("Пустой текст.")
                     return
                 STATE["text"] = text
                 STATE["media_path"] = None
                 STATE["media_type"] = None
                 STATE["caption"] = ""
                 save_json(STATE_FILE, STATE)
-                await message.reply("✅ Текст сохранён.", reply_markup=main_menu_kb())
+                await message.reply("✅ Сохранено.", reply_markup=main_menu_kb())
 
             elif action == "set_media":
                 if not (message.photo or message.video):
                     pending[uid] = {"action": "set_media"}
-                    await message.reply("Не медиа. Пришлите фото/видео.")
                     return
                 if message.photo:
                     ext = "jpg"; STATE["media_type"] = "photo"
@@ -1563,14 +1839,11 @@ def register_handlers(bot: Client) -> None:
                 STATE["caption"] = message.caption or ""
                 STATE["text"] = None
                 save_json(STATE_FILE, STATE)
-                await message.reply(f"✅ Медиа сохранено ({STATE['media_type']}).",
-                    reply_markup=main_menu_kb())
+                await message.reply("✅ Медиа сохранено.", reply_markup=main_menu_kb())
 
-            # группы
             elif action == "add_group":
                 ref = parse_chat_ref(text)
                 if ref is None:
-                    await message.reply("Не распарсил. /cancel")
                     return
                 try:
                     chat = await user_client.get_chat(ref)
@@ -1580,17 +1853,14 @@ def register_handlers(bot: Client) -> None:
                 gid = chat.id
                 title = chat.title or str(gid)
                 if any(g["id"] == gid for g in STATE["groups"]):
-                    await message.reply("ℹ️ Уже в списке.", reply_markup=main_menu_kb())
+                    await message.reply("Уже в списке.")
                     return
                 STATE["groups"].append({
                     "id": gid, "title": title,
-                    "type": chat.type.name if chat.type else "UNKNOWN",
-                    "manual": True,
-                })
+                    "type": chat.type.name if chat.type else "UNKNOWN", "manual": True})
                 save_json(STATE_FILE, STATE)
-                await message.reply(f"✅ {title} ({gid})", reply_markup=main_menu_kb())
+                await message.reply(f"✅ {title}", reply_markup=main_menu_kb())
 
-            # тайминги
             elif action == "set_interval":
                 try:
                     v = int(text)
@@ -1608,23 +1878,21 @@ def register_handlers(bot: Client) -> None:
                     STATE["delay_min"] = v
                     if STATE["delay_max"] < v: STATE["delay_max"] = v
                     save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ {v} сек.", reply_markup=main_menu_kb())
+                    await message.reply(f"✅ {v}", reply_markup=main_menu_kb())
                 except Exception as e:
                     pending[uid] = {"action": "set_delay_min"}
                     await message.reply(f"❌ {e}")
             elif action == "set_delay_max":
                 try:
                     v = int(text)
-                    if v < 1: raise ValueError("мин. 1")
                     if v < STATE["delay_min"]: raise ValueError(f">= {STATE['delay_min']}")
                     STATE["delay_max"] = v
                     save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ {v} сек.", reply_markup=main_menu_kb())
+                    await message.reply(f"✅ {v}", reply_markup=main_menu_kb())
                 except Exception as e:
                     pending[uid] = {"action": "set_delay_max"}
                     await message.reply(f"❌ {e}")
 
-            # ИИ
             elif action in ("ai_style", "ai_about", "ai_work", "ai_forbidden"):
                 ai = STATE.setdefault("ai_assistant", _default_ai())
                 parts = ai.setdefault("prompt_parts", {})
@@ -1643,15 +1911,13 @@ def register_handlers(bot: Client) -> None:
                 if forb:  lines.append(f"ЗАПРЕЩЕНО:\n{forb}")
                 lines.append(
                     "ОБЩИЕ ПРАВИЛА:\n"
-                    "- Пиши как живой человек, не как робот.\n"
-                    "- Не пиши слишком длинные или слишком короткие сообщения.\n"
-                    "- Если клиент запутан или сложный вопрос — передай владельцу.\n"
+                    "- Пиши как живой человек.\n"
+                    "- Не пиши слишком длинно или слишком коротко.\n"
                     "- Никогда не говори, что ты бот или ИИ."
                 )
                 ai["system_prompt"] = "\n\n".join(lines)
                 save_json(STATE_FILE, STATE)
-                await message.reply("✅ Сохранено. Промпт обновлён.",
-                                    reply_markup=ai_menu_kb())
+                await message.reply("✅ Обновлено.", reply_markup=ai_menu_kb())
 
             elif action == "ai_inactive":
                 try:
@@ -1659,54 +1925,92 @@ def register_handlers(bot: Client) -> None:
                     if v < 1: raise ValueError("мин. 1")
                     STATE["ai_assistant"]["inactive_minutes"] = v
                     save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ Неактивность ИИ: {v} мин.",
-                                        reply_markup=ai_menu_kb())
+                    await message.reply(f"✅ {v} мин.", reply_markup=ai_menu_kb())
                 except Exception as e:
                     pending[uid] = {"action": "ai_inactive"}
+                    await message.reply(f"❌ {e}")
+
+            # ⌨️ Имитация набора
+            elif action == "ai_typing_min":
+                try:
+                    v = float(text.replace(",", "."))
+                    if v < 0.5: raise ValueError("мин. 0.5")
+                    STATE["ai_assistant"]["typing_min_delay"] = v
+                    save_json(STATE_FILE, STATE)
+                    await message.reply(f"✅ Мин. задержка: {v} сек.",
+                                        reply_markup=ai_typing_kb())
+                except Exception as e:
+                    pending[uid] = {"action": "ai_typing_min"}
+                    await message.reply(f"❌ {e}")
+            elif action == "ai_typing_max":
+                try:
+                    v = float(text.replace(",", "."))
+                    if v < 0.5: raise ValueError("мин. 0.5")
+                    STATE["ai_assistant"]["typing_max_delay"] = v
+                    save_json(STATE_FILE, STATE)
+                    await message.reply(f"✅ Макс. задержка: {v} сек.",
+                                        reply_markup=ai_typing_kb())
+                except Exception as e:
+                    pending[uid] = {"action": "ai_typing_max"}
+                    await message.reply(f"❌ {e}")
+            elif action == "ai_typing_cps":
+                try:
+                    v = float(text.replace(",", "."))
+                    if v < 1: raise ValueError("мин. 1")
+                    if v > 100: raise ValueError("макс. 100")
+                    STATE["ai_assistant"]["typing_cps"] = v
+                    save_json(STATE_FILE, STATE)
+                    await message.reply(f"✅ Скорость: {v} симв/сек.",
+                                        reply_markup=ai_typing_kb())
+                except Exception as e:
+                    pending[uid] = {"action": "ai_typing_cps"}
                     await message.reply(f"❌ {e}")
 
             elif action == "ai_cf_account":
                 cleaned = clean_secret(text)
                 STATE["ai_assistant"]["cf_account_id"] = cleaned
                 save_json(STATE_FILE, STATE)
-                await message.reply(
-                    f"✅ CF Account ID сохранён (длина {len(cleaned)}).",
-                    reply_markup=ai_cf_menu_kb())
-
+                await message.reply(f"✅ Account ID (длина {len(cleaned)}).",
+                                    reply_markup=ai_cf_menu_kb())
             elif action == "ai_cf_token":
                 cleaned = clean_secret(text)
                 STATE["ai_assistant"]["cf_api_token"] = cleaned
                 save_json(STATE_FILE, STATE)
-                await message.reply(
-                    f"✅ CF API Token сохранён (длина {len(cleaned)}).",
-                    reply_markup=ai_cf_menu_kb())
-
+                await message.reply(f"✅ Token (длина {len(cleaned)}).",
+                                    reply_markup=ai_cf_menu_kb())
             elif action == "ai_cf_model":
                 cleaned = clean_secret(text)
                 STATE["ai_assistant"]["cf_model"] = cleaned or CF_MODELS[0]
                 save_json(STATE_FILE, STATE)
-                await message.reply(f"✅ Модель: {STATE['ai_assistant']['cf_model']}",
-                                    reply_markup=ai_menu_kb())
+                await message.reply("✅ Сохранено.", reply_markup=ai_menu_kb())
 
-            # автоответчик
+            elif action == "ai_rule_add":
+                if not text:
+                    pending[uid] = {"action": "ai_rule_add"}
+                    return
+                ai = STATE.setdefault("ai_assistant", _default_ai())
+                rules = ai.setdefault("rules", [])
+                rules.append(text)
+                save_json(STATE_FILE, STATE)
+                await message.reply(
+                    f"✅ Правило #{len(rules)} добавлено.",
+                    reply_markup=ai_train_kb())
+
             elif action == "ar_first":
                 STATE.setdefault("autoreply", _default_autoreply())["template_first"] = message.text or ""
                 save_json(STATE_FILE, STATE)
-                await message.reply("✅ Шаблон для новых сохранён.",
-                                    reply_markup=autoreply_menu_kb())
+                await message.reply("✅ Сохранено.", reply_markup=autoreply_menu_kb())
             elif action == "ar_known":
                 STATE.setdefault("autoreply", _default_autoreply())["template_known"] = message.text or ""
                 save_json(STATE_FILE, STATE)
-                await message.reply("✅ Шаблон для знакомых сохранён.",
-                                    reply_markup=autoreply_menu_kb())
+                await message.reply("✅ Сохранено.", reply_markup=autoreply_menu_kb())
             elif action == "ar_inactive":
                 try:
                     v = int(text)
                     if v < 1: raise ValueError("мин. 1")
                     STATE["autoreply"]["inactive_minutes"] = v
                     save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ Неактивность автоответчика: {v} мин.",
-                                        reply_markup=autoreply_menu_kb())
+                    await message.reply(f"✅ {v} мин.", reply_markup=autoreply_menu_kb())
                 except Exception as e:
                     pending[uid] = {"action": "ar_inactive"}
                     await message.reply(f"❌ {e}")
@@ -1716,19 +2020,18 @@ def register_handlers(bot: Client) -> None:
                     if v < 0: raise ValueError("мин. 0")
                     STATE["autoreply"]["cooldown_minutes"] = v
                     save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ Cooldown: {v} мин.",
-                                        reply_markup=autoreply_menu_kb())
+                    await message.reply(f"✅ {v} мин.", reply_markup=autoreply_menu_kb())
                 except Exception as e:
                     pending[uid] = {"action": "ar_cooldown"}
                     await message.reply(f"❌ {e}")
 
         except Exception as e:
-            log.exception("Ошибка ввода админа")
+            log.exception("on_admin_input")
             await message.reply(f"❌ {e}")
 
 
 # ---------------------------------------------------------------------------
-# Глобальный обработчик исключений asyncio
+# Глобальный обработчик исключений
 # ---------------------------------------------------------------------------
 
 def _install_asyncio_exception_handler(loop):
@@ -1761,20 +2064,15 @@ async def main():
     STATE = load_state()
 
     _install_asyncio_exception_handler(asyncio.get_running_loop())
-
     await db_init()
-
     http_session = aiohttp.ClientSession()
 
     user_client = Client(name=SESSION_USER, api_id=CFG["api_id"], api_hash=CFG["api_hash"])
     register_user_handlers(user_client)
 
     bot_client = Client(
-        name=SESSION_BOT,
-        api_id=CFG["api_id"],
-        api_hash=CFG["api_hash"],
-        bot_token=CFG["bot_token"],
-    )
+        name=SESSION_BOT, api_id=CFG["api_id"], api_hash=CFG["api_hash"],
+        bot_token=CFG["bot_token"])
     register_handlers(bot_client)
 
     log.info("Запуск управляющего бота…")
@@ -1804,28 +2102,30 @@ async def main():
         ai = STATE.get("ai_assistant") or {}
         ar = STATE.get("autoreply") or {}
         cf_id, cf_tok = _get_cf_creds()
-        cf_ok = "🟢" if (cf_id and cf_tok) else "🔴 (настрой в ИИ-меню)"
+        rules_count = len(ai.get("rules") or [])
+        ex_count = await db_count_examples()
         await bot_client.send_message(
             CFG["admin_id"],
             f"🤖 Автопостер запущен.\n"
-            f"• Юзербот: {'🟢 готов' if USERBOT_READY else '🔴 /login'}\n"
-            f"• ИИ (Cloudflare): {'🟢 вкл' if ai.get('enabled') else '🔴 выкл'}\n"
-            f"• Тест-режим: {'🧪 ВКЛ' if ai.get('test_mode') else '🔴 выкл'}\n"
-            f"• CF ключи: {cf_ok}\n"
+            f"• Юзербот: {'🟢' if USERBOT_READY else '🔴 /login'}\n"
+            f"• ИИ: {'🟢 вкл' if ai.get('enabled') else '🔴 выкл'}\n"
+            f"• Тест: {'🧪 ВКЛ' if ai.get('test_mode') else '🔴'}\n"
+            f"• Имитация набора: {'⌨️ ВКЛ' if ai.get('typing_enabled', True) else '🔴 выкл'}\n"
+            f"• CF ключи: {'🟢' if (cf_id and cf_tok) else '🔴'}\n"
+            f"• Правил: {rules_count} | Примеров: {ex_count}\n"
             f"• Автоответчик: {'🟢 вкл' if ar.get('enabled') else '🔴 выкл'}\n"
             f"Для доступа: `/auth <PIN>`",
             parse_mode=enums.ParseMode.MARKDOWN)
     except Exception as e:
-        log.warning(f"Не отправить приветствие: {e}")
+        log.warning(f"Приветствие не отправилось: {e}")
 
     if STATE.get("running") and USERBOT_READY:
-        log.info("Возобновляю рассылку…")
         start_mailing()
     elif STATE.get("running") and not USERBOT_READY:
         STATE["running"] = False
         save_json(STATE_FILE, STATE)
 
-    log.info("Сервис работает. Ctrl+C для остановки.")
+    log.info("Сервис работает.")
     try:
         await asyncio.Event().wait()
     finally:
