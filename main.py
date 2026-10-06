@@ -11,6 +11,7 @@
   - Защита от prompt injection
   - Встроенный мануал (гайд по API-ресурсам)
   - Автоматические гиперссылки на профили Telegram
+  - Эскалация: ИИ передаёт клиента владельцу с уведомлением
 """
 
 import asyncio
@@ -62,7 +63,7 @@ DEFAULT_PIN = "2512"
 TEST_CLIENT_ID = 8040297502   # @mikureza
 
 # ---------------------------------------------------------------------------
-# Мануал (гайд по API-ресурсам) — встраивается в системный промпт
+# Мануал по бизнесу
 # ---------------------------------------------------------------------------
 
 BUSINESS_GUIDE = """
@@ -73,7 +74,7 @@ BUSINESS_GUIDE = """
 
 ЧТО ПРОДАЁМ:
 - Ключи Opus (Claude Code) — самая востребованная модель по спросу/цене.
-- Объём: 1M токенов на ключ (чтобы выделяться на фоне других поставщиков).
+- Объём: 1M токенов на ключ.
 - Цена опт: ~14$, розница: ~18$. Спред с 1 ключа: 2-3$.
 
 СКУПЩИКИ (покупают ресурс оптом):
@@ -84,21 +85,19 @@ BUSINESS_GUIDE = """
 
 СЕЛЛЕРЫ (продают ресурс нам):
 - Groot (@grootjerk) — даёт API напрямую, специализируется на текстовых моделях.
-  Продаёт от 10 единиц, на объёмы делает скидки. Иногда нужных моделей нет в наличии.
+  Продаёт от 10 единиц, на объёмы делает скидки.
 - Trick (@trickApibot) — бот для покупки ключей Opus (Claude Code) на 1M токенов.
 
 СХЕМА РАБОТЫ:
-1. Берёшь ключи (Opus/Claude Code на 1M токенов) через Trick или у Groot.
+1. Берёшь ключи через Trick или у Groot.
 2. Передаёшь ресурс скупам (Goblin или miranvel).
 3. Ждёшь обработку 1-2 часа.
 4. Получаешь оплату. Спред 2-3$ с ключа.
 5. Лимиты скупов позволяют продавать до 60 ключей в сутки.
-6. Повторяешь с увеличенным объёмом.
 
 ВАЖНО:
-- Скуп не должен знать, что ты перекуп — иначе поймёт, что переплачивает.
-- Мультиаккинг отслеживается через блокчейн — приведёт к бану.
-- Система работает, пока есть спрос на AI и разница в цене.
+- Скуп не должен знать, что ты перекуп.
+- Мультиаккинг отслеживается через блокчейн.
 """
 
 # ---------------------------------------------------------------------------
@@ -170,24 +169,18 @@ def is_test_client(user_id: int) -> bool:
 
 
 def process_links_for_markdown(text: str) -> str:
-    """
-    Преобразует ссылки Telegram в кликабельные гиперссылки Markdown.
-    Пример: '[Groot](https://t.me/grootjerk)' → '[Groot](https://t.me/grootjerk)'
-    Также обрабатывает '@username' и 't.me/username'.
-    """
+    """Превращает @username и t.me/username в кликабельные Markdown-ссылки."""
     if not text:
         return text
 
-    # Уже готовая Markdown-ссылка [text](url) — не трогаем
-    # Просто убеждаемся, что она корректна
-    # Обрабатываем '@username' → '[username](https://t.me/username)'
+    # @username → [username](https://t.me/username)
     text = re.sub(
         r'(?<![/\w])@(\w{5,32})(?![/\w])',
         r'[\1](https://t.me/\1)',
         text
     )
 
-    # Обрабатываем 't.me/username' (без https://) → '[username](https://t.me/username)'
+    # t.me/username → [username](https://t.me/username)
     text = re.sub(
         r'(?<![/\w])t\.me/(\w{5,32})(?![/\w])',
         r'[\1](https://t.me/\1)',
@@ -219,9 +212,14 @@ async def db_init():
                 user_msg TEXT NOT NULL,
                 bad_reply TEXT,
                 good_reply TEXT NOT NULL,
-                timestamp TEXT NOT NULL
+                timestamp TEXT NOT NULL,
+                source TEXT DEFAULT 'owner'
             )
         """)
+        try:
+            await db.execute("ALTER TABLE ai_examples ADD COLUMN source TEXT DEFAULT 'owner'")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -264,14 +262,14 @@ async def db_get_last_user_msg(user_id: int):
         return None
 
 
-async def db_save_example(user_msg: str, bad_reply: str, good_reply: str):
+async def db_save_example(user_msg: str, bad_reply: str, good_reply: str, source: str = "owner"):
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute(
-                "INSERT INTO ai_examples (user_msg, bad_reply, good_reply, timestamp) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO ai_examples (user_msg, bad_reply, good_reply, timestamp, source) "
+                "VALUES (?, ?, ?, ?, ?)",
                 (user_msg or "", bad_reply or "", good_reply,
-                 datetime.now().isoformat(timespec="seconds")))
+                 datetime.now().isoformat(timespec="seconds"), source))
             await db.execute(
                 "DELETE FROM ai_examples WHERE id NOT IN "
                 "(SELECT id FROM ai_examples ORDER BY id DESC LIMIT 200)")
@@ -296,6 +294,18 @@ async def db_count_examples() -> int:
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             async with db.execute("SELECT COUNT(*) FROM ai_examples") as cursor:
+                row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+async def db_count_examples_by_source(source: str) -> int:
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM ai_examples WHERE source = ?", (source,)
+            ) as cursor:
                 row = await cursor.fetchone()
         return int(row[0]) if row else 0
     except Exception:
@@ -468,6 +478,7 @@ def default_state() -> dict:
         "stats": {
             "sent": 0, "errors": 0, "rounds": 0,
             "autoreplies": 0, "ai_replies": 0, "ai_fallbacks": 0,
+            "ai_escalations": 0,
             "last_round": None, "next_round": None,
         },
     }
@@ -493,7 +504,7 @@ def load_state() -> dict:
 
     if not isinstance(st.get("stats"), dict):
         st["stats"] = default_state()["stats"]
-    for k in ("autoreplies", "ai_replies", "ai_fallbacks"):
+    for k in ("autoreplies", "ai_replies", "ai_fallbacks", "ai_escalations"):
         st["stats"].setdefault(k, 0)
     return st
 
@@ -669,11 +680,9 @@ async def _send_as_userbot(user_id: int, text: str, save_to_db: bool = True,
     if with_typing:
         await simulate_typing(user_id, text)
     _register_bot_sent(user_id, text)
-    # Отправляем с Markdown-разметкой для гиперссылок
     try:
         await user_client.send_message(user_id, text, parse_mode=enums.ParseMode.MARKDOWN)
     except Exception:
-        # Если Markdown сломан — отправим как plain text
         await user_client.send_message(user_id, text)
     if save_to_db:
         await db_add_message(user_id, "assistant", text)
@@ -703,7 +712,7 @@ async def build_system_prompt() -> str:
     base = ai.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
     parts = [base]
 
-    # Встраиваем мануал по бизнесу
+    # Мануал по бизнесу
     parts.append(BUSINESS_GUIDE)
 
     # Правила владельца
@@ -736,6 +745,24 @@ async def build_system_prompt() -> str:
         "- Формат: [Имя](https://t.me/username)\n"
         "- Пример: 'Скуп [Goblin](https://t.me/Skonexx) принимает до 25 единиц в сутки.'\n"
         "- НИКОГДА не пиши просто 'Goblin' или '@Skonexx' без ссылки."
+    )
+
+    # Инструкция про передачу руководителю
+    parts.append(
+        "📞 КОГДА ПЕРЕДАВАТЬ РУКОВОДИТЕЛЮ:\n"
+        "- Клиент прямо просит: 'позови человека', 'хочу поговорить с руководителем', "
+        "'оператора', 'живого'.\n"
+        "- Клиент задаёт сложный вопрос, на который нет ответа в твоих знаниях.\n"
+        "- Клиент готов купить / хочет обсудить конкретные условия / объёмы / оплату.\n"
+        "- Клиент предлагает что-то вне обычной схемы (особые скидки, отсрочка, индивидуально).\n"
+        "- Клиент злится или конфликтует.\n\n"
+        "КАК ПЕРЕДАВАТЬ:\n"
+        "Вместо обычного ответа напиши РОВНО одну строку в формате:\n"
+        "ПЕРЕДАЮ_РУКОВОДИТЕЛЮ: краткая причина (до 100 символов)\n\n"
+        "Пример: 'ПЕРЕДАЮ_РУКОВОДИТЕЛЮ: клиент готов к сделке, обсуждаем объём'\n"
+        "Пример: 'ПЕРЕДАЮ_РУКОВОДИТЕЛЮ: просит конкретную скидку'\n"
+        "Пример: 'ПЕРЕДАЮ_РУКОВОДИТЕЛЮ: спрашивает про гарантии и возврат'\n\n"
+        "НИЧЕГО БОЛЬШЕ не пиши — ни приветствий, ни объяснений."
     )
 
     # Блок безопасности
@@ -782,13 +809,14 @@ async def verify_cf_token() -> tuple:
 
 
 async def ask_ai(user_id: int, user_message: str):
+    """Возвращает (reply, error_reason, escalate_reason)."""
     ai_cfg = STATE.get("ai_assistant") or {}
     if not ai_cfg.get("enabled"):
-        return None, "disabled"
+        return None, "disabled", None
 
     account_id, api_token = _get_cf_creds()
     if not account_id or not api_token:
-        return None, "no_credentials"
+        return None, "no_credentials", None
 
     model = clean_secret(ai_cfg.get("cf_model") or CFG.get("cf_model") or CF_MODELS[0]) or CF_MODELS[0]
     system_prompt = await build_system_prompt()
@@ -820,7 +848,7 @@ async def ask_ai(user_id: int, user_message: str):
                     log.error(f"[AI] {m} → HTTP {status}: {body[:300]}")
                     last_error = f"http_{status}"
                     if status in (401, 403):
-                        return None, "auth_error"
+                        return None, "auth_error", None
                     continue
                 try:
                     data = json.loads(body)
@@ -833,9 +861,13 @@ async def ask_ai(user_id: int, user_message: str):
                     continue
                 reply = (data.get("result", {}).get("response") or "").strip()
                 if reply and len(reply) > 2:
-                    # Постобработка: превращаем @username и t.me/username в гиперссылки
+                    # Проверка на маркер эскалации
+                    if reply.startswith("ПЕРЕДАЮ_РУКОВОДИТЕЛЮ"):
+                        esc_reason = reply.split(":", 1)[1].strip() if ":" in reply else "не указана"
+                        log.info(f"[AI] Эскалация: {esc_reason}")
+                        return None, "escalate", esc_reason
                     reply = process_links_for_markdown(reply)
-                    return reply, None
+                    return reply, None, None
                 last_error = "empty"
         except asyncio.TimeoutError:
             last_error = "timeout"
@@ -843,7 +875,7 @@ async def ask_ai(user_id: int, user_message: str):
             log.exception(f"[AI] {m} exception: {e}")
             last_error = "exception"
 
-    return None, (last_error or "unknown")
+    return None, (last_error or "unknown"), None
 
 
 async def notify_ai_fallback(user_id: int, user_message: str, reason: str = ""):
@@ -877,6 +909,32 @@ async def notify_ai_temp_error(user_id: int, user_message: str, reason: str):
             parse_mode=enums.ParseMode.MARKDOWN)
     except Exception:
         pass
+
+
+async def notify_escalation(user_id: int, reason: str, last_user_msg: str = ""):
+    """Уведомляет владельца, что ИИ передал клиента на ручное ведение."""
+    try:
+        username = ""
+        name = str(user_id)
+        try:
+            u = await user_client.get_users(user_id)
+            if u:
+                name = u.first_name or name
+                username = f" (@{u.username})" if u.username else ""
+        except Exception:
+            pass
+        await bot_client.send_message(
+            CFG["admin_id"],
+            f"🚨 **ИИ завершила диалог и перенаправила на вас**\n\n"
+            f"👤 {name}{username}\n"
+            f"🆔 `{user_id}`\n"
+            f"📝 Причина: _{reason}_\n"
+            + (f"💬 Последнее сообщение: {last_user_msg[:200]}\n" if last_user_msg else "")
+            + f"\nИИ приостановлен для этого клиента. Возобновить: `/resume {user_id}`",
+            parse_mode=enums.ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        log.error(f"notify_escalation: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1160,6 +1218,7 @@ def ai_menu_text() -> str:
         f"• Ключи CF: {'✅' if (cf_id and cf_tok) else '❌'}\n"
         f"• Правил: {rules}\n"
         f"• Ответов: {STATE['stats'].get('ai_replies', 0)}\n"
+        f"• Передач руководителю: {STATE['stats'].get('ai_escalations', 0)}\n"
         f"• Приостановлено: {paused}"
     )
 
@@ -1207,7 +1266,8 @@ def ai_train_text() -> str:
         f"• Примеров в промпт: {limit}\n\n"
         "В тест-режиме ты можешь обучать ИИ со своего клиентского аккаунта (@mikureza):\n"
         "• `!текст` — добавить правило\n"
-        "• `?текст` — сохранить пример правки"
+        "• `?текст` — сохранить пример правки\n\n"
+        "💡 Счётчик натренированного смотри в 📊 Смотреть примеры."
     )
 
 
@@ -1334,7 +1394,7 @@ def register_user_handlers(client: Client) -> None:
                 if last_bot and text:
                     last_user = await db_get_last_user_msg(chat.id)
                     if last_user:
-                        await db_save_example(last_user, last_bot, text)
+                        await db_save_example(last_user, last_bot, text, source="owner")
                         log.info(f"[LEARN] Пример сохранён для {chat.id}")
 
             _mark_owner_activity()
@@ -1364,14 +1424,14 @@ def register_user_handlers(client: Client) -> None:
             if not ai.get("enabled") and not ar.get("enabled"):
                 return
 
-            # ✅ Отмечаем прочитанным — чтобы у клиента появились две галочки
+            # Отметка прочитанным
             await mark_chat_read(user.id)
 
             text_raw = (message.text or message.caption or "").strip()
             test_mode = bool(ai.get("test_mode"))
 
             # =========================================================
-            # 🎓 ОБУЧЕНИЕ ИИ В ТЕСТ-РЕЖИМЕ (только с @mikureza)
+            # Обучение в тест-режиме (только с @mikureza)
             # =========================================================
             if test_mode and is_test_client(user.id) and text_raw:
                 if text_raw.startswith("!"):
@@ -1394,7 +1454,8 @@ def register_user_handlers(client: Client) -> None:
                         last_bot = BOT_LAST_SENT.get(user.id)
                         last_user_msg = await db_get_last_user_msg(user.id)
                         if last_bot and last_user_msg:
-                            await db_save_example(last_user_msg, last_bot, fix_text)
+                            await db_save_example(last_user_msg, last_bot, fix_text,
+                                                  source="test_client")
                             await user_client.send_message(
                                 user.id,
                                 "✅ Пример правки сохранён. ИИ будет учитывать.")
@@ -1407,7 +1468,7 @@ def register_user_handlers(client: Client) -> None:
                         return
 
             # =========================================================
-            # 🛡️ ЗАЩИТА ОТ ИНЪЕКЦИЙ
+            # Защита от инъекций
             # =========================================================
             elif not is_test_client(user.id) and text_raw and is_suspicious(text_raw):
                 log.warning(f"[SECURITY] Подозрительное сообщение от {user.id}: {text_raw[:150]}")
@@ -1454,13 +1515,36 @@ def register_user_handlers(client: Client) -> None:
             )
 
             if ai_should_run:
-                reply, reason = await ask_ai(user.id, text)
+                reply, reason, esc_reason = await ask_ai(user.id, text)
+
+                # 🚨 Эскалация
+                if reason == "escalate":
+                    _pause_ai(user.id)
+                    STATE["stats"]["ai_fallbacks"] = STATE["stats"].get("ai_fallbacks", 0) + 1
+                    STATE["stats"]["ai_escalations"] = STATE["stats"].get("ai_escalations", 0) + 1
+                    save_json(STATE_FILE, STATE)
+
+                    try:
+                        await _send_as_userbot(
+                            user.id,
+                            "Сейчас передам тебя руководителю, он свяжется с тобой "
+                            "в ближайшее время 👌",
+                            with_typing=True,
+                        )
+                    except Exception as e:
+                        log.error(f"[ESC] не смог отправить клиенту: {e}")
+
+                    await notify_escalation(user.id, esc_reason or "не указана", text)
+                    return
+
+                # Обычный ответ
                 if reply:
                     await _send_as_userbot(user.id, reply, with_typing=True)
                     STATE["stats"]["ai_replies"] = STATE["stats"].get("ai_replies", 0) + 1
                     save_json(STATE_FILE, STATE)
                     return
 
+                # Ошибки API
                 hard_fail = reason in ("no_credentials", "auth_error", "disabled", "empty")
                 soft_fail = reason in ("timeout", "rate_limit", "exception", "bad_json")
                 if hard_fail:
@@ -1723,7 +1807,7 @@ def register_handlers(bot: Client) -> None:
                     f"➖ Осталось {len(STATE['groups'])}.",
                     reply_markup=groups_kb() if STATE["groups"] else main_menu_kb())
 
-            # ---------- ИИ ----------
+            # ИИ
             elif data == "ai_menu":
                 await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
             elif data == "ai_toggle":
@@ -1823,7 +1907,7 @@ def register_handlers(bot: Client) -> None:
                 await cb.answer(f"▶️ {target} возобновлён.")
                 await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
 
-            # ---------- Обучение ----------
+            # Обучение
             elif data == "ai_train":
                 global await_count_cache
                 await_count_cache = await db_count_examples()
@@ -1889,6 +1973,8 @@ def register_handlers(bot: Client) -> None:
                 save_json(STATE_FILE, STATE)
                 await cb.message.edit_text(ai_train_text(), reply_markup=ai_train_kb())
             elif data == "ai_ex_show":
+                from_owner = await db_count_examples_by_source("owner")
+                from_test = await db_count_examples_by_source("test_client")
                 examples = await db_get_examples(limit=20)
                 if not examples:
                     await cb.answer("Примеров нет.", show_alert=True)
@@ -1898,7 +1984,12 @@ def register_handlers(bot: Client) -> None:
                     u = (ex.get("user_msg") or "")[:100]
                     g = (ex.get("good_reply") or "")[:150]
                     lines.append(f"{i}. 👤 {u}\n   ✅ {g}")
-                text = "📚 Примеры:\n\n" + "\n\n".join(lines)
+                text = (
+                    f"📚 Примеры:\n"
+                    f"• От владельца (твои правки в диалогах): {from_owner}\n"
+                    f"• С тест-клиента (@mikureza): {from_test}\n\n"
+                    + "\n\n".join(lines)
+                )
                 if len(text) > 3500:
                     text = text[:3500] + "\n…(обрезано)"
                 await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup([
@@ -1908,7 +1999,7 @@ def register_handlers(bot: Client) -> None:
                 await cb.answer("🧹 Очищено.", show_alert=True)
                 await cb.message.edit_text(ai_train_text(), reply_markup=ai_train_kb())
 
-            # ---------- Автоответчик ----------
+            # Автоответчик
             elif data == "ar_menu":
                 await cb.message.edit_text(autoreply_menu_text(), reply_markup=autoreply_menu_kb())
             elif data == "ar_toggle":
@@ -1935,7 +2026,7 @@ def register_handlers(bot: Client) -> None:
                 save_json(STATE_FILE, STATE)
                 await cb.message.edit_text("♻️ Сброшено.", reply_markup=autoreply_menu_kb())
 
-            # ---------- Статус ----------
+            # Статус
             elif data == "status":
                 s = STATE["stats"]
                 ai = STATE.get("ai_assistant") or {}
@@ -1955,6 +2046,7 @@ def register_handlers(bot: Client) -> None:
                     f"• Имитация набора: {'🟢' if ai.get('typing_enabled', True) else '🔴'}\n"
                     f"• Ключи CF: {'✅' if (cf_id and cf_tok) else '❌'}\n"
                     f"• Ответов: {s.get('ai_replies', 0)}\n"
+                    f"• Передач руководителю: {s.get('ai_escalations', 0)}\n"
                     f"• Правил: {rules_count} | Примеров: {ex_count}\n\n"
                     f"🤖 Автоответчик: {'🟢' if ar.get('enabled') else '🔴'}\n"
                     f"• Автоответов: {s.get('autoreplies', 0)}"
