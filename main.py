@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Автопостер + автоответчик + ИИ-ассистент (DeepSeek).
+Автопостер + автоответчик + ИИ-ассистент (Cloudflare Workers AI).
 Сессии: /data/userbot.session, /data/control_bot.session
 История диалогов: /data/chat_history.db (SQLite)
 
 Приоритет ответа клиенту:
-    1) ИИ (если включён и владелец неактивен и юзер не на паузе)
-    2) Автоответчик (если включён и владелец неактивен и cooldown ок)
-    3) Передача клиента владельцу (если ИИ не смог ответить)
+    1) ИИ (Cloudflare Workers AI) — если включён, владелец неактивен, юзер не на паузе
+    2) Автоответчик — если включён, владелец неактивен, cooldown ок
+    3) Передача клиента владельцу — если ИИ не смог ответить
 """
 
 import asyncio
@@ -17,8 +17,8 @@ import random
 import logging
 from datetime import datetime, timedelta
 
+import aiohttp
 import aiosqlite
-from openai import OpenAI
 
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -68,17 +68,15 @@ CFG: dict = {}
 STATE: dict = {}
 user_client: Client = None
 bot_client: Client = None
-deepseek_client: OpenAI = None
+http_session: aiohttp.ClientSession = None
 mailing_task: asyncio.Task = None
+peer_refresh_task: asyncio.Task = None
 USERBOT_READY: bool = False
 ME_ID: int = 0
 
 authed: set = set()
 pending: dict = {}
-
-# Защита от ложного определения "владелец вмешался": храним последнее
-# сообщение, отправленное самим ботом (ИИ или автоответчиком) для каждого юзера.
-BOT_LAST_SENT: dict = {}   # user_id -> текст последнего сообщения от бота
+BOT_LAST_SENT: dict = {}
 
 # ---------------------------------------------------------------------------
 # SQLite
@@ -111,7 +109,7 @@ async def db_add_message(user_id: int, role: str, content: str):
         log.error(f"DB add error: {e}")
 
 
-async def db_get_history(user_id: int, limit: int = 20) -> list:
+async def db_get_history(user_id: int, limit: int = 30) -> list:
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             async with db.execute(
@@ -120,11 +118,7 @@ async def db_get_history(user_id: int, limit: int = 20) -> list:
             ) as cursor:
                 rows = await cursor.fetchall()
         rows.reverse()
-        result = []
-        for role, content in rows:
-            r = "user" if role == "user" else "assistant"
-            result.append({"role": r, "content": content})
-        return result
+        return [{"role": ("user" if r == "user" else "assistant"), "content": c} for r, c in rows]
     except Exception as e:
         log.error(f"DB history error: {e}")
         return []
@@ -172,7 +166,9 @@ ENV_MAP = {
     "BOT_TOKEN": ("bot_token", str),
     "ADMIN_ID": ("admin_id", int),
     "PIN": ("pin", str),
-    "DEEPSEEK_API_KEY": ("deepseek_api_key", str),
+    "CF_ACCOUNT_ID": ("cf_account_id", str),
+    "CF_API_TOKEN": ("cf_api_token", str),
+    "CF_MODEL": ("cf_model", str),
 }
 
 
@@ -211,14 +207,14 @@ DEFAULT_SYSTEM_PROMPT = """Ты — Алексей (можно Леха), мен
 - Твоя задача: познакомиться, рассказать о сути, заинтересовать, собрать информацию о клиенте.
 
 КАК ВЕСТИ ДИАЛОГ:
-1. Познакомься. Пример: "Хорошо, меня зовут Алексей, а если просто — Лёха. Как мне обращаться к тебе?"
+1. Познакомься. Пример: "Меня зовут Алексей, а если просто — Лёха. Как мне обращаться к тебе?"
 2. Узнай о клиенте: возраст, чем занимается, был ли опыт с крипто-кошельками.
 3. Если заинтересовал — попроси написать о себе.
 4. Общайся неформально, создавай комфортную атмосферу.
 5. Мягко подводи к покупке.
 
 ЗАПРЕЩЕНО:
-- Называть точные цены без согласования (можешь сказать "около 14$", но не гарантировать).
+- Называть точные цены без согласования (можешь сказать "около 14$").
 - Обещать конкретные сроки или доход.
 - Давить на клиента.
 - Говорить, что ты бот или ИИ. Ты — Алексей, живой человек.
@@ -236,7 +232,10 @@ def _default_ai() -> dict:
         "inactive_minutes": 5,
         "system_prompt": DEFAULT_SYSTEM_PROMPT,
         "prompt_parts": {},
-        "paused_users": [],           # юзеры, которым ИИ больше не отвечает
+        "paused_users": [],
+        "cf_account_id": "",
+        "cf_api_token": "",
+        "cf_model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     }
 
 
@@ -264,7 +263,7 @@ def default_state() -> dict:
         "delay_max": 15,
         "groups": [],
         "running": False,
-        "owner_last_activity": None,   # общее поле: когда ВЛАДЕЛЕЦ последний раз писал
+        "owner_last_activity": None,
         "autoreply": _default_autoreply(),
         "ai_assistant": _default_ai(),
         "stats": {
@@ -279,13 +278,11 @@ def load_state() -> dict:
     raw = load_json(STATE_FILE, {}) or {}
     st = default_state()
     st.update(raw)
-
     for key, default_fn in (("autoreply", _default_autoreply), ("ai_assistant", _default_ai)):
         merged = st.get(key) or {}
         for k, v in default_fn().items():
             merged.setdefault(k, v)
         st[key] = merged
-
     if not isinstance(st.get("stats"), dict):
         st["stats"] = default_state()["stats"]
     for k in ("autoreplies", "ai_replies", "ai_fallbacks"):
@@ -317,7 +314,6 @@ def parse_chat_ref(text: str):
 
 
 def _owner_inactive(minutes: int) -> bool:
-    """Общая проверка неактивности владельца по заданному порогу."""
     last = STATE.get("owner_last_activity")
     if not last:
         return True
@@ -400,19 +396,14 @@ def _unpause_ai(user_id: int):
 
 
 def _register_bot_sent(user_id: int, text: str):
-    """Помечаем, что это сообщение отправил сам бот, а не владелец."""
     BOT_LAST_SENT[user_id] = (text or "").strip()
 
 
 def _was_sent_by_bot(user_id: int, text: str) -> bool:
-    last = BOT_LAST_SENT.get(user_id)
-    if not last:
-        return False
-    return last == (text or "").strip()
+    return BOT_LAST_SENT.get(user_id) == (text or "").strip()
 
 
 async def _send_as_userbot(user_id: int, text: str, save_to_db: bool = True):
-    """Отправка от юзербота с регистрацией в BOT_LAST_SENT."""
     _register_bot_sent(user_id, text)
     await user_client.send_message(user_id, text)
     if save_to_db:
@@ -420,48 +411,101 @@ async def _send_as_userbot(user_id: int, text: str, save_to_db: bool = True):
 
 
 # ---------------------------------------------------------------------------
-# ИИ-ассистент
+# Cloudflare Workers AI
 # ---------------------------------------------------------------------------
 
-async def ai_generate_reply(user_id: int, user_message: str):
-    global deepseek_client
-    if not deepseek_client:
-        log.warning("[AI] DeepSeek клиент не инициализирован")
-        return None
+CF_MODELS = [
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "@cf/meta/llama-3.1-8b-instruct-fast",
+]
 
-    ai_cfg = STATE.get("ai_assistant", {})
+
+async def ask_ai(user_id: int, user_message: str):
+    """Возвращает (reply | None, reason | None). reason='api_error' если временный сбой."""
+    ai_cfg = STATE.get("ai_assistant") or {}
     if not ai_cfg.get("enabled"):
-        return None
+        return None, "disabled"
 
+    account_id = (ai_cfg.get("cf_account_id") or CFG.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID") or "").strip()
+    api_token = (ai_cfg.get("cf_api_token") or CFG.get("cf_api_token") or os.getenv("CF_API_TOKEN") or "").strip()
+    if not account_id or not api_token:
+        log.warning("[AI] Cloudflare: не заданы account_id или api_token")
+        return None, "no_credentials"
+
+    model = (ai_cfg.get("cf_model") or CFG.get("cf_model") or CF_MODELS[0]).strip()
     system_prompt = ai_cfg.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
-    history = await db_get_history(user_id, limit=30)   # не ограничиваем жёстко
+    history = await db_get_history(user_id, limit=30)
 
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
-    messages.append({"role": "user", "content": user_message})
+    if not history or history[-1].get("content") != user_message:
+        messages.append({"role": "user", "content": user_message})
 
-    try:
-        log.info(f"[AI] Запрос в DeepSeek для {user_id}")
-        # max_tokens не ограничиваем — берём большой лимит
-        response = deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=messages,
-            temperature=0.7,
-            max_tokens=2000,
-        )
-        reply = (response.choices[0].message.content or "").strip()
-        if reply:
-            log.info(f"[AI] ✅ Ответ ({len(reply)} симв.)")
-            return reply
-        log.warning("[AI] DeepSeek вернул пустой ответ")
-        return None
-    except Exception as e:
-        log.error(f"[AI] Ошибка DeepSeek: {type(e).__name__}: {e}")
-        return None
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messages": messages,
+        "max_tokens": 1024,
+        "temperature": 0.7,
+    }
+
+    # Пробуем основную модель, потом фоллбэк-модель
+    models_to_try = [model] + [m for m in CF_MODELS if m != model]
+
+    last_error = None
+    for m in models_to_try:
+        url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{m}"
+        try:
+            log.info(f"[AI] Запрос в Cloudflare ({m}) для {user_id}")
+            async with http_session.post(
+                url, json=payload, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=45),
+            ) as resp:
+                status = resp.status
+                body = await resp.text()
+                if status == 429:
+                    log.warning(f"[AI] {m}: rate limit")
+                    last_error = "rate_limit"
+                    continue
+                if status != 200:
+                    log.error(f"[AI] {m} → HTTP {status}: {body[:300]}")
+                    last_error = f"http_{status}"
+                    # 401/403 — не тот ключ, дальше пробовать бессмысленно
+                    if status in (401, 403):
+                        return None, "auth_error"
+                    continue
+                try:
+                    data = json.loads(body)
+                except Exception:
+                    log.error(f"[AI] Не распарсил JSON: {body[:300]}")
+                    last_error = "bad_json"
+                    continue
+                if not data.get("success"):
+                    errs = data.get("errors") or []
+                    log.error(f"[AI] {m} success=false: {errs}")
+                    last_error = "api_error"
+                    continue
+                reply = (data.get("result", {}).get("response") or "").strip()
+                if reply and len(reply) > 2:
+                    log.info(f"[AI] ✅ {m} ответ ({len(reply)} симв.)")
+                    return reply, None
+                log.warning(f"[AI] {m} вернул пустой ответ")
+                last_error = "empty"
+        except asyncio.TimeoutError:
+            log.warning(f"[AI] {m}: timeout")
+            last_error = "timeout"
+            continue
+        except Exception as e:
+            log.exception(f"[AI] {m} exception: {e}")
+            last_error = "exception"
+            continue
+
+    return None, (last_error or "unknown")
 
 
 async def notify_ai_fallback(user_id: int, user_message: str, reason: str = ""):
-    """Уведомляет владельца, что ИИ не справился и клиента нужно подхватить."""
     try:
         username = ""
         name = str(user_id)
@@ -479,12 +523,25 @@ async def notify_ai_fallback(user_id: int, user_message: str, reason: str = ""):
             f"🆔 `{user_id}`\n"
             f"💬 Сообщение: {user_message[:300]}\n"
             f"❓ Причина: {reason or 'неизвестно'}\n\n"
-            f"ИИ приостановлен для этого клиента. Когда разберёшься — "
-            f"`/resume {user_id}`",
+            f"ИИ приостановлен для этого клиента. Возобновить: `/resume {user_id}`",
             parse_mode=enums.ParseMode.MARKDOWN,
         )
     except Exception as e:
         log.error(f"Не удалось уведомить админа: {e}")
+
+
+async def notify_ai_temp_error(user_id: int, user_message: str, reason: str):
+    """Временный сбой — без паузы, просто уведомляем."""
+    try:
+        await bot_client.send_message(
+            CFG["admin_id"],
+            f"⚠️ Временный сбой ИИ ({reason}). Клиент `{user_id}` не получил ответ.\n"
+            f"💬 {user_message[:200]}\n"
+            f"(ИИ НЕ приостановлен для этого клиента — следующее сообщение попробует снова.)",
+            parse_mode=enums.ParseMode.MARKDOWN,
+        )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +667,38 @@ def start_mailing() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Обновление кэша пиров (лечит Peer id invalid)
+# ---------------------------------------------------------------------------
+
+async def peer_refresh_loop():
+    """Раз в 30 минут прогреваем кэш пиров — иначе Pyrogram падает
+    с 'Peer id invalid' на апдейтах из незнакомых чатов."""
+    while True:
+        await asyncio.sleep(1800)
+        if not USERBOT_READY:
+            continue
+        try:
+            count = 0
+            async for _ in user_client.get_dialogs():
+                count += 1
+                if count >= 500:
+                    break
+            log.info(f"[PEERS] Кэш обновлён ({count} диалогов)")
+        except FloodWait as e:
+            log.warning(f"[PEERS] FloodWait {e.value}s")
+            await asyncio.sleep(e.value + 5)
+        except Exception as e:
+            log.warning(f"[PEERS] Ошибка обновления кэша: {e}")
+
+
+def start_peer_refresh():
+    global peer_refresh_task
+    if peer_refresh_task and not peer_refresh_task.done():
+        return
+    peer_refresh_task = asyncio.create_task(peer_refresh_loop())
+
+
+# ---------------------------------------------------------------------------
 # Клавиатуры
 # ---------------------------------------------------------------------------
 
@@ -655,6 +744,9 @@ def groups_kb() -> InlineKeyboardMarkup:
 def ai_menu_kb() -> InlineKeyboardMarkup:
     ai = STATE.get("ai_assistant") or {}
     enabled = ai.get("enabled", False)
+    has_cf = bool((ai.get("cf_account_id") or CFG.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID")))
+    has_tok = bool((ai.get("cf_api_token") or CFG.get("cf_api_token") or os.getenv("CF_API_TOKEN")))
+    cred_state = "✅" if (has_cf and has_tok) else "❌"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔴 Выключить ИИ" if enabled else "🟢 Включить ИИ",
                               callback_data="ai_toggle")],
@@ -666,23 +758,54 @@ def ai_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("♻️ Сбросить промпт к дефолту", callback_data="ai_reset_prompt")],
         [InlineKeyboardButton(f"⏱ Неактивность: {ai.get('inactive_minutes', 5)} мин",
                               callback_data="ai_inactive")],
+        [InlineKeyboardButton(f"🔑 Cloudflare ключи {cred_state}", callback_data="ai_cf_menu")],
+        [InlineKeyboardButton(f"🤖 Модель: {ai.get('cf_model', '')[:40]}", callback_data="ai_cf_model")],
         [InlineKeyboardButton(f"📋 Приостановленные ({len(ai.get('paused_users') or [])})",
                               callback_data="ai_paused")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
     ])
 
 
+def ai_cf_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔑 CF Account ID", callback_data="ai_cf_account")],
+        [InlineKeyboardButton("🔑 CF API Token", callback_data="ai_cf_token")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="ai_menu")],
+    ])
+
+
+def ai_cf_menu_text() -> str:
+    ai = STATE.get("ai_assistant") or {}
+    cf_id = ai.get("cf_account_id") or CFG.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID", "")
+    cf_tok = ai.get("cf_api_token") or CFG.get("cf_api_token") or os.getenv("CF_API_TOKEN", "")
+    return (
+        "🔑 Cloudflare Workers AI — ключи\n\n"
+        f"• Account ID: {'✅ ' + cf_id[:12] + '…' if cf_id else '❌ не задан'}\n"
+        f"• API Token: {'✅ задан' if cf_tok else '❌ не задан'}\n\n"
+        "Где взять:\n"
+        "1. https://dash.cloudflare.com → AI → Workers AI\n"
+        "2. 'Use REST API' → Create Token\n"
+        "3. Скопируй Account ID и API Token\n"
+        "4. Вставь сюда."
+    )
+
+
 def ai_menu_text() -> str:
     ai = STATE.get("ai_assistant") or {}
     paused = len(ai.get("paused_users") or [])
+    cf_id = ai.get("cf_account_id") or CFG.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID", "")
+    cf_tok = ai.get("cf_api_token") or CFG.get("cf_api_token") or os.getenv("CF_API_TOKEN", "")
     return (
-        "🧠 ИИ-ассистент (DeepSeek)\n"
+        "🧠 ИИ-ассистент (Cloudflare Workers AI)\n"
         f"• Статус: {'🟢 вкл' if ai.get('enabled') else '🔴 выкл'}\n"
         f"• Неактивность: {ai.get('inactive_minutes', 5)} мин\n"
+        f"• Модель: {ai.get('cf_model')}\n"
+        f"• Ключи CF: {'✅' if (cf_id and cf_tok) else '❌'}\n"
         f"• Ответов ИИ: {STATE['stats'].get('ai_replies', 0)}\n"
-        f"• Передач админу: {STATE['stats'].get('ai_fallbacks', 0)}\n"
+        f"• Передач владельцу: {STATE['stats'].get('ai_fallbacks', 0)}\n"
         f"• Приостановлено диалогов: {paused}\n\n"
-        "Настрой разделы ниже — они собираются в один системный промпт."
+        "Разделы ниже собираются в один системный промпт.\n"
+        "ИИ отвечает только когда ты неактивен."
     )
 
 
@@ -726,12 +849,12 @@ def autoreply_menu_text() -> str:
         f"• Знакомых: {len(ar.get('known_users') or [])}\n\n"
         f"📩 Шаблон для новых:\n{tf if tf else '— (не задан)'}\n\n"
         f"📩 Шаблон для знакомых:\n{tk if tk else '— (не задан)'}\n\n"
-        "Автоответчик срабатывает, если ИИ выключен или не смог ответить."
+        "Срабатывает, если ИИ выключен или не смог ответить."
     )
 
 
 # ---------------------------------------------------------------------------
-# Логин юзербота / заполнение known_users
+# Заполнение known_users + логин
 # ---------------------------------------------------------------------------
 
 async def populate_known_users():
@@ -741,7 +864,7 @@ async def populate_known_users():
     ar = STATE.get("autoreply") or {}
     if ar.get("known_users_loaded"):
         return
-    log.info("Загружаю известных юзеров из диалогов…")
+    log.info("Загружаю известных юзеров…")
     known = set(ar.get("known_users") or [])
     try:
         async for dialog in user_client.get_dialogs():
@@ -768,12 +891,9 @@ async def after_userbot_login(message=None):
             if not user_client.is_connected:
                 await user_client.connect()
             await user_client.start()
-            log.info("Dispatcher юзербота запущен.")
         except Exception as e:
             log.warning(f"Не удалось запустить dispatcher: {e}")
-
         asyncio.create_task(populate_known_users())
-
         if message is not None:
             await message.reply(
                 f"✅ Юзербот: {me.first_name} (@{me.username or '—'}).",
@@ -792,28 +912,19 @@ def register_user_handlers(client: Client) -> None:
 
     @client.on_message(filters.private & filters.outgoing)
     async def on_outgoing(client, message):
-        """Обновляем активность владельца и метим собеседника как 'взял в свои руки'."""
         try:
             chat = message.chat
             if not chat or not chat.id or chat.id == ME_ID:
                 return
             if chat.type != enums.ChatType.PRIVATE:
                 return
-
             text = (message.text or "").strip()
-
-            # Если это сообщение отправил наш бот (ИИ или автоответчик) — не считаем
-            # это вмешательством владельца.
             if _was_sent_by_bot(chat.id, text):
                 return
-
-            # Настоящий исходящий от владельца:
             _mark_owner_activity()
             _mark_known_ar(chat.id)
             _pause_ai(chat.id)
-            log.info(f"[OWNER ACTIVE] Владелец написал {chat.id} — ИИ приостановлен")
-
-            # Сохраняем в историю для контекста ИИ
+            log.info(f"[OWNER ACTIVE] Владелец написал {chat.id} — ИИ на паузе")
             if text:
                 await db_add_message(chat.id, "assistant", text)
         except Exception as e:
@@ -821,11 +932,9 @@ def register_user_handlers(client: Client) -> None:
 
     @client.on_message(filters.private & filters.incoming)
     async def on_incoming(client, message):
-        """Приоритет: ИИ → автоответчик → передача владельцу."""
         try:
             if not USERBOT_READY:
                 return
-
             user = message.from_user
             if not user or user.is_bot or user.is_deleted:
                 return
@@ -839,7 +948,7 @@ def register_user_handlers(client: Client) -> None:
             if not ai.get("enabled") and not ar.get("enabled"):
                 return
 
-            # Голосовые — только уведомление
+            # Голосовые — уведомляем
             if message.voice or message.video_note or message.audio:
                 try:
                     await bot_client.send_message(
@@ -857,24 +966,36 @@ def register_user_handlers(client: Client) -> None:
 
             await db_add_message(user.id, "user", text)
 
-            # ---- 1. Пробуем ИИ ----
-            ai_tried = False
+            # ---- 1. ИИ ----
             if ai.get("enabled") and not _is_paused_ai(user.id) and _owner_inactive_ai():
-                ai_tried = True
-                reply = await ai_generate_reply(user.id, text)
+                reply, reason = await ask_ai(user.id, text)
                 if reply:
                     await _send_as_userbot(user.id, reply)
                     STATE["stats"]["ai_replies"] = STATE["stats"].get("ai_replies", 0) + 1
                     save_json(STATE_FILE, STATE)
                     log.info(f"[AI REPLY] → {user.id}: {reply[:80]}")
                     return
-                # ИИ не справился — пауза для этого юзера + уведомление владельцу
-                _pause_ai(user.id)
-                STATE["stats"]["ai_fallbacks"] = STATE["stats"].get("ai_fallbacks", 0) + 1
-                save_json(STATE_FILE, STATE)
-                await notify_ai_fallback(user.id, text, "DeepSeek не ответил")
 
-            # ---- 2. Автоответчик (если включён) ----
+                # Классификация причин
+                hard_fail = reason in ("no_credentials", "auth_error", "disabled", "empty")
+                soft_fail = reason in ("timeout", "rate_limit", "exception", "bad_json")
+
+                if hard_fail:
+                    # ИИ реально не может — ставим на паузу и уведомляем
+                    _pause_ai(user.id)
+                    STATE["stats"]["ai_fallbacks"] = STATE["stats"].get("ai_fallbacks", 0) + 1
+                    save_json(STATE_FILE, STATE)
+                    await notify_ai_fallback(user.id, text, reason)
+                elif soft_fail:
+                    # Временный сбой — не паузим, просто уведомляем
+                    await notify_ai_temp_error(user.id, text, reason)
+                else:
+                    _pause_ai(user.id)
+                    STATE["stats"]["ai_fallbacks"] = STATE["stats"].get("ai_fallbacks", 0) + 1
+                    save_json(STATE_FILE, STATE)
+                    await notify_ai_fallback(user.id, text, reason)
+
+            # ---- 2. Автоответчик ----
             if ar.get("enabled") and _owner_inactive_ar() and _cooldown_ok_ar(user.id):
                 known = _is_known_ar(user.id)
                 template = (ar.get("template_known") if known else ar.get("template_first")) or ""
@@ -887,8 +1008,6 @@ def register_user_handlers(client: Client) -> None:
                     save_json(STATE_FILE, STATE)
                     log.info(f"[AUTOREPLY] → {user.id} ({'known' if known else 'new'})")
                     return
-
-            # Если ИИ был выключен и автоответчик выключен/на cooldown — ничего не делаем.
 
         except FloodWait as fw:
             log.warning(f"FloodWait: {fw.value}s")
@@ -956,8 +1075,7 @@ def register_handlers(bot: Client) -> None:
             await message.reply("❌ user_id должен быть числом.")
             return
         _pause_ai(uid)
-        await message.reply(f"⏸ ИИ приостановлен для {uid}. Возобновить: `/resume {uid}`",
-                            parse_mode=enums.ParseMode.MARKDOWN)
+        await message.reply(f"⏸ ИИ приостановлен для {uid}.")
 
     @bot.on_message(filters.command("resume") & filters.private)
     async def cmd_resume(client, message):
@@ -1002,7 +1120,6 @@ def register_handlers(bot: Client) -> None:
             return
         data = cb.data or ""
         try:
-            # ---------- главное меню ----------
             if data == "menu":
                 await cb.message.edit_text("🎛 Панель управления:", reply_markup=main_menu_kb())
 
@@ -1065,7 +1182,6 @@ def register_handlers(bot: Client) -> None:
                 save_json(STATE_FILE, STATE)
                 await cb.message.edit_text("🗑 Очищено.", reply_markup=main_menu_kb())
 
-            # ---------- тайминги ----------
             elif data == "timings":
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("⏱ Интервал круга (сек)", callback_data="set_interval")],
@@ -1088,7 +1204,6 @@ def register_handlers(bot: Client) -> None:
                 pending[uid] = {"action": "set_delay_max"}
                 await cb.message.edit_text("Макс. задержка.\n/cancel")
 
-            # ---------- группы ----------
             elif data == "scan":
                 if not USERBOT_READY:
                     await cb.answer("Юзербот не готов.", show_alert=True)
@@ -1131,7 +1246,7 @@ def register_handlers(bot: Client) -> None:
                 else:
                     await cb.message.edit_text("➖ Пусто.", reply_markup=main_menu_kb())
 
-            # ---------- ИИ-ассистент ----------
+            # ---------- ИИ ----------
             elif data == "ai_menu":
                 await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
 
@@ -1178,14 +1293,33 @@ def register_handlers(bot: Client) -> None:
                 await cb.message.edit_text(
                     f"Через сколько минут твоего отсутствия включать ИИ? "
                     f"(сейчас {(STATE.get('ai_assistant') or {}).get('inactive_minutes', 5)})\n/cancel")
+
+            elif data == "ai_cf_menu":
+                await cb.message.edit_text(ai_cf_menu_text(), reply_markup=ai_cf_menu_kb())
+
+            elif data == "ai_cf_account":
+                pending[uid] = {"action": "ai_cf_account"}
+                await cb.message.edit_text("Отправь Cloudflare Account ID.\n/cancel")
+
+            elif data == "ai_cf_token":
+                pending[uid] = {"action": "ai_cf_token"}
+                await cb.message.edit_text("Отправь Cloudflare API Token.\n/cancel")
+
+            elif data == "ai_cf_model":
+                models_text = "\n".join(f"`{m}`" for m in CF_MODELS)
+                pending[uid] = {"action": "ai_cf_model"}
+                await cb.message.edit_text(
+                    f"Отправь ID модели Cloudflare Workers AI.\n\n"
+                    f"Популярные:\n{models_text}\n\n/cancel",
+                    parse_mode=enums.ParseMode.MARKDOWN)
+
             elif data == "ai_paused":
                 ai = STATE.get("ai_assistant") or {}
                 if not (ai.get("paused_users") or []):
                     await cb.answer("Список пуст.", show_alert=True)
                     return
                 await cb.message.edit_text(
-                    "📋 Приостановленные диалоги (ИИ не отвечает):\n"
-                    "Нажми, чтобы возобновить.",
+                    "📋 Приостановленные (ИИ не отвечает):",
                     reply_markup=ai_paused_kb())
             elif data.startswith("ai_resume:"):
                 try:
@@ -1214,12 +1348,12 @@ def register_handlers(bot: Client) -> None:
             elif data == "ar_inactive":
                 pending[uid] = {"action": "ar_inactive"}
                 await cb.message.edit_text(
-                    f"Через сколько минут отсутствия владельца включать автоответ? "
+                    f"Через сколько минут отсутствия включать автоответ? "
                     f"(сейчас {STATE['autoreply'].get('inactive_minutes', 5)})\n/cancel")
             elif data == "ar_cooldown":
                 pending[uid] = {"action": "ar_cooldown"}
                 await cb.message.edit_text(
-                    f"Cooldown на одного собеседника в минутах "
+                    f"Cooldown на собеседника в минутах "
                     f"(сейчас {STATE['autoreply'].get('cooldown_minutes', 60)})\n/cancel")
             elif data == "ar_reset_known":
                 ar = STATE.setdefault("autoreply", _default_autoreply())
@@ -1227,15 +1361,16 @@ def register_handlers(bot: Client) -> None:
                 ar["known_users_loaded"] = False
                 save_json(STATE_FILE, STATE)
                 await cb.message.edit_text(
-                    "♻️ Список знакомых сброшен. Он перезагрузится из диалогов "
-                    "(если юзербот подключён).",
+                    "♻️ Список знакомых сброшен.",
                     reply_markup=autoreply_menu_kb())
 
-            # ---------- статус ----------
+            # ---------- Статус ----------
             elif data == "status":
                 s = STATE["stats"]
                 ai = STATE.get("ai_assistant") or {}
                 ar = STATE.get("autoreply") or {}
+                cf_id = ai.get("cf_account_id") or CFG.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID", "")
+                cf_tok = ai.get("cf_api_token") or CFG.get("cf_api_token") or os.getenv("CF_API_TOKEN", "")
                 txt = (
                     f"📊 Статистика\n"
                     f"• Юзербот: {'🟢' if USERBOT_READY else '🔴'}\n"
@@ -1244,7 +1379,9 @@ def register_handlers(bot: Client) -> None:
                     f"• Отправлено: {s.get('sent', 0)}\n"
                     f"• Ошибок: {s.get('errors', 0)}\n"
                     f"• Кругов: {s.get('rounds', 0)}\n\n"
-                    f"🧠 ИИ-ассистент: {'🟢' if ai.get('enabled') else '🔴'}\n"
+                    f"🧠 ИИ (Cloudflare): {'🟢' if ai.get('enabled') else '🔴'}\n"
+                    f"• Ключи CF: {'✅' if (cf_id and cf_tok) else '❌'}\n"
+                    f"• Модель: {ai.get('cf_model')}\n"
                     f"• Ответов ИИ: {s.get('ai_replies', 0)}\n"
                     f"• Передач владельцу: {s.get('ai_fallbacks', 0)}\n"
                     f"• Приостановлено: {len(ai.get('paused_users') or [])}\n"
@@ -1283,7 +1420,7 @@ def register_handlers(bot: Client) -> None:
         action = act.get("action")
         text = (message.text or "").strip()
         try:
-            # ---- логин ----
+            # логин
             if action == "login_phone":
                 phone = text
                 if not phone.startswith("+"):
@@ -1319,7 +1456,7 @@ def register_handlers(bot: Client) -> None:
                     await message.reply("❌ Неверный код. Повторите или /cancel")
                     return
                 except PhoneCodeExpired:
-                    await message.reply("⚠️ Код истёк. Подожди 2 мин и /login заново.")
+                    await message.reply("⚠️ Код истёк. /login заново.")
                     return
                 except Exception as e:
                     await message.reply(f"❌ {e}")
@@ -1338,7 +1475,7 @@ def register_handlers(bot: Client) -> None:
                     return
                 await after_userbot_login(message)
 
-            # ---- сообщение рассылки ----
+            # сообщение рассылки
             elif action == "set_text":
                 if not text:
                     pending[uid] = {"action": "set_text"}
@@ -1369,7 +1506,7 @@ def register_handlers(bot: Client) -> None:
                 await message.reply(f"✅ Медиа сохранено ({STATE['media_type']}).",
                     reply_markup=main_menu_kb())
 
-            # ---- группы ----
+            # группы
             elif action == "add_group":
                 ref = parse_chat_ref(text)
                 if ref is None:
@@ -1393,7 +1530,7 @@ def register_handlers(bot: Client) -> None:
                 save_json(STATE_FILE, STATE)
                 await message.reply(f"✅ {title} ({gid})", reply_markup=main_menu_kb())
 
-            # ---- тайминги ----
+            # тайминги
             elif action == "set_interval":
                 try:
                     v = int(text)
@@ -1427,7 +1564,7 @@ def register_handlers(bot: Client) -> None:
                     pending[uid] = {"action": "set_delay_max"}
                     await message.reply(f"❌ {e}")
 
-            # ---- ИИ ----
+            # ИИ
             elif action in ("ai_style", "ai_about", "ai_work", "ai_forbidden"):
                 ai = STATE.setdefault("ai_assistant", _default_ai())
                 parts = ai.setdefault("prompt_parts", {})
@@ -1440,14 +1577,10 @@ def register_handlers(bot: Client) -> None:
                 forb = (parts.get("ai_forbidden") or "").strip()
 
                 lines = []
-                if style:
-                    lines.append(f"СТИЛЬ ОБЩЕНИЯ:\n{style}")
-                if about:
-                    lines.append(f"ИНФОРМАЦИЯ ОБО МНЕ:\n{about}")
-                if work:
-                    lines.append(f"СУТЬ РАБОТЫ:\n{work}")
-                if forb:
-                    lines.append(f"ЗАПРЕЩЕНО:\n{forb}")
+                if style: lines.append(f"СТИЛЬ ОБЩЕНИЯ:\n{style}")
+                if about: lines.append(f"ИНФОРМАЦИЯ ОБО МНЕ:\n{about}")
+                if work:  lines.append(f"СУТЬ РАБОТЫ:\n{work}")
+                if forb:  lines.append(f"ЗАПРЕЩЕНО:\n{forb}")
                 lines.append(
                     "ОБЩИЕ ПРАВИЛА:\n"
                     "- Пиши как живой человек, не как робот.\n"
@@ -1472,19 +1605,33 @@ def register_handlers(bot: Client) -> None:
                     pending[uid] = {"action": "ai_inactive"}
                     await message.reply(f"❌ {e}")
 
-            # ---- Автоответчик ----
+            elif action == "ai_cf_account":
+                STATE["ai_assistant"]["cf_account_id"] = text
+                save_json(STATE_FILE, STATE)
+                await message.reply("✅ CF Account ID сохранён.", reply_markup=ai_cf_menu_kb())
+
+            elif action == "ai_cf_token":
+                STATE["ai_assistant"]["cf_api_token"] = text
+                save_json(STATE_FILE, STATE)
+                await message.reply("✅ CF API Token сохранён.", reply_markup=ai_cf_menu_kb())
+
+            elif action == "ai_cf_model":
+                STATE["ai_assistant"]["cf_model"] = text or CF_MODELS[0]
+                save_json(STATE_FILE, STATE)
+                await message.reply(f"✅ Модель: {STATE['ai_assistant']['cf_model']}",
+                                    reply_markup=ai_menu_kb())
+
+            # автоответчик
             elif action == "ar_first":
                 STATE.setdefault("autoreply", _default_autoreply())["template_first"] = message.text or ""
                 save_json(STATE_FILE, STATE)
                 await message.reply("✅ Шаблон для новых сохранён.",
                                     reply_markup=autoreply_menu_kb())
-
             elif action == "ar_known":
                 STATE.setdefault("autoreply", _default_autoreply())["template_known"] = message.text or ""
                 save_json(STATE_FILE, STATE)
                 await message.reply("✅ Шаблон для знакомых сохранён.",
                                     reply_markup=autoreply_menu_kb())
-
             elif action == "ar_inactive":
                 try:
                     v = int(text)
@@ -1496,7 +1643,6 @@ def register_handlers(bot: Client) -> None:
                 except Exception as e:
                     pending[uid] = {"action": "ar_inactive"}
                     await message.reply(f"❌ {e}")
-
             elif action == "ar_cooldown":
                 try:
                     v = int(text)
@@ -1515,11 +1661,31 @@ def register_handlers(bot: Client) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Глобальный обработчик исключений asyncio
+# ---------------------------------------------------------------------------
+
+def _install_asyncio_exception_handler(loop):
+    """Pyrogram иногда падает на 'Peer id invalid' в фоновых тасках.
+    Это не критично — просто пропускаем такие ошибки, не спамим в логи."""
+    def handler(loop, context):
+        exc = context.get("exception")
+        msg = str(context.get("message") or "")
+        if isinstance(exc, ValueError) and "Peer id invalid" in str(exc):
+            return
+        if isinstance(exc, KeyError) and "ID not found" in str(exc):
+            return
+        if "Peer id invalid" in msg or "ID not found" in msg:
+            return
+        loop.default_exception_handler(context)
+    loop.set_exception_handler(handler)
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
 async def main():
-    global CFG, STATE, user_client, bot_client, deepseek_client, USERBOT_READY, ME_ID
+    global CFG, STATE, user_client, bot_client, http_session, USERBOT_READY, ME_ID
 
     CFG = load_cfg()
     if not cfg_ok(CFG):
@@ -1529,27 +1695,20 @@ async def main():
     save_json(CONFIG_FILE, CFG)
     STATE = load_state()
 
-    # --- SQLite ---
+    # Глобальный handler ДО запуска клиентов
+    _install_asyncio_exception_handler(asyncio.get_running_loop())
+
+    # SQLite
     await db_init()
 
-    # --- DeepSeek ---
-    if CFG.get("deepseek_api_key"):
-        try:
-            deepseek_client = OpenAI(
-                api_key=CFG["deepseek_api_key"],
-                base_url="https://api.deepseek.com",
-            )
-            log.info("✅ DeepSeek клиент инициализирован.")
-        except Exception as e:
-            log.warning(f"DeepSeek не инициализирован: {e}")
-    else:
-        log.warning("DEEPSEEK_API_KEY не задан — ИИ работать не будет.")
+    # aiohttp сессия
+    http_session = aiohttp.ClientSession()
 
-    # --- Юзербот ---
+    # Юзербот
     user_client = Client(name=SESSION_USER, api_id=CFG["api_id"], api_hash=CFG["api_hash"])
     register_user_handlers(user_client)
 
-    # --- Бот ---
+    # Бот
     bot_client = Client(
         name=SESSION_BOT,
         api_id=CFG["api_id"],
@@ -1563,15 +1722,16 @@ async def main():
     bme = await bot_client.get_me()
     log.info(f"Бот запущен: @{bme.username}")
 
-    # --- Пытаемся поднять юзербот ---
+    # Юзербот из сессии
     try:
         await user_client.start()
         me = await user_client.get_me()
         if me:
             ME_ID = me.id
             USERBOT_READY = True
-            log.info(f"✅ Юзербот авторизован: {me.first_name} (@{me.username}) id={me.id}")
+            log.info(f"✅ Юзербот: {me.first_name} (@{me.username}) id={me.id}")
             asyncio.create_task(populate_known_users())
+            start_peer_refresh()
     except Exception as e:
         log.warning(f"Юзербот не авторизован: {e}")
         try:
@@ -1581,25 +1741,25 @@ async def main():
             pass
         USERBOT_READY = False
 
-    # --- Приветствие ---
+    # Приветствие
     try:
-        ai_status = "🟢 вкл" if (STATE.get("ai_assistant") or {}).get("enabled") else "🔴 выкл"
-        ar_status = "🟢 вкл" if (STATE.get("autoreply") or {}).get("enabled") else "🔴 выкл"
-        ds_status = "🟢 подключён" if deepseek_client else "🔴 нет ключа"
-        ub_status = "🟢 готов" if USERBOT_READY else "🔴 не авторизован (/login)"
+        ai = STATE.get("ai_assistant") or {}
+        ar = STATE.get("autoreply") or {}
+        cf_id = ai.get("cf_account_id") or CFG.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID", "")
+        cf_tok = ai.get("cf_api_token") or CFG.get("cf_api_token") or os.getenv("CF_API_TOKEN", "")
+        cf_ok = "🟢" if (cf_id and cf_tok) else "🔴 (настрой в ИИ-меню)"
         await bot_client.send_message(
             CFG["admin_id"],
             f"🤖 Автопостер запущен.\n"
-            f"• Юзербот: {ub_status}\n"
-            f"• DeepSeek: {ds_status}\n"
-            f"• ИИ-ассистент: {ai_status}\n"
-            f"• Автоответчик: {ar_status}\n"
+            f"• Юзербот: {'🟢 готов' if USERBOT_READY else '🔴 /login'}\n"
+            f"• ИИ (Cloudflare): {'🟢 вкл' if ai.get('enabled') else '🔴 выкл'}\n"
+            f"• CF ключи: {cf_ok}\n"
+            f"• Автоответчик: {'🟢 вкл' if ar.get('enabled') else '🔴 выкл'}\n"
             f"Для доступа: `/auth <PIN>`",
             parse_mode=enums.ParseMode.MARKDOWN)
     except Exception as e:
         log.warning(f"Не отправить приветствие: {e}")
 
-    # --- Восстановление рассылки ---
     if STATE.get("running") and USERBOT_READY:
         log.info("Возобновляю рассылку…")
         start_mailing()
@@ -1608,7 +1768,11 @@ async def main():
         save_json(STATE_FILE, STATE)
 
     log.info("Сервис работает. Ctrl+C для остановки.")
-    await asyncio.Event().wait()
+    try:
+        await asyncio.Event().wait()
+    finally:
+        if http_session:
+            await http_session.close()
 
 
 if __name__ == "__main__":
