@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Автопостер + ИИ-ассистент на Groq (Llama 3.3 70B).
-Помнит диалоги через SQLite. Ручное вмешательство из бота.
+Автопостер + автоответчик + ИИ-ассистент на DeepSeek.
+Юзербот-сессия: /data/userbot.session
 """
 
 import asyncio
@@ -13,7 +13,7 @@ import logging
 import aiosqlite
 from datetime import datetime, timedelta
 
-from groq import Groq
+from openai import OpenAI
 
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -63,7 +63,7 @@ CFG: dict = {}
 STATE: dict = {}
 user_client: Client = None
 bot_client: Client = None
-groq_client: Groq = None
+deepseek_client: OpenAI = None
 mailing_task: asyncio.Task = None
 USERBOT_READY: bool = False
 ME_ID: int = 0
@@ -76,7 +76,6 @@ pending: dict = {}
 # ---------------------------------------------------------------------------
 
 async def db_init():
-    """Создаёт таблицу истории диалогов, если её нет."""
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS messages (
@@ -94,7 +93,6 @@ async def db_init():
 
 
 async def db_add_message(user_id: int, role: str, content: str):
-    """role: 'user' (клиент) или 'assistant' (ИИ) или 'owner' (владелец)."""
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
             "INSERT INTO messages (user_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
@@ -104,7 +102,6 @@ async def db_add_message(user_id: int, role: str, content: str):
 
 
 async def db_get_history(user_id: int, limit: int = 20) -> list:
-    """Возвращает последние N сообщений диалога в формате Groq messages."""
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute(
             "SELECT role, content FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT ?",
@@ -114,7 +111,6 @@ async def db_get_history(user_id: int, limit: int = 20) -> list:
     rows.reverse()
     result = []
     for role, content in rows:
-        # Мапим 'user' (клиент) -> 'user' в Groq, 'assistant'/'owner' -> 'assistant'
         groq_role = "user" if role == "user" else "assistant"
         result.append({"role": groq_role, "content": content})
     return result
@@ -152,7 +148,7 @@ ENV_MAP = {
     "BOT_TOKEN": ("bot_token", str),
     "ADMIN_ID": ("admin_id", int),
     "PIN": ("pin", str),
-    "GROQ_API_KEY": ("groq_api_key", str),
+    "DEEPSEEK_API_KEY": ("deepseek_api_key", str),
 }
 
 
@@ -174,7 +170,7 @@ def cfg_ok(cfg: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Дефолтный промпт (твои примеры)
+# Дефолтный промпт
 # ---------------------------------------------------------------------------
 
 DEFAULT_SYSTEM_PROMPT = """Ты — Алексей (можно Леха), менеджер по продажам. Общаешься с потенциальными клиентами в Telegram.
@@ -186,7 +182,7 @@ DEFAULT_SYSTEM_PROMPT = """Ты — Алексей (можно Леха), мен
 - Умеренно используй эмодзи (🤝, 😊, 👍) — не перебарщивай.
 
 СУТЬ РАБОТЫ:
-- Мы продаём IP-ключи (прокси/доступы). Оптовая цена — 14$, розничная — 18$. 
+- Мы продаём IP-ключи (прокси/доступы). Оптовая цена — 14$, розничная — 18$.
 - Клиент покупает у нас оптом, продаёт дороже, маржу оставляет себе.
 - Твоя задача: познакомиться, рассказать о сути, заинтересовать, собрать информацию о клиенте.
 
@@ -207,45 +203,52 @@ DEFAULT_SYSTEM_PROMPT = """Ты — Алексей (можно Леха), мен
 
 
 # ---------------------------------------------------------------------------
-# ИИ-ассистент
+# ИИ-ассистент (DeepSeek)
 # ---------------------------------------------------------------------------
 
-# Флаг: юзеры, с которыми ИИ НЕ должен общаться (владелец вмешался)
-ai_paused_users: set = set()
-
-
 async def ai_generate_reply(user_id: int, user_message: str) -> str:
-    """Генерирует ответ от ИИ с учётом истории диалога."""
-    global groq_client
-    if not groq_client:
+    global deepseek_client
+    if not deepseek_client:
+        log.warning("[AI] DeepSeek клиент не инициализирован — пропускаю")
         return None
 
     ai_cfg = STATE.get("ai_assistant", {})
     if not ai_cfg.get("enabled"):
+        log.info("[AI] ИИ выключен в настройках — пропускаю")
         return None
 
-    # Собираем системный промпт из настроек
     system_prompt = ai_cfg.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
-
-    # Достаём историю диалога
     history = await db_get_history(user_id, limit=20)
 
-    # Собираем messages для Groq
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_message})
 
     try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        log.info("[AI] Запрос в DeepSeek (deepseek-chat)")
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-chat",
             messages=messages,
             temperature=0.7,
             max_tokens=500,
         )
         reply = response.choices[0].message.content.strip()
-        return reply
+        if reply:
+            log.info(f"[AI] ✅ Ответ ({len(reply)} симв.)")
+            return reply
+        else:
+            log.warning("[AI] DeepSeek вернул пустой ответ")
+            return None
     except Exception as e:
-        log.exception(f"Ошибка Groq: {e}")
+        log.error(f"[AI] Ошибка DeepSeek: {type(e).__name__}: {e}")
+        try:
+            await bot_client.send_message(
+                CFG["admin_id"],
+                f"❌ ИИ не смог ответить — ошибка DeepSeek:\n`{e}`",
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
+        except Exception:
+            pass
         return None
 
 
@@ -256,10 +259,11 @@ async def ai_generate_reply(user_id: int, user_message: str) -> str:
 def _default_ai() -> dict:
     return {
         "enabled": False,
-        "inactive_minutes": 5,      # через сколько минут офлайна включается ИИ
+        "inactive_minutes": 5,
         "system_prompt": DEFAULT_SYSTEM_PROMPT,
         "last_user_activity": None,
-        "paused_users": [],         # юзеры, с которыми ИИ не общается (ты вмешался)
+        "paused_users": [],
+        "prompt_parts": {},
     }
 
 
@@ -352,7 +356,7 @@ def _is_owner_inactive_ai() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Отправка / скан / рассылка (без изменений)
+# Отправка / скан / рассылка
 # ---------------------------------------------------------------------------
 
 async def send_post(chat_id: int) -> None:
@@ -535,12 +539,12 @@ def ai_menu_text() -> str:
     ai = STATE.get("ai_assistant") or {}
     paused = len(ai.get("paused_users") or [])
     return (
-        "🤖 ИИ-ассистент\n"
+        "🤖 ИИ-ассистент (DeepSeek)\n"
         f"• Статус: {'🟢 вкл' if ai.get('enabled') else '🔴 выкл'}\n"
         f"• Офлайн-порог: {ai.get('inactive_minutes', 5)} мин\n"
         f"• Ответов ИИ: {STATE['stats'].get('ai_replies', 0)}\n"
         f"• Приостановлено диалогов: {paused}\n\n"
-        "Настрой разделы ниже — они собираются в один системный промпт для Llama 3.3."
+        "Настрой разделы ниже — они собираются в один системный промпт."
     )
 
 
@@ -573,14 +577,13 @@ async def after_userbot_login(message=None):
 
 
 # ---------------------------------------------------------------------------
-# Обработчики юзербота (главное!)
+# Обработчики юзербота
 # ---------------------------------------------------------------------------
 
 def register_user_handlers(client: Client) -> None:
 
     @client.on_message(filters.private & filters.outgoing)
     async def on_outgoing(client, message):
-        """Владелец написал сам — обновляем активность и приостанавливаем ИИ."""
         try:
             chat = message.chat
             if not chat or not chat.id or chat.id == ME_ID:
@@ -588,25 +591,13 @@ def register_user_handlers(client: Client) -> None:
             if chat.type != enums.ChatType.PRIVATE:
                 return
 
-            text = (message.text or "").strip()
-            # Определяем: это автоответ/ИИ или сам владелец?
             ai = STATE.get("ai_assistant") or {}
-            # ИИ-ответы и автоответы содержат характерные маркеры, но проще:
-            # если сообщение отправлено не через наш send_ai_reply — считаем владельцем.
-            # Здесь ловим только сообщения, отправленные ВЛАДЕЛЬЦЕМ вручную.
-
-            # Проверяем, не наш ли это последний ИИ-ответ
-            from_ai = message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == ME_ID
-
-            # Обновляем активность владельца
             ai["last_user_activity"] = datetime.now().isoformat(timespec="seconds")
 
-            # Если владелец написал сам (не через reply на свой же пост) — ставим ИИ на паузу
-            if not from_ai:
-                paused = set(ai.get("paused_users") or [])
-                paused.add(str(chat.id))
-                ai["paused_users"] = list(paused)
-                log.info(f"[AI PAUSED] Владелец вмешался в диалог с {chat.id}")
+            paused = set(ai.get("paused_users") or [])
+            paused.add(str(chat.id))
+            ai["paused_users"] = list(paused)
+            log.info(f"[AI PAUSED] Владелец вмешался в диалог с {chat.id}")
 
             STATE["ai_assistant"] = ai
             save_json(STATE_FILE, STATE)
@@ -615,7 +606,6 @@ def register_user_handlers(client: Client) -> None:
 
     @client.on_message(filters.private & filters.incoming)
     async def on_incoming(client, message):
-        """Новое входящее сообщение от клиента."""
         try:
             if not USERBOT_READY:
                 return
@@ -631,15 +621,13 @@ def register_user_handlers(client: Client) -> None:
             if not ai.get("enabled"):
                 return
 
-            # Если владелец недавно писал — ИИ молчит
             if not _is_owner_inactive_ai():
                 return
 
-            # Если этот юзер на паузе (владелец вмешался)
             if str(user.id) in (ai.get("paused_users") or []):
                 return
 
-            # ---- Голосовое сообщение -> пересылаем владельцу ----
+            # Голосовое -> уведомление
             if message.voice or message.video_note or message.audio:
                 try:
                     await bot_client.send_message(
@@ -651,18 +639,14 @@ def register_user_handlers(client: Client) -> None:
                     pass
                 return
 
-            # ---- Обычный текст ----
             text = (message.text or message.caption or "").strip()
             if not text:
                 return
 
-            # Сохраняем входящее в историю
             await db_add_message(user.id, "user", text)
 
-            # Генерируем ответ ИИ
             reply = await ai_generate_reply(user.id, text)
             if not reply:
-                # ИИ не смог — уведомляем владельца
                 try:
                     await bot_client.send_message(
                         CFG["admin_id"],
@@ -673,10 +657,7 @@ def register_user_handlers(client: Client) -> None:
                     pass
                 return
 
-            # Отправляем ответ
             await user_client.send_message(user.id, reply)
-
-            # Сохраняем ответ в историю
             await db_add_message(user.id, "assistant", reply)
 
             STATE["stats"]["ai_replies"] = STATE["stats"].get("ai_replies", 0) + 1
@@ -723,7 +704,6 @@ def register_handlers(bot: Client) -> None:
 
     @bot.on_message(filters.command("pause") & filters.private)
     async def cmd_pause(client, message):
-        """Ручное приостановление ИИ для конкретного юзера: /pause <user_id или @username>."""
         if message.from_user.id != CFG["admin_id"] or message.from_user.id not in authed:
             return
         parts = (message.text or "").split(maxsplit=1)
@@ -942,27 +922,18 @@ def register_handlers(bot: Client) -> None:
                 pending[uid] = {"action": "ai_style"}
                 await cb.message.edit_text(
                     "📝 Опиши стиль общения ИИ. Например:\n"
-                    "«Дружелюбно, неформально, с лёгкими эмодзи, короткие сообщения»\n\n"
-                    "Отправь текст:",
-                )
+                    "«Дружелюбно, неформально, с лёгкими эмодзи, короткие сообщения»\n\nОтправь текст:")
             elif data == "ai_about":
                 pending[uid] = {"action": "ai_about"}
-                await cb.message.edit_text(
-                    "👤 Напиши информацию о себе (имя, чем занимаешься):",
-                )
+                await cb.message.edit_text("👤 Напиши информацию о себе (имя, чем занимаешься):")
             elif data == "ai_work":
                 pending[uid] = {"action": "ai_work"}
-                await cb.message.edit_text(
-                    "💼 Опиши суть работы/продукта (что продаёшь, цены, схему):",
-                )
+                await cb.message.edit_text("💼 Опиши суть работы/продукта (что продаёшь, цены, схему):")
             elif data == "ai_forbidden":
                 pending[uid] = {"action": "ai_forbidden"}
-                await cb.message.edit_text(
-                    "🚫 Что ИИ НИКОГДА не должен говорить/делать:",
-                )
+                await cb.message.edit_text("🚫 Что ИИ НИКОГДА не должен говорить/делать:")
             elif data == "ai_show_prompt":
                 prompt = (STATE.get("ai_assistant") or {}).get("system_prompt") or DEFAULT_SYSTEM_PROMPT
-                # Telegram ограничивает длину, разбиваем если надо
                 if len(prompt) > 3500:
                     prompt = prompt[:3500] + "\n…(обрезано)"
                 await cb.message.edit_text(
@@ -973,15 +944,14 @@ def register_handlers(bot: Client) -> None:
             elif data == "ai_reset_prompt":
                 ai = STATE.setdefault("ai_assistant", _default_ai())
                 ai["system_prompt"] = DEFAULT_SYSTEM_PROMPT
+                ai["prompt_parts"] = {}
                 save_json(STATE_FILE, STATE)
-                await cb.message.edit_text("♻️ Промпт сброшен к дефолту.",
-                                            reply_markup=ai_menu_kb())
+                await cb.message.edit_text("♻️ Промпт сброшен к дефолту.", reply_markup=ai_menu_kb())
             elif data == "ai_inactive":
                 pending[uid] = {"action": "ai_inactive"}
                 await cb.message.edit_text(
                     f"Через сколько минут твоего отсутствия включать ИИ? "
-                    f"(сейчас {(STATE.get('ai_assistant') or {}).get('inactive_minutes', 5)})"
-                )
+                    f"(сейчас {(STATE.get('ai_assistant') or {}).get('inactive_minutes', 5)})")
 
             elif data == "status":
                 s = STATE["stats"]
@@ -1024,7 +994,6 @@ def register_handlers(bot: Client) -> None:
         action = act.get("action")
         text = (message.text or "").strip()
         try:
-            # ---- логин ----
             if action == "login_phone":
                 phone = text
                 if not phone.startswith("+"):
@@ -1079,7 +1048,6 @@ def register_handlers(bot: Client) -> None:
                     return
                 await after_userbot_login(message)
 
-            # ---- сообщение рассылки ----
             elif action == "set_text":
                 if not text:
                     pending[uid] = {"action": "set_text"}
@@ -1110,7 +1078,6 @@ def register_handlers(bot: Client) -> None:
                 await message.reply(f"✅ Медиа сохранено ({STATE['media_type']}).",
                     reply_markup=main_menu_kb())
 
-            # ---- группы ----
             elif action == "add_group":
                 ref = parse_chat_ref(text)
                 if ref is None:
@@ -1134,7 +1101,6 @@ def register_handlers(bot: Client) -> None:
                 save_json(STATE_FILE, STATE)
                 await message.reply(f"✅ {title} ({gid})", reply_markup=main_menu_kb())
 
-            # ---- тайминги ----
             elif action == "set_interval":
                 try:
                     v = int(text)
@@ -1168,37 +1134,34 @@ def register_handlers(bot: Client) -> None:
                     pending[uid] = {"action": "set_delay_max"}
                     await message.reply(f"❌ {e}")
 
-            # ---- ИИ-настройки ----
             elif action in ("ai_style", "ai_about", "ai_work", "ai_forbidden"):
-                # Сохраняем в отдельные поля, потом собираем системный промпт
                 ai = STATE.setdefault("ai_assistant", _default_ai())
                 parts = ai.setdefault("prompt_parts", {})
                 parts[action] = message.text or ""
                 ai["prompt_parts"] = parts
 
-                # Пересобираем системный промпт
                 style = parts.get("ai_style", "").strip()
                 about = parts.get("ai_about", "").strip()
                 work = parts.get("ai_work", "").strip()
                 forb = parts.get("ai_forbidden", "").strip()
 
-                prompt_lines = [DEFAULT_SYSTEM_PROMPT.split("СТИЛЬ ОБЩЕНИЯ:")[0].strip()]
+                prompt_lines = []
                 if style:
-                    prompt_lines.append(f"\nСТИЛЬ ОБЩЕНИЯ:\n{style}")
+                    prompt_lines.append(f"СТИЛЬ ОБЩЕНИЯ:\n{style}")
                 if about:
-                    prompt_lines.append(f"\nИНФОРМАЦИЯ ОБО МНЕ:\n{about}")
+                    prompt_lines.append(f"ИНФОРМАЦИЯ ОБО МНЕ:\n{about}")
                 if work:
-                    prompt_lines.append(f"\nСУТЬ РАБОТЫ:\n{work}")
+                    prompt_lines.append(f"СУТЬ РАБОТЫ:\n{work}")
                 if forb:
-                    prompt_lines.append(f"\nЗАПРЕЩЕНО:\n{forb}")
+                    prompt_lines.append(f"ЗАПРЕЩЕНО:\n{forb}")
                 prompt_lines.append(
-                    "\nОБЩИЕ ПРАВИЛА:\n"
+                    "ОБЩИЕ ПРАВИЛА:\n"
                     "- Пиши как живой человек, не как робот.\n"
                     "- Не пиши слишком длинные или слишком короткие сообщения.\n"
                     "- Если клиент запутан или сложный вопрос — передай владельцу.\n"
                     "- Никогда не говори, что ты бот или ИИ."
                 )
-                ai["system_prompt"] = "\n".join(prompt_lines)
+                ai["system_prompt"] = "\n\n".join(prompt_lines)
                 save_json(STATE_FILE, STATE)
                 await message.reply("✅ Сохранено. Промпт обновлён.",
                                     reply_markup=ai_menu_kb())
@@ -1225,7 +1188,7 @@ def register_handlers(bot: Client) -> None:
 # ---------------------------------------------------------------------------
 
 async def main():
-    global CFG, STATE, user_client, bot_client, groq_client, USERBOT_READY, ME_ID
+    global CFG, STATE, user_client, bot_client, deepseek_client, USERBOT_READY, ME_ID
 
     CFG = load_cfg()
     if not cfg_ok(CFG):
@@ -1238,13 +1201,18 @@ async def main():
     # --- SQLite ---
     await db_init()
 
-    # --- Groq ---
-    if CFG.get("groq_api_key"):
+    # --- DeepSeek ---
+    if CFG.get("deepseek_api_key"):
         try:
-            groq_client = Groq(api_key=CFG["groq_api_key"])
-            log.info("Groq клиент инициализирован.")
+            deepseek_client = OpenAI(
+                api_key=CFG["deepseek_api_key"],
+                base_url="https://api.deepseek.com",
+            )
+            log.info("✅ DeepSeek клиент инициализирован.")
         except Exception as e:
-            log.warning(f"Groq не инициализирован: {e}")
+            log.warning(f"DeepSeek не инициализирован: {e}")
+    else:
+        log.warning("DEEPSEEK_API_KEY не задан — ИИ не будет работать.")
 
     # --- Юзербот ---
     user_client = Client(name=SESSION_USER, api_id=CFG["api_id"], api_hash=CFG["api_hash"])
@@ -1284,13 +1252,13 @@ async def main():
     # --- Приветствие ---
     try:
         ai_status = "🟢 вкл" if (STATE.get("ai_assistant") or {}).get("enabled") else "🔴 выкл"
-        groq_status = "🟢 подключён" if groq_client else "🔴 нет ключа"
+        ds_status = "🟢 подключён" if deepseek_client else "🔴 нет ключа"
         status = "🟢 готов" if USERBOT_READY else "🔴 не авторизован (/login)"
         await bot_client.send_message(
             CFG["admin_id"],
             f"🤖 Автопостер запущен.\n"
             f"Юзербот: {status}\n"
-            f"Groq: {groq_status}\n"
+            f"DeepSeek: {ds_status}\n"
             f"ИИ-ассистент: {ai_status}\n"
             f"Для доступа: `/auth <PIN>`",
             parse_mode=enums.ParseMode.MARKDOWN)
