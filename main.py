@@ -114,7 +114,7 @@ user_clients: dict = {}       # {acc_id: Client}
 mailing_tasks: dict = {}      # {acc_id: asyncio.Task}
 subscribe_tasks: dict = {}    # {acc_id: asyncio.Task}
 MAIN_ACC_ID: str = ""
-ME_IDS: dict = {}             # {acc_id: user_id}
+ME_IDS: dict = {}
 
 authed: set = set()
 pending: dict = {}
@@ -122,6 +122,31 @@ BOT_LAST_SENT: dict = {}
 PENDING_REPLIES: dict = {}
 await_count_cache = 0
 MAIN_HANDLERS_REGISTERED = set()
+
+# ---------------------------------------------------------------------------
+# Параметры устройства для Client (важно для отправки SMS)
+# ---------------------------------------------------------------------------
+
+DEVICE_PARAMS = {
+    "app_version": "9.3.1",
+    "device_model": "Samsung Galaxy S23 Ultra",
+    "system_version": "Android 13",
+    "lang_code": "ru",
+}
+
+
+def make_client(session_path: str) -> Client:
+    """Создаёт Pyrogram клиент с параметрами реального устройства."""
+    return Client(
+        name=session_path,
+        api_id=CFG["api_id"],
+        api_hash=CFG["api_hash"],
+        app_version=DEVICE_PARAMS["app_version"],
+        device_model=DEVICE_PARAMS["device_model"],
+        system_version=DEVICE_PARAMS["system_version"],
+        lang_code=DEVICE_PARAMS["lang_code"],
+    )
+
 
 # ---------------------------------------------------------------------------
 # Утилиты
@@ -580,7 +605,6 @@ def load_state() -> dict:
     if not st.get("main_account_id") and st.get("accounts"):
         st["main_account_id"] = st["accounts"][0]["id"]
 
-    # Миграция: поля подписки
     for acc in st.get("accounts") or []:
         acc.setdefault("subscribe_queue", [])
         acc.setdefault("subscribe_status", "idle")
@@ -1087,7 +1111,7 @@ def _was_sent_by_bot(user_id: int, text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Прочитано / реакции / набор (для основного аккаунта)
+# Прочитано / реакции / набор
 # ---------------------------------------------------------------------------
 
 def get_main_client() -> Client:
@@ -2084,7 +2108,7 @@ async def start_userbot_clients():
         session_name = acc.get("session_name") or f"userbot_{acc_id}"
         session_path = os.path.join(DATA_DIR, session_name)
         try:
-            c = Client(name=session_path, api_id=CFG["api_id"], api_hash=CFG["api_hash"])
+            c = make_client(session_path)
             user_clients[acc_id] = c
         except Exception as e:
             log.warning(f"Не смог создать клиент {acc_id}: {e}")
@@ -2144,7 +2168,7 @@ async def populate_known_users_for_main():
 
 
 # ---------------------------------------------------------------------------
-# Обработчики юзербота (основной аккаунт)
+# Обработчики юзербота
 # ---------------------------------------------------------------------------
 
 def register_main_handlers(c: Client):
@@ -2569,7 +2593,6 @@ def register_handlers(bot: Client) -> None:
             return
         await message.reply("🎛 Панель:", reply_markup=main_menu_kb())
 
-    # ---------------- CALLBACKS ----------------
     @bot.on_callback_query()
     async def on_cb(client, cb):
         uid = cb.from_user.id
@@ -2587,7 +2610,6 @@ def register_handlers(bot: Client) -> None:
             elif data == "noop":
                 await cb.answer("—")
 
-            # === Аккаунты ===
             elif data == "accounts_menu":
                 await cb.message.edit_text(accounts_menu_text(),
                                             reply_markup=accounts_menu_kb())
@@ -2775,7 +2797,7 @@ def register_handlers(bot: Client) -> None:
                     c = user_clients.get(acc_id)
                     if c:
                         register_main_handlers(c)
-                    await cb.answer("⭐ Основной изменён. Перезапусти бота для эффекта.",
+                    await cb.answer("⭐ Основной изменён.",
                                      show_alert=True)
                 await cb.message.edit_text(account_text(acc_id),
                                             reply_markup=account_kb(acc_id))
@@ -2819,7 +2841,6 @@ def register_handlers(bot: Client) -> None:
                 await cb.message.edit_text(accounts_menu_text(),
                                             reply_markup=accounts_menu_kb())
 
-            # === Подписка ===
             elif data.startswith("acc_sub_menu:"):
                 acc_id = data.split(":", 1)[1]
                 if not get_account(acc_id):
@@ -2838,8 +2859,7 @@ def register_handlers(bot: Client) -> None:
                     "• Через запятую: `@g1, @g2, @g3`\n"
                     "• Или `.txt` файлом — каждая группа на строке\n\n"
                     "Строки с `#` — комментарии.\n\n"
-                    "⚠️ Группы добавятся в ОЧЕРЕДЬ, ничего не подписывается сразу.\n"
-                    "После загрузки зайди в подписку и жми ▶️ Старт.\n/cancel",
+                    "⚠️ Группы добавятся в ОЧЕРЕДЬ.\n/cancel",
                     parse_mode=enums.ParseMode.MARKDOWN)
 
             elif data.startswith("acc_sub_delay:"):
@@ -2893,7 +2913,6 @@ def register_handlers(bot: Client) -> None:
                 await cb.message.edit_text(subscribe_menu_text(acc_id),
                                             reply_markup=subscribe_menu_kb(acc_id))
 
-            # === ИИ ===
             elif data == "ai_menu":
                 await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
             elif data == "ai_toggle":
@@ -3146,7 +3165,6 @@ def register_handlers(bot: Client) -> None:
                 await cb.answer("🧹 Очищено.")
                 await cb.message.edit_text(ai_train_text(), reply_markup=ai_train_kb())
 
-            # Автоответчик
             elif data == "ar_menu":
                 await cb.message.edit_text(autoreply_menu_text(),
                                             reply_markup=autoreply_menu_kb())
@@ -3176,7 +3194,6 @@ def register_handlers(bot: Client) -> None:
                 await cb.message.edit_text("♻️ Сброшено.",
                                             reply_markup=autoreply_menu_kb())
 
-            # Статистика
             elif data == "stats_menu":
                 await cb.message.edit_text(stats_menu_text(),
                                             reply_markup=stats_menu_kb())
@@ -3215,10 +3232,13 @@ def register_handlers(bot: Client) -> None:
                 sname = f"userbot_{int(datetime.now().timestamp())}"
                 session_path = os.path.join(DATA_DIR, sname)
                 try:
-                    new_c = Client(name=session_path,
-                                    api_id=CFG["api_id"], api_hash=CFG["api_hash"])
+                    new_c = make_client(session_path)
                     await new_c.connect()
-                    sent = await new_c.send_code(phone)
+                    # force_sms=True — принудительно SMS-кой
+                    try:
+                        sent = await new_c.send_code(phone, force_sms=True)
+                    except TypeError:
+                        sent = await new_c.send_code(phone)
                 except Exception as e:
                     await message.reply(f"❌ send_code: {e}")
                     return
@@ -3229,7 +3249,10 @@ def register_handlers(bot: Client) -> None:
                     "session_name": sname,
                     "client": new_c,
                 }
-                await message.reply("📩 Код из Telegram:")
+                await message.reply(
+                    "📩 Код отправлен SMS-кой на номер.\n\n"
+                    "Если SMS не пришло за 60 сек — напиши `/cancel` и попробуй снова.\n\n"
+                    "Введи код:")
 
             elif action == "acc_add_code":
                 phone = act["phone"]
@@ -3299,7 +3322,6 @@ def register_handlers(bot: Client) -> None:
                     f"✅ Аккаунт добавлен: **{name}** (id={me.id}).",
                     reply_markup=main_menu_kb())
 
-            # === Загрузка списка групп для подписки ===
             elif action == "acc_sub_load":
                 acc_id = act["acc_id"]
                 acc = get_account(acc_id)
@@ -3390,7 +3412,6 @@ def register_handlers(bot: Client) -> None:
                 await message.reply(f"✅ Задержка: {lo}–{hi} сек.",
                                      reply_markup=account_kb(acc_id))
 
-            # === Тексты аккаунтов ===
             elif action == "acc_text":
                 acc_id = act["acc_id"]
                 acc = get_account(acc_id)
@@ -3502,7 +3523,6 @@ def register_handlers(bot: Client) -> None:
                 save_json(STATE_FILE, STATE)
                 await message.reply(f"✅ {title}", reply_markup=account_kb(acc_id))
 
-            # === ИИ ===
             elif action == "ai_typing_min":
                 try:
                     v = float(text.replace(",", "."))
@@ -3627,7 +3647,6 @@ def register_handlers(bot: Client) -> None:
                 await message.reply(f"✅ Примеры сохранены ({len(combined)} симв.).",
                                     reply_markup=ai_training_kb())
 
-            # Автоответчик
             elif action == "ar_first":
                 STATE.setdefault("autoreply", _default_autoreply())["template_first"] = text
                 save_json(STATE_FILE, STATE)
