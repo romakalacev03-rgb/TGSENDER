@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 Автопостер с мульти-аккаунтами + массовая подписка + автоответчик + ИИ.
++ Автоподписка на обязательные каналы
++ Проверка аккаунта через @SpamBot
++ Рандомные реакции в группах
++ Автосортировка групп по папкам
++ Уведомления о личных сообщениях
 """
 
 import asyncio
@@ -22,7 +27,9 @@ from pyrogram.errors import (
     SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, PasswordHashInvalid,
     UserAlreadyParticipant, UsernameInvalid, UsernameNotOccupied,
     InviteHashExpired, InviteHashInvalid, ChatIdInvalid,
+    UserNotParticipant,
 )
+from pyrogram.raw import functions, types
 
 # ---------------------------------------------------------------------------
 # Пути
@@ -51,9 +58,10 @@ except Exception:
 
 DEFAULT_PIN = "2512"
 TEST_CLIENT_ID = 8040297502
+SPAMBOT_USERNAME = "SpamBot"
 
 # ---------------------------------------------------------------------------
-# Мануал по бизнесу
+# Мануал
 # ---------------------------------------------------------------------------
 
 BUSINESS_GUIDE = """
@@ -97,6 +105,8 @@ ENGLISH_FIXES = {
 
 REACTION_EMOJIS = ["👍", "❤", "🔥", "🤝", "😊", "💯", "⚡", "🎯", "👌", "🙏"]
 
+GROUP_REACTION_EMOJIS = ["👍", "🔥", "💯", "🎯", "⚡", "🤝", "❤️", "😎"]
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(message)s",
@@ -110,9 +120,10 @@ STATE: dict = {}
 bot_client: Client = None
 http_session: aiohttp.ClientSession = None
 
-user_clients: dict = {}       # {acc_id: Client}
-mailing_tasks: dict = {}      # {acc_id: asyncio.Task}
-subscribe_tasks: dict = {}    # {acc_id: asyncio.Task}
+user_clients: dict = {}
+mailing_tasks: dict = {}
+subscribe_tasks: dict = {}
+folder_tasks: dict = {}
 MAIN_ACC_ID: str = ""
 ME_IDS: dict = {}
 
@@ -123,10 +134,6 @@ PENDING_REPLIES: dict = {}
 await_count_cache = 0
 MAIN_HANDLERS_REGISTERED = set()
 
-# ---------------------------------------------------------------------------
-# Параметры устройства для Client (важно для отправки SMS)
-# ---------------------------------------------------------------------------
-
 DEVICE_PARAMS = {
     "app_version": "9.3.1",
     "device_model": "Samsung Galaxy S23 Ultra",
@@ -136,7 +143,6 @@ DEVICE_PARAMS = {
 
 
 def make_client(session_path: str) -> Client:
-    """Создаёт Pyrogram клиент с параметрами реального устройства."""
     return Client(
         name=session_path,
         api_id=CFG["api_id"],
@@ -522,6 +528,20 @@ def _new_account(name: str, session_name: str) -> dict:
         "subscribe_stats": {
             "subscribed": 0, "skipped": 0, "errors": 0, "started_at": None,
         },
+        # Автоподписка
+        "auto_subscribe_enabled": True,
+        "auto_subscribe_queue": [],
+        "auto_subscribe_delay": 30,
+        # Проверка аккаунта
+        "last_spam_check": None,
+        "spam_status": "unknown",
+        "spam_message": "",
+        # Папки
+        "folder_index": 0,
+        "folder_size": 100,
+        # Реакции в группах
+        "group_reactions_enabled": True,
+        "group_reactions_chance": 5,
     }
 
 
@@ -534,7 +554,10 @@ def default_state() -> dict:
         "ai_assistant": _default_ai(),
         "global_stats": {
             "autoreplies": 0, "ai_replies": 0, "ai_fallbacks": 0, "ai_escalations": 0,
+            "auto_subscribes": 0, "group_reactions": 0, "folder_moves": 0,
         },
+        "groups": [],  # Список известных групп для авто-подписки
+        "known_channels": [],  # Каналы для автоподписки
     }
 
 
@@ -599,7 +622,8 @@ def load_state() -> dict:
 
     if not isinstance(st.get("global_stats"), dict):
         st["global_stats"] = default_state()["global_stats"]
-    for k in ("autoreplies", "ai_replies", "ai_fallbacks", "ai_escalations"):
+    for k in ("autoreplies", "ai_replies", "ai_fallbacks", "ai_escalations",
+              "auto_subscribes", "group_reactions", "folder_moves"):
         st["global_stats"].setdefault(k, 0)
 
     if not st.get("main_account_id") and st.get("accounts"):
@@ -613,6 +637,21 @@ def load_state() -> dict:
         acc.setdefault("subscribe_stats", {
             "subscribed": 0, "skipped": 0, "errors": 0, "started_at": None,
         })
+        acc.setdefault("auto_subscribe_enabled", True)
+        acc.setdefault("auto_subscribe_queue", [])
+        acc.setdefault("auto_subscribe_delay", 30)
+        acc.setdefault("last_spam_check", None)
+        acc.setdefault("spam_status", "unknown")
+        acc.setdefault("spam_message", "")
+        acc.setdefault("folder_index", 0)
+        acc.setdefault("folder_size", 100)
+        acc.setdefault("group_reactions_enabled", True)
+        acc.setdefault("group_reactions_chance", 5)
+
+    if not isinstance(st.get("groups"), list):
+        st["groups"] = []
+    if not isinstance(st.get("known_channels"), list):
+        st["known_channels"] = []
 
     return st
 
@@ -655,7 +694,7 @@ def remove_account(acc_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Проверка пересечений и парсинг групп
+# Пересечения / парсинг
 # ---------------------------------------------------------------------------
 
 def normalize_group_ref(g) -> str:
@@ -924,10 +963,6 @@ async def verify_cf_account(acc: dict) -> tuple:
         return False, f"❌ {e}"
 
 
-# ---------------------------------------------------------------------------
-# Промпт сборка
-# ---------------------------------------------------------------------------
-
 async def build_system_prompt() -> str:
     ai = STATE.get("ai_assistant") or {}
     parts = []
@@ -1020,7 +1055,7 @@ async def ask_ai(user_id: int, user_message: str):
 
 
 # ---------------------------------------------------------------------------
-# Общие утилиты state
+# Общие утилиты
 # ---------------------------------------------------------------------------
 
 def _owner_inactive(minutes: int) -> bool:
@@ -1111,101 +1146,510 @@ def _was_sent_by_bot(user_id: int, text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Прочитано / реакции / набор
+# ФУНКЦИИ АВТОПОДПИСКИ
 # ---------------------------------------------------------------------------
 
-def get_main_client() -> Client:
-    acc = get_main_account()
+async def try_join_required_chats(client: Client, chat_id: int) -> bool:
+    """
+    Пытается подписаться на обязательные каналы из сообщения.
+    Возвращает True если что-то подписал.
+    """
+    try:
+        chat = await client.get_chat(chat_id)
+        # Проверяем сообщения чата на наличие кнопок подписки
+        async for msg in client.get_chat_history(chat_id, limit=5):
+            if not msg.reply_markup:
+                continue
+            for row in msg.reply_markup.inline_keyboard:
+                for btn in row:
+                    if not btn.url:
+                        continue
+                    url = btn.url
+                    # Проверяем t.me ссылки
+                    if "t.me/" in url and "joinchat" not in url and "+" not in url:
+                        username = url.split("t.me/")[-1].split("/")[0].strip()
+                        if username:
+                            try:
+                                await client.join_chat(username)
+                                log.info(f"[AUTOSUB] подписался на @{username}")
+                                STATE["global_stats"]["auto_subscribes"] = \
+                                    STATE["global_stats"].get("auto_subscribes", 0) + 1
+                                save_json(STATE_FILE, STATE)
+                                return True
+                            except UserAlreadyParticipant:
+                                pass
+                            except FloodWait as fw:
+                                await asyncio.sleep(fw.value + 5)
+                            except Exception:
+                                pass
+        return False
+    except Exception as e:
+        log.debug(f"[AUTOSUB] {chat_id}: {e}")
+        return False
+
+
+async def auto_subscribe_loop(acc_id: str):
+    """Цикл автоподписки на обязательные каналы."""
+    acc = get_account(acc_id)
     if not acc:
-        return None
-    return user_clients.get(acc["id"])
-
-
-async def mark_chat_read(user_id: int) -> None:
-    c = get_main_client()
+        return
+    c = user_clients.get(acc_id)
     if not c:
         return
+
+    while acc.get("auto_subscribe_enabled", True):
+        queue = acc.get("auto_subscribe_queue") or []
+        if not queue:
+            await asyncio.sleep(30)
+            continue
+
+        ref = queue.pop(0)
+        try:
+            chat = await c.get_chat(ref)
+            await try_join_required_chats(c, chat.id)
+        except Exception as e:
+            log.debug(f"[AUTOSUB] {ref}: {e}")
+
+        acc["auto_subscribe_queue"] = queue
+        save_json(STATE_FILE, STATE)
+        delay = int(acc.get("auto_subscribe_delay", 30))
+        await asyncio.sleep(delay + random.randint(5, 15))
+
+
+def start_auto_subscribe(acc_id: str):
+    t = folder_tasks.get(f"autosub_{acc_id}")
+    if t and not t.done():
+        return
+    folder_tasks[f"autosub_{acc_id}"] = asyncio.create_task(auto_subscribe_loop(acc_id))
+
+
+# ---------------------------------------------------------------------------
+# ФУНКЦИИ ПРОВЕРКИ АККАУНТА (@SpamBot)
+# ---------------------------------------------------------------------------
+
+async def check_spambot(acc_id: str) -> tuple:
+    """Проверяет аккаунт через @SpamBot. Возвращает (status, message)."""
+    c = user_clients.get(acc_id)
+    if not c:
+        return "error", "Клиент не подключён"
+
     try:
-        await c.read_chat_history(user_id)
+        # Отправляем /start боту
+        await c.send_message(SPAMBOT_USERNAME, "/start")
+        await asyncio.sleep(3)
+
+        # Читаем ответ
+        messages = []
+        async for msg in c.get_chat_history(SPAMBOT_USERNAME, limit=3):
+            if msg.text:
+                messages.append(msg.text)
+            if len(messages) >= 2:
+                break
+
+        if not messages:
+            return "unknown", "Нет ответа от SpamBot"
+
+        response = messages[0] if messages else ""
+        response_lower = response.lower()
+
+        # Парсим статус
+        if "good news" in response_lower or "no limits" in response_lower:
+            status = "good"
+            msg = "Аккаунт в порядке, ограничений нет"
+        elif "limited" in response_lower or "restricted" in response_lower:
+            status = "limited"
+            # Извлекаем причину
+            msg = response[:500]
+        elif "free" in response_lower and "restriction" in response_lower:
+            status = "good"
+            msg = "Аккаунт свободен"
+        else:
+            status = "unknown"
+            msg = response[:500]
+
+        acc = get_account(acc_id)
+        if acc:
+            acc["last_spam_check"] = datetime.now().isoformat(timespec="seconds")
+            acc["spam_status"] = status
+            acc["spam_message"] = msg
+            save_json(STATE_FILE, STATE)
+
+        return status, msg
+
     except FloodWait as fw:
-        await asyncio.sleep(fw.value + 1)
+        return "flood", f"FloodWait {fw.value}s"
+    except Exception as e:
+        return "error", str(e)[:200]
+
+
+async def notify_spam_check(acc_id: str):
+    """Проверяет аккаунт и уведомляет админа."""
+    acc = get_account(acc_id)
+    if not acc:
+        return
+    status, msg = await check_spambot(acc_id)
+    name = acc.get("name", "?")
+
+    status_emoji = {
+        "good": "✅",
+        "limited": "🚫",
+        "flood": "⏳",
+        "unknown": "❓",
+        "error": "❌",
+    }.get(status, "❓")
+
+    try:
+        await bot_client.send_message(
+            CFG["admin_id"],
+            f"{status_emoji} **Проверка аккаунта** `{name}`\n\n"
+            f"Статус: **{status}**\n\n"
+            f"{msg}",
+            parse_mode=enums.ParseMode.MARKDOWN)
     except Exception:
         pass
 
 
-async def try_send_reaction(user_id: int, message_id: int):
-    c = get_main_client()
-    if not c:
+# ---------------------------------------------------------------------------
+# ФУНКЦИИ РЕАКЦИЙ В ГРУППАХ
+# ---------------------------------------------------------------------------
+
+async def try_group_reaction(acc_id: str, chat_id: int, message_id: int):
+    """Рандомно ставит реакцию на сообщение в группе."""
+    acc = get_account(acc_id)
+    if not acc:
         return
-    ai = STATE.get("ai_assistant") or {}
-    if not ai.get("reactions_enabled", True):
+    if not acc.get("group_reactions_enabled", True):
         return
+
     try:
-        chance = int(ai.get("reactions_chance", 20))
+        chance = int(acc.get("group_reactions_chance", 5))
     except Exception:
-        chance = 20
+        chance = 5
+
     if random.randint(1, 100) > chance:
         return
-    emoji = random.choice(REACTION_EMOJIS)
-    try:
-        await c.send_reaction(chat_id=user_id, message_id=message_id, emoji=emoji)
-        log.info(f"[REACT] {user_id} → {emoji}")
-    except FloodWait as fw:
-        await asyncio.sleep(fw.value + 1)
-    except Exception as e:
-        log.debug(f"[REACT] {user_id}: {e}")
 
-
-async def simulate_typing(user_id: int, text: str) -> None:
-    c = get_main_client()
+    c = user_clients.get(acc_id)
     if not c:
         return
-    ai = STATE.get("ai_assistant") or {}
-    if not ai.get("typing_enabled", True) or not text:
-        return
-    try:
-        min_delay = float(ai.get("typing_min_delay", 1.5))
-        max_delay = float(ai.get("typing_max_delay", 10.0))
-        cps = float(ai.get("typing_cps", 12.0)) or 12.0
-    except Exception:
-        min_delay, max_delay, cps = 1.5, 10.0, 12.0
-    if max_delay < min_delay:
-        max_delay = min_delay
-    delay = (len(text) / cps) * random.uniform(0.7, 1.3)
-    delay = max(min_delay, min(max_delay, delay))
-    loop = asyncio.get_event_loop()
-    end_time = loop.time() + delay
-    try:
-        while loop.time() < end_time:
-            await c.send_chat_action(user_id, enums.ChatAction.TYPING)
-            remain = end_time - loop.time()
-            await asyncio.sleep(min(4.0, max(0.2, remain)))
-    except Exception as e:
-        log.warning(f"[TYPING] {e}")
 
-
-async def _send_as_userbot(user_id: int, text: str, save_to_db: bool = True,
-                            with_typing: bool = True):
-    c = get_main_client()
-    if not c:
-        return
-    if with_typing:
-        await simulate_typing(user_id, text)
-    _register_bot_sent(user_id, text)
+    emoji = random.choice(GROUP_REACTION_EMOJIS)
     try:
-        await c.send_message(user_id, text, parse_mode=enums.ParseMode.MARKDOWN)
+        await c.send_reaction(chat_id=chat_id, message_id=message_id, emoji=emoji)
+        STATE["global_stats"]["group_reactions"] = \
+            STATE["global_stats"].get("group_reactions", 0) + 1
+        save_json(STATE_FILE, STATE)
+        log.info(f"[GROUP REACT] {acc.get('name')} → {chat_id} {emoji}")
     except Exception:
-        try:
-            await c.send_message(user_id, text)
-        except Exception as e:
-            log.error(f"send fail: {e}")
-            return
-    if save_to_db:
-        await db_add_message(user_id, "assistant", text)
+        pass
 
 
 # ---------------------------------------------------------------------------
-# Рассылка
+# ФУНКЦИИ АВТОСОРТИРОВКИ ПО ПАПКАМ
+# ---------------------------------------------------------------------------
+
+async def get_or_create_folder(client: Client, folder_name: str, folder_index: int) -> int:
+    """
+    Возвращает ID папки с указанным именем.
+    Создаёт если не существует.
+    """
+    try:
+        # Получаем список существующих папок
+        result = await client.invoke(functions.messages.GetDialogFilters())
+        filters = result.filters if hasattr(result, 'filters') else result
+
+        for f in filters:
+            if isinstance(f, types.DialogFilter):
+                if f.title == folder_name:
+                    return f.id
+
+        # Создаём новую папку
+        folder_id = folder_index + 2  # 0 и 1 зарезервированы
+        new_filter = types.DialogFilter(
+            id=folder_id,
+            title=folder_name,
+            pinned_peers=[],
+            include_peers=[],
+            exclude_peers=[],
+            emoticon="📁",
+        )
+        await client.invoke(
+            functions.messages.UpdateDialogFilter(id=folder_id, filter=new_filter)
+        )
+        log.info(f"[FOLDER] создана папка '{folder_name}' (id={folder_id})")
+        return folder_id
+    except Exception as e:
+        log.error(f"[FOLDER] ошибка: {e}")
+        return -1
+
+
+async def add_chat_to_folder(client: Client, folder_id: int, chat_id: int):
+    """Добавляет чат в папку."""
+    try:
+        peer = await client.resolve_peer(chat_id)
+        result = await client.invoke(functions.messages.GetDialogFilters())
+        filters = result.filters if hasattr(result, 'filters') else result
+
+        for f in filters:
+            if isinstance(f, types.DialogFilter) and f.id == folder_id:
+                if peer not in f.include_peers:
+                    f.include_peers.append(peer)
+                    await client.invoke(
+                        functions.messages.UpdateDialogFilter(id=folder_id, filter=f)
+                    )
+                    log.info(f"[FOLDER] {chat_id} → папка {folder_id}")
+                return True
+        return False
+    except Exception as e:
+        log.error(f"[FOLDER] add error: {e}")
+        return False
+
+
+async def auto_sort_folders_loop(acc_id: str):
+    """Автоматически сортирует группы по папкам."""
+    acc = get_account(acc_id)
+    if not acc:
+        return
+    c = user_clients.get(acc_id)
+    if not c:
+        return
+
+    folder_size = int(acc.get("folder_size", 100))
+    current_index = int(acc.get("folder_index", 0))
+    groups = acc.get("groups") or []
+
+    if not groups:
+        return
+
+    # Определяем папку для каждой группы
+    total_folders = (len(groups) + folder_size - 1) // folder_size
+
+    for i, g in enumerate(groups):
+        folder_num = i // folder_size
+        folder_name = f"Рассылка {folder_num + 1}"
+
+        folder_id = await get_or_create_folder(c, folder_name, folder_num)
+        if folder_id > 0:
+            await add_chat_to_folder(c, folder_id, g["id"])
+            STATE["global_stats"]["folder_moves"] = \
+                STATE["global_stats"].get("folder_moves", 0) + 1
+
+        # Небольшая пауза чтобы не зафродить
+        await asyncio.sleep(1)
+
+    # Архивируем основные группы (кроме папки рассылки)
+    # Перемещаем группы в архив чтобы не мешали
+    try:
+        # Архив — это папка с folder_id=1
+        for g in groups:
+            try:
+                await c.archive_chats(g["id"])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    acc["folder_index"] = total_folders
+    save_json(STATE_FILE, STATE)
+
+
+def start_folder_sort(acc_id: str):
+    t = folder_tasks.get(f"folders_{acc_id}")
+    if t and not t.done():
+        return
+    folder_tasks[f"folders_{acc_id}"] = asyncio.create_task(auto_sort_folders_loop(acc_id))
+
+
+# ---------------------------------------------------------------------------
+# ОБРАБОТЧИКИ ЮЗЕРБОТА
+# ---------------------------------------------------------------------------
+
+def register_main_handlers(c: Client):
+    if c.name in MAIN_HANDLERS_REGISTERED:
+        return
+    MAIN_HANDLERS_REGISTERED.add(c.name)
+
+    @c.on_message(filters.private & filters.outgoing)
+    async def on_outgoing(client, message):
+        try:
+            chat = message.chat
+            if not chat or not chat.id:
+                return
+            if chat.type != enums.ChatType.PRIVATE:
+                return
+            text = (message.text or "").strip()
+            if _was_sent_by_bot(chat.id, text):
+                return
+
+            ai = STATE.get("ai_assistant") or {}
+            if ai.get("auto_examples_enabled", True):
+                last_bot = BOT_LAST_SENT.get(chat.id)
+                if last_bot and text:
+                    last_user = await db_get_last_user_msg(chat.id)
+                    if last_user:
+                        await db_save_example(last_user, last_bot, text, source="owner")
+
+            _mark_owner_activity()
+            _mark_known_ar(chat.id)
+            if not ai.get("test_mode"):
+                _pause_ai(chat.id)
+            if text:
+                await db_add_message(chat.id, "assistant", text)
+        except Exception as e:
+            log.exception(f"on_outgoing: {e}")
+
+    @c.on_message(filters.private & filters.incoming)
+    async def on_incoming(client, message):
+        try:
+            user = message.from_user
+            if not user or user.is_bot or user.is_deleted:
+                return
+            main_id = ME_IDS.get(STATE.get("main_account_id"), 0)
+            if user.id == main_id:
+                return
+            if user.id == CFG.get("admin_id"):
+                return
+
+            ai = STATE.get("ai_assistant") or {}
+            ar = STATE.get("autoreply") or {}
+            if not ai.get("enabled") and not ar.get("enabled"):
+                return
+
+            await mark_chat_read(user.id)
+            text_raw = (message.text or message.caption or "").strip()
+            test_mode = bool(ai.get("test_mode"))
+
+            # Уведомление о личном сообщении
+            try:
+                username = f" (@{user.username})" if user.username else ""
+                await bot_client.send_message(
+                    CFG["admin_id"],
+                    f"📩 **Новое личное сообщение**\n\n"
+                    f"👤 {user.first_name}{username}\n"
+                    f"🆔 `{user.id}`\n"
+                    f"💬 {text_raw[:300]}",
+                    parse_mode=enums.ParseMode.MARKDOWN)
+            except Exception:
+                pass
+
+            if is_test_client(user.id) and text_raw.lower() == "/reset":
+                cancel_pending_reply(user.id)
+                saved = await save_session_to_examples(user.id)
+                await db_clear_user_messages(user.id)
+                BOT_LAST_SENT.pop(user.id, None)
+                try:
+                    await client.send_message(
+                        user.id, f"♻️ Справочник обновлён (+{saved}).")
+                except Exception:
+                    pass
+                return
+
+            if test_mode and is_test_client(user.id) and text_raw:
+                if text_raw.startswith("!"):
+                    rule_text = text_raw[1:].strip()
+                    if rule_text:
+                        ai_state = STATE.setdefault("ai_assistant", _default_ai())
+                        rules = ai_state.setdefault("rules", [])
+                        rules.append(rule_text)
+                        save_json(STATE_FILE, STATE)
+                        await client.send_message(
+                            user.id, f"✅ Правило #{len(rules)}:\n_{rule_text}_",
+                            parse_mode=enums.ParseMode.MARKDOWN)
+                        return
+                elif text_raw.startswith("?"):
+                    fix_text = text_raw[1:].strip()
+                    if fix_text:
+                        last_bot = BOT_LAST_SENT.get(user.id)
+                        last_user_msg = await db_get_last_user_msg(user.id)
+                        if last_bot and last_user_msg:
+                            await db_save_example(last_user_msg, last_bot, fix_text,
+                                                  source="test_client")
+                            await client.send_message(user.id, "✅ Пример сохранён.")
+                        return
+
+            elif not is_test_client(user.id) and text_raw and is_suspicious(text_raw):
+                cancel_pending_reply(user.id)
+                try:
+                    await bot_client.send_message(
+                        CFG["admin_id"],
+                        f"🛡️ Манипуляция от {user.id}: _{text_raw[:200]}_",
+                        parse_mode=enums.ParseMode.MARKDOWN)
+                except Exception:
+                    pass
+                _pause_ai(user.id)
+                try:
+                    await client.send_message(user.id, "Извини, позже отвечу.")
+                except Exception:
+                    pass
+                return
+
+            if message.voice or message.video_note or message.audio:
+                cancel_pending_reply(user.id)
+                return
+
+            text = (message.text or message.caption or "").strip()
+            if not text:
+                return
+
+            await db_add_message(user.id, "user", text)
+
+            if not is_test_client(user.id):
+                asyncio.create_task(try_send_reaction(user.id, message.id))
+
+            ai_should_run = (
+                ai.get("enabled")
+                and (test_mode or not _is_paused_ai(user.id))
+                and (test_mode or _owner_inactive_ai())
+            )
+
+            if ai_should_run:
+                cancel_pending_reply(user.id)
+                PENDING_REPLIES[user.id] = asyncio.create_task(scheduled_ai_reply(user.id))
+                return
+
+            if (not test_mode) and ar.get("enabled") and _owner_inactive_ar() and _cooldown_ok_ar(user.id):
+                known = _is_known_ar(user.id)
+                template = (ar.get("template_known") if known else ar.get("template_first")) or ""
+                template = template.strip()
+                if template:
+                    await _send_as_userbot(user.id, template, with_typing=True)
+                    _mark_known_ar(user.id)
+                    _set_cooldown_ar(user.id)
+                    STATE["global_stats"]["autoreplies"] = \
+                        STATE["global_stats"].get("autoreplies", 0) + 1
+                    save_json(STATE_FILE, STATE)
+        except FloodWait as fw:
+            await asyncio.sleep(fw.value + 2)
+        except Exception as e:
+            log.exception(f"on_incoming: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Обработчик групповых сообщений (для реакций)
+# ---------------------------------------------------------------------------
+
+async def group_message_handler(client: Client, message):
+    """Обрабатывает сообщения в группах для реакций."""
+    try:
+        chat = message.chat
+        if not chat or chat.type not in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP):
+            return
+
+        # Определяем какой это аккаунт
+        acc_id = None
+        for aid, c in user_clients.items():
+            if c.name == client.name:
+                acc_id = aid
+                break
+
+        if acc_id:
+            await try_group_reaction(acc_id, chat.id, message.id)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Остальные функции (рассылка, подписка, ИИ и т.д.)
 # ---------------------------------------------------------------------------
 
 async def send_post_for_account(acc_id: str, chat_id: int) -> None:
@@ -1264,6 +1708,8 @@ async def mailing_loop_for_account(acc_id: str):
                     PeerIdInvalid, UserIsBlocked, ChannelPrivate):
                 errors += 1
                 acc["stats"]["errors"] = acc["stats"].get("errors", 0) + 1
+                # Автоподписка на обязательные каналы
+                await try_join_required_chats(user_clients.get(acc_id), gid)
             except Exception as e:
                 errors += 1
                 acc["stats"]["errors"] = acc["stats"].get("errors", 0) + 1
@@ -1328,10 +1774,6 @@ async def scan_groups_for_account(acc_id: str) -> list:
     return found
 
 
-# ---------------------------------------------------------------------------
-# Массовая подписка
-# ---------------------------------------------------------------------------
-
 async def subscribe_one_group(client: Client, ref):
     try:
         chat = await client.join_chat(ref)
@@ -1361,7 +1803,8 @@ async def subscribe_loop(acc_id: str):
         return
     c = user_clients.get(acc_id)
     if not c:
-        log.warning(f"[SUB] {acc_id}: нет клиента")
+        acc["subscribe_status"] = "error"
+        save_json(STATE_FILE, STATE)
         return
 
     acc["subscribe_status"] = "running"
@@ -1370,7 +1813,8 @@ async def subscribe_loop(acc_id: str):
     try:
         await bot_client.send_message(
             CFG["admin_id"],
-            f"📥 Подписка запущена для **{acc.get('name')}**\n"
+            f"📥 **Подписка запущена**\n"
+            f"• Аккаунт: **{acc.get('name')}**\n"
             f"• В очереди: {len(acc.get('subscribe_queue') or [])}\n"
             f"• Задержка: {acc.get('subscribe_delay_min')}–{acc.get('subscribe_delay_max')} сек",
             parse_mode=enums.ParseMode.MARKDOWN)
@@ -1388,7 +1832,6 @@ async def subscribe_loop(acc_id: str):
         try:
             status, extra, chat = await subscribe_one_group(c, ref)
         except Exception as e:
-            log.exception(f"[SUB] {ref}: {e}")
             status, extra, chat = "error", str(e)[:100], None
 
         stats = acc.setdefault("subscribe_stats", {
@@ -1396,41 +1839,34 @@ async def subscribe_loop(acc_id: str):
 
         if status == "ok":
             stats["subscribed"] += 1
-            log.info(f"[SUB] [{acc.get('name')}] ✅ {ref}")
             if chat:
                 gid = chat.id
                 exists = any(g["id"] == gid for g in (acc.get("groups") or []))
                 if not exists:
                     acc.setdefault("groups", []).append({
-                        "id": gid,
-                        "title": chat.title or str(gid),
+                        "id": gid, "title": chat.title or str(gid),
                         "type": chat.type.name if chat.type else "UNKNOWN",
                         "manual": True,
                     })
             queue.pop(0)
-
         elif status == "already":
             stats["skipped"] += 1
-            log.info(f"[SUB] [{acc.get('name')}] ⏭ уже {ref}")
             if chat:
                 gid = chat.id
                 exists = any(g["id"] == gid for g in (acc.get("groups") or []))
                 if not exists:
                     acc.setdefault("groups", []).append({
-                        "id": gid,
-                        "title": chat.title or str(gid),
+                        "id": gid, "title": chat.title or str(gid),
                         "type": chat.type.name if chat.type else "UNKNOWN",
                         "manual": True,
                     })
             queue.pop(0)
-
         elif status == "flood":
             wait_s = int(extra or 60) + random.randint(5, 20)
-            log.warning(f"[SUB] [{acc.get('name')}] 🌊 FloodWait {wait_s}s")
             try:
                 await bot_client.send_message(
                     CFG["admin_id"],
-                    f"🌊 FloodWait {wait_s} сек на **{acc.get('name')}**. Жду…",
+                    f"🌊 FloodWait {wait_s} сек на **{acc.get('name')}**.",
                     parse_mode=enums.ParseMode.MARKDOWN)
             except Exception:
                 pass
@@ -1439,10 +1875,8 @@ async def subscribe_loop(acc_id: str):
                     break
                 await asyncio.sleep(1)
             continue
-
         else:
             stats["errors"] += 1
-            log.warning(f"[SUB] [{acc.get('name')}] ❌ {ref}: {extra}")
             queue.pop(0)
 
         acc["subscribe_queue"] = queue
@@ -1454,7 +1888,6 @@ async def subscribe_loop(acc_id: str):
             if hi < lo:
                 hi = lo
             delay = random.randint(lo, hi)
-            log.info(f"[SUB] [{acc.get('name')}] пауза {delay}s")
             for _ in range(delay):
                 if acc.get("subscribe_status") != "running":
                     break
@@ -1464,11 +1897,11 @@ async def subscribe_loop(acc_id: str):
         stats = acc.get("subscribe_stats") or {}
         await bot_client.send_message(
             CFG["admin_id"],
-            f"📥 Подписка завершена для **{acc.get('name')}**\n"
+            f"📥 **Подписка завершена**\n"
+            f"• Аккаунт: **{acc.get('name')}**\n"
             f"• Подписался: {stats.get('subscribed', 0)}\n"
             f"• Уже был: {stats.get('skipped', 0)}\n"
-            f"• Ошибок: {stats.get('errors', 0)}\n"
-            f"• Осталось: {len(acc.get('subscribe_queue') or [])}",
+            f"• Ошибок: {stats.get('errors', 0)}",
             parse_mode=enums.ParseMode.MARKDOWN)
     except Exception:
         pass
@@ -1479,6 +1912,172 @@ def start_subscribe(acc_id: str):
     if t and not t.done():
         return
     subscribe_tasks[acc_id] = asyncio.create_task(subscribe_loop(acc_id))
+
+
+# ---------------------------------------------------------------------------
+# Прочитано / реакции / набор
+# ---------------------------------------------------------------------------
+
+def get_main_client() -> Client:
+    acc = get_main_account()
+    if not acc:
+        return None
+    return user_clients.get(acc["id"])
+
+
+async def mark_chat_read(user_id: int) -> None:
+    c = get_main_client()
+    if not c:
+        return
+    try:
+        await c.read_chat_history(user_id)
+    except FloodWait as fw:
+        await asyncio.sleep(fw.value + 1)
+    except Exception:
+        pass
+
+
+async def try_send_reaction(user_id: int, message_id: int):
+    c = get_main_client()
+    if not c:
+        return
+    ai = STATE.get("ai_assistant") or {}
+    if not ai.get("reactions_enabled", True):
+        return
+    try:
+        chance = int(ai.get("reactions_chance", 20))
+    except Exception:
+        chance = 20
+    if random.randint(1, 100) > chance:
+        return
+    emoji = random.choice(REACTION_EMOJIS)
+    try:
+        await c.send_reaction(chat_id=user_id, message_id=message_id, emoji=emoji)
+    except Exception:
+        pass
+
+
+async def simulate_typing(user_id: int, text: str) -> None:
+    c = get_main_client()
+    if not c:
+        return
+    ai = STATE.get("ai_assistant") or {}
+    if not ai.get("typing_enabled", True) or not text:
+        return
+    try:
+        min_delay = float(ai.get("typing_min_delay", 1.5))
+        max_delay = float(ai.get("typing_max_delay", 10.0))
+        cps = float(ai.get("typing_cps", 12.0)) or 12.0
+    except Exception:
+        min_delay, max_delay, cps = 1.5, 10.0, 12.0
+    if max_delay < min_delay:
+        max_delay = min_delay
+    delay = (len(text) / cps) * random.uniform(0.7, 1.3)
+    delay = max(min_delay, min(max_delay, delay))
+    loop = asyncio.get_event_loop()
+    end_time = loop.time() + delay
+    try:
+        while loop.time() < end_time:
+            await c.send_chat_action(user_id, enums.ChatAction.TYPING)
+            remain = end_time - loop.time()
+            await asyncio.sleep(min(4.0, max(0.2, remain)))
+    except Exception:
+        pass
+
+
+async def _send_as_userbot(user_id: int, text: str, save_to_db: bool = True,
+                            with_typing: bool = True):
+    c = get_main_client()
+    if not c:
+        return
+    if with_typing:
+        await simulate_typing(user_id, text)
+    _register_bot_sent(user_id, text)
+    try:
+        await c.send_message(user_id, text, parse_mode=enums.ParseMode.MARKDOWN)
+    except Exception:
+        try:
+            await c.send_message(user_id, text)
+        except Exception as e:
+            log.error(f"send fail: {e}")
+            return
+    if save_to_db:
+        await db_add_message(user_id, "assistant", text)
+
+
+# ---------------------------------------------------------------------------
+# Обработка ИИ
+# ---------------------------------------------------------------------------
+
+async def process_ai_reply(user_id: int, text: str):
+    reply, reason, esc_reason = await ask_ai(user_id, text)
+
+    if reason == "escalate":
+        _pause_ai(user_id)
+        STATE["global_stats"]["ai_fallbacks"] = \
+            STATE["global_stats"].get("ai_fallbacks", 0) + 1
+        STATE["global_stats"]["ai_escalations"] = \
+            STATE["global_stats"].get("ai_escalations", 0) + 1
+        save_json(STATE_FILE, STATE)
+        try:
+            await _send_as_userbot(
+                user_id,
+                "Сейчас передам тебя руководителю, он свяжется в ближайшее время 👌",
+                with_typing=True)
+        except Exception:
+            pass
+        await notify_escalation(user_id, esc_reason or "не указана", text)
+        return
+
+    if reply:
+        await _send_as_userbot(user_id, reply, with_typing=True)
+        STATE["global_stats"]["ai_replies"] = \
+            STATE["global_stats"].get("ai_replies", 0) + 1
+        save_json(STATE_FILE, STATE)
+        return
+
+    hard_fail = reason in ("no_credentials", "auth_error", "disabled",
+                            "empty", "all_accounts_blocked")
+    soft_fail = reason in ("timeout", "rate_limit", "exception", "bad_json")
+    if hard_fail:
+        _pause_ai(user_id)
+        STATE["global_stats"]["ai_fallbacks"] = \
+            STATE["global_stats"].get("ai_fallbacks", 0) + 1
+        save_json(STATE_FILE, STATE)
+        await notify_ai_fallback(user_id, text, reason)
+    elif soft_fail:
+        await notify_ai_temp_error(user_id, text, reason)
+    else:
+        _pause_ai(user_id)
+        await notify_ai_fallback(user_id, text, reason)
+
+
+async def scheduled_ai_reply(user_id: int):
+    try:
+        ai = STATE.get("ai_assistant") or {}
+        test_mode = bool(ai.get("test_mode"))
+        if not test_mode and ai.get("reply_delay_enabled", True):
+            min_d = int(ai.get("reply_delay_min", 120))
+            max_d = int(ai.get("reply_delay_max", 240))
+            if max_d < min_d:
+                max_d = min_d
+            delay = random.randint(min_d, max_d)
+            await asyncio.sleep(delay)
+        last_text = await db_get_last_user_msg(user_id)
+        if last_text:
+            await process_ai_reply(user_id, last_text)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.exception(f"[SCHED] {user_id}: {e}")
+    finally:
+        PENDING_REPLIES.pop(user_id, None)
+
+
+def cancel_pending_reply(user_id: int):
+    t = PENDING_REPLIES.get(user_id)
+    if t and not t.done():
+        t.cancel()
 
 
 # ---------------------------------------------------------------------------
@@ -1503,8 +2102,8 @@ async def notify_ai_fallback(user_id: int, user_message: str, reason: str = ""):
             f"⚠️ **ИИ не смог ответить**\n\n👤 {name}{username}\n🆔 `{user_id}`\n"
             f"💬 {user_message[:300]}\n❓ {reason}\n\n`/resume {user_id}`",
             parse_mode=enums.ParseMode.MARKDOWN)
-    except Exception as e:
-        log.error(f"notify_ai_fallback: {e}")
+    except Exception:
+        pass
 
 
 async def notify_ai_temp_error(user_id: int, user_message: str, reason: str):
@@ -1550,17 +2149,70 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     ar = STATE.get("autoreply") or {}
     accounts = STATE.get("accounts") or []
     running_count = sum(1 for a in accounts if a.get("running"))
+    subs_count = sum(1 for a in accounts if a.get("subscribe_status") == "running")
     ai_state = "🟢" if ai.get("enabled") else "🔴"
     ar_state = "🟢" if ar.get("enabled") else "🔴"
+    subs_mark = f" 📥{subs_count}" if subs_count else ""
+
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
-            f"📢 Рассылка ({running_count}/{len(accounts)} аккаунтов)",
+            f"📢 Рассылка ({running_count}/{len(accounts)})",
             callback_data="accounts_menu")],
+        [InlineKeyboardButton(
+            f"📥 Массовая подписка{subs_mark}",
+            callback_data="sub_main")],
         [InlineKeyboardButton(f"🧠 ИИ-ассистент ({ai_state})", callback_data="ai_menu")],
         [InlineKeyboardButton(f"🤖 Автоответчик ({ar_state})", callback_data="ar_menu")],
         [InlineKeyboardButton("📚 Обучение ИИ", callback_data="ai_train")],
+        [InlineKeyboardButton("🔍 Проверить аккаунты", callback_data="check_all_spam")],
         [InlineKeyboardButton("📊 Статистика", callback_data="stats_menu")],
     ])
+
+
+def sub_main_kb() -> InlineKeyboardMarkup:
+    accounts = STATE.get("accounts") or []
+    rows = []
+    for acc in accounts:
+        sub_status = acc.get("subscribe_status", "idle")
+        status_icon = {
+            "running": "🟢",
+            "paused": "⏸",
+            "done": "✅",
+        }.get(sub_status, "⚪️")
+        queue_len = len(acc.get("subscribe_queue") or [])
+        queue_mark = f" ({queue_len})" if queue_len else ""
+        name = (acc.get("name") or "—")[:25]
+        rows.append([InlineKeyboardButton(
+            f"{status_icon} {name}{queue_mark}",
+            callback_data=f"acc_sub_menu:{acc['id']}")])
+    if not accounts:
+        rows.append([InlineKeyboardButton("— нет аккаунтов —", callback_data="noop")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def sub_main_text() -> str:
+    accounts = STATE.get("accounts") or []
+    lines = [
+        "📥 **Массовая подписка**\n",
+        "Выбери аккаунт, чтобы загрузить список групп "
+        "и подписаться на них с таймингами.\n",
+    ]
+    if not accounts:
+        lines.append("⚠️ Сначала добавь аккаунт в 📢 Рассылке.")
+    else:
+        lines.append("**Статусы:**")
+        lines.append("⚪️ не активна | 🟢 идёт | ⏸ пауза | ✅ завершена")
+        lines.append("")
+        for i, acc in enumerate(accounts, 1):
+            s = acc.get("subscribe_stats") or {}
+            q = len(acc.get("subscribe_queue") or [])
+            lines.append(
+                f"{i}. **{acc.get('name', '?')}** — "
+                f"очередь: {q} | ✅{s.get('subscribed', 0)} "
+                f"⏭{s.get('skipped', 0)} ❌{s.get('errors', 0)}"
+            )
+    return "\n".join(lines)
 
 
 def accounts_menu_kb() -> InlineKeyboardMarkup:
@@ -1597,13 +2249,20 @@ def accounts_menu_text() -> str:
             main_mark = " ⭐" if acc.get("id") == main_id else ""
             sub_mark = " 📥" if acc.get("subscribe_status") == "running" else ""
             s = acc.get("stats") or {}
+            spam_mark = ""
+            spam_status = acc.get("spam_status", "unknown")
+            if spam_status == "limited":
+                spam_mark = " 🚫"
+            elif spam_status == "good":
+                spam_mark = " ✅"
             lines.append(
-                f"{mark} **{i}. {acc.get('name', '?')}**{main_mark}{sub_mark}\n"
+                f"{mark} **{i}. {acc.get('name', '?')}**{main_mark}{sub_mark}{spam_mark}\n"
                 f"   Групп: {len(acc.get('groups') or [])} | "
                 f"Отправлено: {s.get('sent', 0)} | Ошибок: {s.get('errors', 0)}"
             )
     lines.append("\n⭐ — основной (автоответчик и ИИ)")
     lines.append("📥 — активная подписка")
+    lines.append("🚫 — спам-бан | ✅ — всё ок")
     return "\n".join(lines)
 
 
@@ -1636,6 +2295,14 @@ def account_kb(acc_id: str) -> InlineKeyboardMarkup:
             f"📥 Массовая подписка"
             + (f" ({sub_queue_len})" if sub_queue_len else ""),
             callback_data=f"acc_sub_menu:{acc_id}")])
+    # Новые функции
+    rows.append([InlineKeyboardButton("🔍 Проверить спам-бан",
+                                       callback_data=f"acc_check_spam:{acc_id}")])
+    rows.append([InlineKeyboardButton("📂 Разложить по папкам",
+                                       callback_data=f"acc_sort_folders:{acc_id}")])
+    rows.append([InlineKeyboardButton(
+        f"😊 Реакции в группах: {'🟢' if acc.get('group_reactions_enabled', True) else '🔴'}",
+        callback_data=f"acc_toggle_group_react:{acc_id}")])
     if not is_main:
         rows.append([InlineKeyboardButton("⭐ Сделать основным",
                                           callback_data=f"acc_setmain:{acc_id}")])
@@ -1670,6 +2337,13 @@ def account_text(acc_id: str) -> str:
         "done": "✅ завершена",
     }.get(sub_status, sub_status)
 
+    spam_status = acc.get("spam_status", "unknown")
+    spam_emoji = {
+        "good": "✅",
+        "limited": "🚫",
+        "unknown": "❓",
+    }.get(spam_status, "❓")
+
     return (
         f"📢 **{acc.get('name', '?')}** {is_main}\n\n"
         f"• Статус: {'🟢 рассылка идёт' if acc.get('running') else '⚪️ остановлена'}\n"
@@ -1679,12 +2353,18 @@ def account_text(acc_id: str) -> str:
         f"• Задержка: {acc.get('delay_min', 5)}–{acc.get('delay_max', 15)} сек\n\n"
         f"📊 Отправлено: {s.get('sent', 0)} | Ошибок: {s.get('errors', 0)} | "
         f"Кругов: {s.get('rounds', 0)}\n\n"
+        f"🔍 **Спам-статус:** {spam_emoji}\n"
+        f"• Проверка: {acc.get('last_spam_check') or '—'}\n"
+        f"• Статус: {acc.get('spam_status', 'unknown')}\n\n"
         f"📥 **Подписка:** {sub_status_text}\n"
         f"• Подписался: {sub_stats.get('subscribed', 0)} | "
         f"Уже был: {sub_stats.get('skipped', 0)} | "
         f"Ошибок: {sub_stats.get('errors', 0)}\n"
         f"• Задержка: {acc.get('subscribe_delay_min', 40)}–"
         f"{acc.get('subscribe_delay_max', 120)} сек\n\n"
+        f"📁 Папка: {acc.get('folder_index', 0) + 1} (по {acc.get('folder_size', 100)} групп)\n"
+        f"😊 Реакции в группах: {'🟢' if acc.get('group_reactions_enabled', True) else '🔴'} "
+        f"({acc.get('group_reactions_chance', 5)}%)\n\n"
         f"📝 Текст:\n{preview}"
     )
 
@@ -1744,7 +2424,8 @@ def subscribe_menu_text(acc_id: str) -> str:
         f"{acc.get('subscribe_delay_max', 120)} сек\n\n"
         f"📊 Подписался: {stats.get('subscribed', 0)} | "
         f"Уже был: {stats.get('skipped', 0)} | "
-        f"Ошибок: {stats.get('errors', 0)}"
+        f"Ошибок: {stats.get('errors', 0)}\n\n"
+        f"💡 **Как:** нажми 📋, отправь список групп, потом ▶️"
         + preview
     )
 
@@ -1837,9 +2518,10 @@ def ai_react_text() -> str:
     ai = STATE.get("ai_assistant") or {}
     enabled = ai.get("reactions_enabled", True)
     return (
-        "😊 Реакции\n"
+        "😊 Реакции в личке\n"
         f"• Статус: {'🟢 вкл' if enabled else '🔴 выкл'}\n"
-        f"• Шанс: {ai.get('reactions_chance', 20)}%"
+        f"• Шанс: {ai.get('reactions_chance', 20)}%\n\n"
+        "Реакции в группах настраиваются на каждом аккаунте отдельно."
     )
 
 
@@ -1866,7 +2548,7 @@ def ai_delay_text() -> str:
         f"• Статус: {'🟢 вкл' if enabled else '🔴 выкл'}\n"
         f"• Мин: {ai.get('reply_delay_min', 120)} сек\n"
         f"• Макс: {ai.get('reply_delay_max', 240)} сек\n"
-        f"• Тест: {'🟢 ВКЛ (задержка не работает)' if test else '🔴 выкл'}"
+        f"• Тест: {'🟢 ВКЛ' if test else '🔴 выкл'}"
     )
 
 
@@ -2079,16 +2761,22 @@ def stats_menu_text() -> str:
     accounts = STATE.get("accounts") or []
     total_sent = 0
     total_err = 0
+    total_subs = 0
     for acc in accounts:
         s = acc.get("stats") or {}
+        ss = acc.get("subscribe_stats") or {}
         total_sent += s.get("sent", 0)
         total_err += s.get("errors", 0)
+        total_subs += ss.get("subscribed", 0)
         sub_mark = ""
         if acc.get("subscribe_status") == "running":
             sub_mark = " 📥"
         lines.append(f"📢 {acc.get('name', '?')}: 🟢{s.get('sent', 0)} | "
                      f"❌{s.get('errors', 0)} | Кругов {s.get('rounds', 0)}{sub_mark}")
     lines.append(f"\n**Итого по рассылке:** 🟢 {total_sent} | ❌ {total_err}")
+    lines.append(f"**Подписок:** {total_subs}")
+    lines.append(f"**Автоподписок:** {gs.get('auto_subscribes', 0)}")
+    lines.append(f"**Реакций в группах:** {gs.get('group_reactions', 0)}")
     lines.append("")
     lines.append(f"🧠 ИИ: {'🟢 вкл' if ai.get('enabled') else '🔴 выкл'}")
     lines.append(f"• Ответов ИИ: {gs.get('ai_replies', 0)}")
@@ -2098,7 +2786,7 @@ def stats_menu_text() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Логин аккаунтов
+# Логин
 # ---------------------------------------------------------------------------
 
 async def start_userbot_clients():
@@ -2136,6 +2824,8 @@ async def try_start_existing_clients():
                     start_mailing_for_account(acc_id)
                 if acc.get("subscribe_status") == "running":
                     start_subscribe(acc_id)
+                if acc.get("auto_subscribe_enabled", True):
+                    start_auto_subscribe(acc_id)
         except Exception as e:
             log.warning(f"[{acc.get('name')}] не залогинен: {e}")
             try:
@@ -2165,1520 +2855,6 @@ async def populate_known_users_for_main():
     ar["known_users_loaded"] = True
     STATE["autoreply"] = ar
     save_json(STATE_FILE, STATE)
-
-
-# ---------------------------------------------------------------------------
-# Обработчики юзербота
-# ---------------------------------------------------------------------------
-
-def register_main_handlers(c: Client):
-    if c.name in MAIN_HANDLERS_REGISTERED:
-        return
-    MAIN_HANDLERS_REGISTERED.add(c.name)
-
-    @c.on_message(filters.private & filters.outgoing)
-    async def on_outgoing(client, message):
-        try:
-            chat = message.chat
-            if not chat or not chat.id:
-                return
-            if chat.type != enums.ChatType.PRIVATE:
-                return
-            text = (message.text or "").strip()
-            if _was_sent_by_bot(chat.id, text):
-                return
-
-            ai = STATE.get("ai_assistant") or {}
-            if ai.get("auto_examples_enabled", True):
-                last_bot = BOT_LAST_SENT.get(chat.id)
-                if last_bot and text:
-                    last_user = await db_get_last_user_msg(chat.id)
-                    if last_user:
-                        await db_save_example(last_user, last_bot, text, source="owner")
-
-            _mark_owner_activity()
-            _mark_known_ar(chat.id)
-            if not ai.get("test_mode"):
-                _pause_ai(chat.id)
-            if text:
-                await db_add_message(chat.id, "assistant", text)
-        except Exception as e:
-            log.exception(f"on_outgoing: {e}")
-
-    @c.on_message(filters.private & filters.incoming)
-    async def on_incoming(client, message):
-        try:
-            user = message.from_user
-            if not user or user.is_bot or user.is_deleted:
-                return
-            main_id = ME_IDS.get(STATE.get("main_account_id"), 0)
-            if user.id == main_id:
-                return
-            if user.id == CFG.get("admin_id"):
-                return
-
-            ai = STATE.get("ai_assistant") or {}
-            ar = STATE.get("autoreply") or {}
-            if not ai.get("enabled") and not ar.get("enabled"):
-                return
-
-            await mark_chat_read(user.id)
-            text_raw = (message.text or message.caption or "").strip()
-            test_mode = bool(ai.get("test_mode"))
-
-            if is_test_client(user.id) and text_raw.lower() == "/reset":
-                cancel_pending_reply(user.id)
-                saved = await save_session_to_examples(user.id)
-                await db_clear_user_messages(user.id)
-                BOT_LAST_SENT.pop(user.id, None)
-                try:
-                    await client.send_message(
-                        user.id, f"♻️ Справочник обновлён (+{saved}).")
-                except Exception:
-                    pass
-                return
-
-            if test_mode and is_test_client(user.id) and text_raw:
-                if text_raw.startswith("!"):
-                    rule_text = text_raw[1:].strip()
-                    if rule_text:
-                        ai_state = STATE.setdefault("ai_assistant", _default_ai())
-                        rules = ai_state.setdefault("rules", [])
-                        rules.append(rule_text)
-                        save_json(STATE_FILE, STATE)
-                        await client.send_message(
-                            user.id, f"✅ Правило #{len(rules)}:\n_{rule_text}_",
-                            parse_mode=enums.ParseMode.MARKDOWN)
-                        return
-                elif text_raw.startswith("?"):
-                    fix_text = text_raw[1:].strip()
-                    if fix_text:
-                        last_bot = BOT_LAST_SENT.get(user.id)
-                        last_user_msg = await db_get_last_user_msg(user.id)
-                        if last_bot and last_user_msg:
-                            await db_save_example(last_user_msg, last_bot, fix_text,
-                                                  source="test_client")
-                            await client.send_message(user.id, "✅ Пример сохранён.")
-                        return
-
-            elif not is_test_client(user.id) and text_raw and is_suspicious(text_raw):
-                cancel_pending_reply(user.id)
-                try:
-                    await bot_client.send_message(
-                        CFG["admin_id"],
-                        f"🛡️ Манипуляция от {user.id}: _{text_raw[:200]}_",
-                        parse_mode=enums.ParseMode.MARKDOWN)
-                except Exception:
-                    pass
-                _pause_ai(user.id)
-                try:
-                    await client.send_message(user.id, "Извини, позже отвечу.")
-                except Exception:
-                    pass
-                return
-
-            if message.voice or message.video_note or message.audio:
-                cancel_pending_reply(user.id)
-                try:
-                    await bot_client.send_message(
-                        CFG["admin_id"],
-                        f"🔔 Голосовое от {user.first_name} (id={user.id})")
-                except Exception:
-                    pass
-                return
-
-            text = (message.text or message.caption or "").strip()
-            if not text:
-                return
-
-            await db_add_message(user.id, "user", text)
-
-            if not is_test_client(user.id):
-                asyncio.create_task(try_send_reaction(user.id, message.id))
-
-            ai_should_run = (
-                ai.get("enabled")
-                and (test_mode or not _is_paused_ai(user.id))
-                and (test_mode or _owner_inactive_ai())
-            )
-
-            if ai_should_run:
-                cancel_pending_reply(user.id)
-                PENDING_REPLIES[user.id] = asyncio.create_task(scheduled_ai_reply(user.id))
-                return
-
-            if (not test_mode) and ar.get("enabled") and _owner_inactive_ar() and _cooldown_ok_ar(user.id):
-                known = _is_known_ar(user.id)
-                template = (ar.get("template_known") if known else ar.get("template_first")) or ""
-                template = template.strip()
-                if template:
-                    await _send_as_userbot(user.id, template, with_typing=True)
-                    _mark_known_ar(user.id)
-                    _set_cooldown_ar(user.id)
-                    STATE["global_stats"]["autoreplies"] = \
-                        STATE["global_stats"].get("autoreplies", 0) + 1
-                    save_json(STATE_FILE, STATE)
-        except FloodWait as fw:
-            await asyncio.sleep(fw.value + 2)
-        except Exception as e:
-            log.exception(f"on_incoming: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Обработка ИИ
-# ---------------------------------------------------------------------------
-
-async def process_ai_reply(user_id: int, text: str):
-    reply, reason, esc_reason = await ask_ai(user_id, text)
-
-    if reason == "escalate":
-        _pause_ai(user_id)
-        STATE["global_stats"]["ai_fallbacks"] = \
-            STATE["global_stats"].get("ai_fallbacks", 0) + 1
-        STATE["global_stats"]["ai_escalations"] = \
-            STATE["global_stats"].get("ai_escalations", 0) + 1
-        save_json(STATE_FILE, STATE)
-        try:
-            await _send_as_userbot(
-                user_id,
-                "Сейчас передам тебя руководителю, он свяжется в ближайшее время 👌",
-                with_typing=True)
-        except Exception:
-            pass
-        await notify_escalation(user_id, esc_reason or "не указана", text)
-        return
-
-    if reply:
-        await _send_as_userbot(user_id, reply, with_typing=True)
-        STATE["global_stats"]["ai_replies"] = \
-            STATE["global_stats"].get("ai_replies", 0) + 1
-        save_json(STATE_FILE, STATE)
-        return
-
-    hard_fail = reason in ("no_credentials", "auth_error", "disabled",
-                            "empty", "all_accounts_blocked")
-    soft_fail = reason in ("timeout", "rate_limit", "exception", "bad_json")
-    if hard_fail:
-        _pause_ai(user_id)
-        STATE["global_stats"]["ai_fallbacks"] = \
-            STATE["global_stats"].get("ai_fallbacks", 0) + 1
-        save_json(STATE_FILE, STATE)
-        await notify_ai_fallback(user_id, text, reason)
-    elif soft_fail:
-        await notify_ai_temp_error(user_id, text, reason)
-    else:
-        _pause_ai(user_id)
-        await notify_ai_fallback(user_id, text, reason)
-
-
-async def scheduled_ai_reply(user_id: int):
-    try:
-        ai = STATE.get("ai_assistant") or {}
-        test_mode = bool(ai.get("test_mode"))
-        if not test_mode and ai.get("reply_delay_enabled", True):
-            min_d = int(ai.get("reply_delay_min", 120))
-            max_d = int(ai.get("reply_delay_max", 240))
-            if max_d < min_d:
-                max_d = min_d
-            delay = random.randint(min_d, max_d)
-            log.info(f"[DELAY] {user_id}: {delay}s")
-            await asyncio.sleep(delay)
-        last_text = await db_get_last_user_msg(user_id)
-        if last_text:
-            await process_ai_reply(user_id, last_text)
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        log.exception(f"[SCHED] {user_id}: {e}")
-    finally:
-        PENDING_REPLIES.pop(user_id, None)
-
-
-def cancel_pending_reply(user_id: int):
-    t = PENDING_REPLIES.get(user_id)
-    if t and not t.done():
-        t.cancel()
-
-
-# ---------------------------------------------------------------------------
-# Оптимизатор
-# ---------------------------------------------------------------------------
-
-OPTIMIZER_SYSTEM = """Ты — эксперт промпт-инжиниринга. Преобразуй правила и примеры в структуру.
-Убери дубликаты, противоречия, мусор.
-ФОРМАТ:
-===CORE===
-<4-6 тезисов>
-===SCENARIOS===
-<5-8 сценариев>
-===PRIORITY_RULES===
-<1. ... 2. ... 3. ...>
-Больше ничего."""
-
-
-def _parse_optimizer_response(text: str) -> dict:
-    result = {"core": "", "scenarios": "", "priority_rules": "", "ok": False}
-    if not text:
-        return result
-    core_match = re.search(r"===CORE===\s*(.*?)(?====SCENARIOS===|$)",
-                            text, re.DOTALL | re.IGNORECASE)
-    scen_match = re.search(r"===SCENARIOS===\s*(.*?)(?====PRIORITY_RULES===|$)",
-                            text, re.DOTALL | re.IGNORECASE)
-    rules_match = re.search(r"===PRIORITY_RULES===\s*(.*?)$",
-                             text, re.DOTALL | re.IGNORECASE)
-    if core_match:
-        result["core"] = core_match.group(1).strip()
-    if scen_match:
-        result["scenarios"] = scen_match.group(1).strip()
-    if rules_match:
-        result["priority_rules"] = rules_match.group(1).strip()
-    result["ok"] = bool(result["core"] or result["scenarios"] or result["priority_rules"])
-    return result
-
-
-async def optimize_prompt() -> tuple:
-    ai = STATE.get("ai_assistant") or {}
-    rules = ai.get("rules") or []
-    examples = await db_get_all_examples()
-    if not rules and not examples:
-        return False, "Нет правил и примеров."
-
-    parts = []
-    if rules:
-        parts.append("ПРАВИЛА:")
-        for i, r in enumerate(rules, 1):
-            parts.append(f"{i}. {r}")
-    if examples:
-        parts.append("\nПРИМЕРЫ:")
-        for i, ex in enumerate(examples[:40], 1):
-            u = (ex.get("user_msg") or "").strip()
-            g = (ex.get("good_reply") or "").strip()
-            if u and g:
-                parts.append(f"{i}. Клиент: {u}\n   Ответ: {g}")
-    user_input = "\n".join(parts)
-    if len(user_input) > 12000:
-        user_input = user_input[:12000] + "\n…"
-
-    messages = [
-        {"role": "system", "content": OPTIMIZER_SYSTEM},
-        {"role": "user", "content": user_input},
-    ]
-    text, reason = await _cf_request(messages, max_tokens=2000, temperature=0.3)
-    if not text:
-        return False, f"Ошибка: {reason}"
-    parsed = _parse_optimizer_response(text)
-    if not parsed["ok"]:
-        return False, f"Не распарсил:\n{text[:500]}"
-    parsed["rules_count"] = len(rules)
-    parsed["examples_count"] = len(examples)
-    return True, parsed
-
-
-def apply_optimization(result: dict):
-    ai = STATE.setdefault("ai_assistant", _default_ai())
-    ai["prompt_core"] = result.get("core", "")
-    ai["prompt_scenarios"] = result.get("scenarios", "")
-    ai["prompt_priority_rules"] = result.get("priority_rules", "")
-    save_json(STATE_FILE, STATE)
-
-
-def revert_optimization():
-    ai = STATE.setdefault("ai_assistant", _default_ai())
-    ai["prompt_core"] = ""
-    ai["prompt_scenarios"] = ""
-    ai["prompt_priority_rules"] = ""
-    save_json(STATE_FILE, STATE)
-
-
-def _format_optimization_preview(res: dict) -> str:
-    text = (
-        "🧠 **Оптимизация**\n\n"
-        f"Правил: {res.get('rules_count', 0)} | Примеров: {res.get('examples_count', 0)}\n\n"
-        f"━━━ 🎯 ЯДРО ━━━\n{res.get('core', '—')}\n\n"
-        f"━━━ 🎭 СЦЕНАРИИ ━━━\n{res.get('scenarios', '—')}\n\n"
-        f"━━━ ⭐ ПРИОРИТЕТЫ ━━━\n{res.get('priority_rules', '—')}"
-    )
-    if len(text) > 3500:
-        text = text[:3500] + "\n…"
-    return text
-
-
-# ===========================================================================
-# ОБРАБОТЧИКИ БОТА
-# ===========================================================================
-
-def register_handlers(bot: Client) -> None:
-
-    @bot.on_message(filters.command("start") & filters.private)
-    async def cmd_start(client, message):
-        if message.from_user.id != CFG["admin_id"]:
-            await message.reply("⛔ Доступ запрещён.")
-            return
-        if message.from_user.id not in authed:
-            await message.reply("🔒 `/auth <PIN>`", parse_mode=enums.ParseMode.MARKDOWN)
-            return
-        await message.reply("🎛 Панель:", reply_markup=main_menu_kb())
-
-    @bot.on_message(filters.command("auth") & filters.private)
-    async def cmd_auth(client, message):
-        if message.from_user.id != CFG["admin_id"]:
-            return
-        parts = (message.text or "").split(maxsplit=1)
-        if len(parts) < 2 or parts[1].strip() != str(CFG.get("pin", DEFAULT_PIN)):
-            await message.reply("❌ Неверный ПИН.")
-            return
-        authed.add(message.from_user.id)
-        pending.pop(message.from_user.id, None)
-        await message.reply("✅ Авторизация.", reply_markup=main_menu_kb())
-
-    @bot.on_message(filters.command("cancel") & filters.private)
-    async def cmd_cancel(client, message):
-        if message.from_user.id != CFG["admin_id"]:
-            return
-        pending.pop(message.from_user.id, None)
-        await message.reply("Отменено.", reply_markup=main_menu_kb())
-
-    @bot.on_message(filters.command("pause") & filters.private)
-    async def cmd_pause(client, message):
-        if message.from_user.id != CFG["admin_id"] or message.from_user.id not in authed:
-            return
-        parts = (message.text or "").split(maxsplit=1)
-        if len(parts) < 2:
-            await message.reply("Использование: `/pause <user_id>`")
-            return
-        try:
-            uid = int(parts[1].strip())
-        except ValueError:
-            await message.reply("❌ user_id — число.")
-            return
-        _pause_ai(uid)
-        cancel_pending_reply(uid)
-        await message.reply(f"⏸ ИИ приостановлен для {uid}.")
-
-    @bot.on_message(filters.command("resume") & filters.private)
-    async def cmd_resume(client, message):
-        if message.from_user.id != CFG["admin_id"] or message.from_user.id not in authed:
-            return
-        parts = (message.text or "").split(maxsplit=1)
-        if len(parts) < 2:
-            await message.reply("Использование: `/resume <user_id>`")
-            return
-        try:
-            uid = int(parts[1].strip())
-        except ValueError:
-            await message.reply("❌ user_id — число.")
-            return
-        _unpause_ai(uid)
-        await message.reply(f"▶️ ИИ снова общается с {uid}.")
-
-    @bot.on_message(filters.command("fix") & filters.private)
-    async def cmd_fix(client, message):
-        if message.from_user.id != CFG["admin_id"] or message.from_user.id not in authed:
-            return
-        parts = (message.text or "").split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].strip():
-            await message.reply("Использование: `/fix <правило>`")
-            return
-        rule = parts[1].strip()
-        ai = STATE.setdefault("ai_assistant", _default_ai())
-        rules = ai.setdefault("rules", [])
-        rules.append(rule)
-        save_json(STATE_FILE, STATE)
-        await message.reply(f"✅ Правило #{len(rules)}: _{rule}_",
-                            parse_mode=enums.ParseMode.MARKDOWN)
-
-    @bot.on_message(filters.command("panel") & filters.private)
-    async def cmd_panel(client, message):
-        if message.from_user.id != CFG["admin_id"] or message.from_user.id not in authed:
-            return
-        await message.reply("🎛 Панель:", reply_markup=main_menu_kb())
-
-    @bot.on_callback_query()
-    async def on_cb(client, cb):
-        uid = cb.from_user.id
-        if uid != CFG["admin_id"]:
-            await cb.answer("⛔", show_alert=True)
-            return
-        if uid not in authed:
-            await cb.answer("🔒 /auth <PIN>", show_alert=True)
-            return
-        data = cb.data or ""
-        try:
-            if data == "menu":
-                await cb.message.edit_text("🎛 Панель:", reply_markup=main_menu_kb())
-
-            elif data == "noop":
-                await cb.answer("—")
-
-            elif data == "accounts_menu":
-                await cb.message.edit_text(accounts_menu_text(),
-                                            reply_markup=accounts_menu_kb())
-
-            elif data == "acc_add":
-                pending[uid] = {"action": "acc_add_phone"}
-                await cb.message.edit_text(
-                    "➕ **Добавление аккаунта**\n\n"
-                    "Отправь номер телефона в формате `+79991234567`.\n\n"
-                    "⚠️ Используй отдельный аккаунт, а не основной.\n/cancel",
-                    parse_mode=enums.ParseMode.MARKDOWN)
-
-            elif data == "acc_check_overlaps":
-                overlaps = check_group_overlaps()
-                if not overlaps:
-                    await cb.answer("✅ Пересечений нет!", show_alert=True)
-                    return
-                lines = ["⚠️ **Найдены пересечения групп:**\n"]
-                accounts = STATE.get("accounts") or []
-                id_to_name = {a["id"]: a.get("name", "?") for a in accounts}
-                for acc_id, keys in overlaps.items():
-                    name = id_to_name.get(acc_id, acc_id[:8])
-                    lines.append(f"\n📢 **{name}** — {len(keys)} дубликатов:")
-                    for k in keys[:5]:
-                        lines.append(f"  • `{k}`")
-                    if len(keys) > 5:
-                        lines.append(f"  …и ещё {len(keys) - 5}")
-                text = "\n".join(lines)
-                if len(text) > 3500:
-                    text = text[:3500] + "\n…"
-                await cb.message.edit_text(
-                    text,
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⬅️ Назад", callback_data="accounts_menu")]]))
-
-            elif data.startswith("acc_open:"):
-                acc_id = data.split(":", 1)[1]
-                if not get_account(acc_id):
-                    await cb.answer("Аккаунт не найден.")
-                    return
-                await cb.message.edit_text(account_text(acc_id),
-                                            reply_markup=account_kb(acc_id))
-
-            elif data.startswith("acc_toggle:"):
-                acc_id = data.split(":", 1)[1]
-                acc = get_account(acc_id)
-                if not acc:
-                    await cb.answer("Не найден.")
-                    return
-                if not user_clients.get(acc_id):
-                    await cb.answer("Клиент не подключён.", show_alert=True)
-                    return
-                if acc.get("running"):
-                    acc["running"] = False
-                    save_json(STATE_FILE, STATE)
-                    await cb.answer("⏸ Остановлено")
-                else:
-                    if not acc.get("groups"):
-                        await cb.answer("Нет групп!", show_alert=True)
-                        return
-                    if not (acc.get("text") or acc.get("media_path")):
-                        await cb.answer("Не задан текст!", show_alert=True)
-                        return
-                    acc["running"] = True
-                    save_json(STATE_FILE, STATE)
-                    start_mailing_for_account(acc_id)
-                    await cb.answer("🚀 Запущено")
-                await cb.message.edit_text(account_text(acc_id),
-                                            reply_markup=account_kb(acc_id))
-
-            elif data.startswith("acc_text:"):
-                acc_id = data.split(":", 1)[1]
-                pending[uid] = {"action": "acc_text", "acc_id": acc_id}
-                await cb.message.edit_text(
-                    "📝 Отправь текст для рассылки.\n\n"
-                    "Можно markdown: **жирный**, __курсив__, ||спойлер||, "
-                    "[ссылка](url)\n/cancel",
-                    parse_mode=enums.ParseMode.MARKDOWN)
-
-            elif data.startswith("acc_media:"):
-                acc_id = data.split(":", 1)[1]
-                pending[uid] = {"action": "acc_media", "acc_id": acc_id}
-                await cb.message.edit_text("🖼 Отправь фото или видео.\n/cancel")
-
-            elif data.startswith("acc_timing:"):
-                acc_id = data.split(":", 1)[1]
-                acc = get_account(acc_id)
-                if not acc:
-                    return
-                kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        f"⏱ Интервал: {acc.get('interval', 1800)}с",
-                        callback_data=f"acc_setint:{acc_id}")],
-                    [InlineKeyboardButton(
-                        f"⏳ Мин: {acc.get('delay_min', 5)}с",
-                        callback_data=f"acc_setdmin:{acc_id}")],
-                    [InlineKeyboardButton(
-                        f"⏳ Макс: {acc.get('delay_max', 15)}с",
-                        callback_data=f"acc_setdmax:{acc_id}")],
-                    [InlineKeyboardButton("⬅️ Назад", callback_data=f"acc_open:{acc_id}")],
-                ])
-                await cb.message.edit_text(
-                    f"⏱ Тайминги **{acc.get('name')}**\n"
-                    f"• Интервал: {acc.get('interval')} сек\n"
-                    f"• Задержка: {acc.get('delay_min')}–{acc.get('delay_max')} сек",
-                    reply_markup=kb)
-
-            elif data.startswith("acc_setint:"):
-                acc_id = data.split(":", 1)[1]
-                pending[uid] = {"action": "acc_setint", "acc_id": acc_id}
-                await cb.message.edit_text("Интервал (>=60):\n/cancel")
-
-            elif data.startswith("acc_setdmin:"):
-                acc_id = data.split(":", 1)[1]
-                pending[uid] = {"action": "acc_setdmin", "acc_id": acc_id}
-                await cb.message.edit_text("Мин. задержка (>=1):\n/cancel")
-
-            elif data.startswith("acc_setdmax:"):
-                acc_id = data.split(":", 1)[1]
-                pending[uid] = {"action": "acc_setdmax", "acc_id": acc_id}
-                await cb.message.edit_text("Макс. задержка:\n/cancel")
-
-            elif data.startswith("acc_scan:"):
-                acc_id = data.split(":", 1)[1]
-                c = user_clients.get(acc_id)
-                if not c:
-                    await cb.answer("Клиент не подключён.", show_alert=True)
-                    return
-                await cb.answer("Сканирую…")
-                await cb.message.edit_text("🔍 Сканирую…")
-                found = await scan_groups_for_account(acc_id)
-                acc = get_account(acc_id)
-                scanned = {g["id"] for g in found}
-                manual = [g for g in (acc.get("groups") or [])
-                          if g.get("manual") and g["id"] not in scanned]
-                acc["groups"] = found + manual
-                save_json(STATE_FILE, STATE)
-                await cb.message.edit_text(
-                    f"✅ Найдено: {len(found)}. Всего: {len(acc['groups'])}.",
-                    reply_markup=account_kb(acc_id))
-
-            elif data.startswith("acc_addgrp:"):
-                acc_id = data.split(":", 1)[1]
-                pending[uid] = {"action": "acc_addgrp", "acc_id": acc_id}
-                await cb.message.edit_text("@username / t.me/... / ID:\n/cancel")
-
-            elif data.startswith("acc_delgrp:"):
-                acc_id = data.split(":", 1)[1]
-                acc = get_account(acc_id)
-                if not acc or not acc.get("groups"):
-                    await cb.answer("Пусто.", show_alert=True)
-                    return
-                rows = []
-                for g in (acc.get("groups") or [])[:30]:
-                    t = (g.get("title") or str(g.get("id")))[:35]
-                    rows.append([InlineKeyboardButton(
-                        f"❌ {t}", callback_data=f"acc_delg:{acc_id}:{g['id']}")])
-                rows.append([InlineKeyboardButton(
-                    "⬅️ Назад", callback_data=f"acc_open:{acc_id}")])
-                await cb.message.edit_text("Удалить группу:",
-                                            reply_markup=InlineKeyboardMarkup(rows))
-
-            elif data.startswith("acc_delg:"):
-                parts = data.split(":", 2)
-                if len(parts) < 3:
-                    return
-                acc_id, gid_s = parts[1], parts[2]
-                try:
-                    gid = int(gid_s)
-                except ValueError:
-                    return
-                acc = get_account(acc_id)
-                if acc:
-                    acc["groups"] = [g for g in acc["groups"] if g["id"] != gid]
-                    save_json(STATE_FILE, STATE)
-                await cb.answer("Удалено.")
-                await cb.message.edit_text(account_text(acc_id),
-                                            reply_markup=account_kb(acc_id))
-
-            elif data.startswith("acc_setmain:"):
-                acc_id = data.split(":", 1)[1]
-                if get_account(acc_id):
-                    STATE["main_account_id"] = acc_id
-                    save_json(STATE_FILE, STATE)
-                    c = user_clients.get(acc_id)
-                    if c:
-                        register_main_handlers(c)
-                    await cb.answer("⭐ Основной изменён.",
-                                     show_alert=True)
-                await cb.message.edit_text(account_text(acc_id),
-                                            reply_markup=account_kb(acc_id))
-
-            elif data.startswith("acc_remove:"):
-                acc_id = data.split(":", 1)[1]
-                kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Да, удалить",
-                                          callback_data=f"acc_remove_ok:{acc_id}")],
-                    [InlineKeyboardButton("❌ Отмена",
-                                          callback_data=f"acc_open:{acc_id}")],
-                ])
-                await cb.message.edit_text(
-                    "🗑 Удалить аккаунт? Сессия тоже удалится.",
-                    reply_markup=kb)
-
-            elif data.startswith("acc_remove_ok:"):
-                acc_id = data.split(":", 1)[1]
-                acc = get_account(acc_id)
-                if acc:
-                    acc["running"] = False
-                    acc["subscribe_status"] = "paused"
-                    c = user_clients.get(acc_id)
-                    if c:
-                        try:
-                            await c.stop()
-                        except Exception:
-                            pass
-                        user_clients.pop(acc_id, None)
-                    sname = acc.get("session_name")
-                    if sname:
-                        for ext in (".session", ".session-journal"):
-                            p = os.path.join(DATA_DIR, sname + ext)
-                            try:
-                                if os.path.exists(p):
-                                    os.remove(p)
-                            except Exception:
-                                pass
-                    remove_account(acc_id)
-                    await cb.answer("🗑 Удалён.")
-                await cb.message.edit_text(accounts_menu_text(),
-                                            reply_markup=accounts_menu_kb())
-
-            elif data.startswith("acc_sub_menu:"):
-                acc_id = data.split(":", 1)[1]
-                if not get_account(acc_id):
-                    await cb.answer("Не найден.")
-                    return
-                await cb.message.edit_text(subscribe_menu_text(acc_id),
-                                            reply_markup=subscribe_menu_kb(acc_id))
-
-            elif data.startswith("acc_sub_load:"):
-                acc_id = data.split(":", 1)[1]
-                pending[uid] = {"action": "acc_sub_load", "acc_id": acc_id}
-                await cb.message.edit_text(
-                    "📋 Отправь список групп.\n\n"
-                    "**Форматы:**\n"
-                    "• По одной на строку: `@group1`, `https://t.me/group2`, `-1001234567890`\n"
-                    "• Через запятую: `@g1, @g2, @g3`\n"
-                    "• Или `.txt` файлом — каждая группа на строке\n\n"
-                    "Строки с `#` — комментарии.\n\n"
-                    "⚠️ Группы добавятся в ОЧЕРЕДЬ.\n/cancel",
-                    parse_mode=enums.ParseMode.MARKDOWN)
-
-            elif data.startswith("acc_sub_delay:"):
-                acc_id = data.split(":", 1)[1]
-                pending[uid] = {"action": "acc_sub_delay", "acc_id": acc_id}
-                await cb.message.edit_text(
-                    "⏱ Отправь мин и макс через пробел или дефис.\n"
-                    "Например: `40 120` или `40-120`\n\n"
-                    "Рекомендую 40–120 сек.\n/cancel",
-                    parse_mode=enums.ParseMode.MARKDOWN)
-
-            elif data.startswith("acc_sub_start:"):
-                acc_id = data.split(":", 1)[1]
-                acc = get_account(acc_id)
-                if not acc:
-                    return
-                if not acc.get("subscribe_queue"):
-                    await cb.answer("Очередь пуста.", show_alert=True)
-                    return
-                if not user_clients.get(acc_id):
-                    await cb.answer("Клиент не подключён.", show_alert=True)
-                    return
-                acc["subscribe_status"] = "running"
-                if not acc.get("subscribe_stats", {}).get("started_at"):
-                    acc.setdefault("subscribe_stats", {})["started_at"] = \
-                        datetime.now().isoformat(timespec="seconds")
-                save_json(STATE_FILE, STATE)
-                start_subscribe(acc_id)
-                await cb.answer("▶️ Запущено")
-                await cb.message.edit_text(subscribe_menu_text(acc_id),
-                                            reply_markup=subscribe_menu_kb(acc_id))
-
-            elif data.startswith("acc_sub_stop:"):
-                acc_id = data.split(":", 1)[1]
-                acc = get_account(acc_id)
-                if acc:
-                    acc["subscribe_status"] = "paused"
-                    save_json(STATE_FILE, STATE)
-                await cb.answer("⏸ Остановлено")
-                await cb.message.edit_text(subscribe_menu_text(acc_id),
-                                            reply_markup=subscribe_menu_kb(acc_id))
-
-            elif data.startswith("acc_sub_clear:"):
-                acc_id = data.split(":", 1)[1]
-                acc = get_account(acc_id)
-                if acc:
-                    acc["subscribe_queue"] = []
-                    acc["subscribe_status"] = "idle"
-                    save_json(STATE_FILE, STATE)
-                await cb.answer("🗑 Очередь очищена")
-                await cb.message.edit_text(subscribe_menu_text(acc_id),
-                                            reply_markup=subscribe_menu_kb(acc_id))
-
-            elif data == "ai_menu":
-                await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
-            elif data == "ai_toggle":
-                ai = STATE.setdefault("ai_assistant", _default_ai())
-                ai["enabled"] = not ai.get("enabled", False)
-                save_json(STATE_FILE, STATE)
-                await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
-            elif data == "ai_test_toggle":
-                ai = STATE.setdefault("ai_assistant", _default_ai())
-                ai["test_mode"] = not ai.get("test_mode", False)
-                save_json(STATE_FILE, STATE)
-                await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
-
-            elif data == "ai_typing_menu":
-                await cb.message.edit_text(ai_typing_text(), reply_markup=ai_typing_kb())
-            elif data == "ai_typing_toggle":
-                ai = STATE.setdefault("ai_assistant", _default_ai())
-                ai["typing_enabled"] = not ai.get("typing_enabled", True)
-                save_json(STATE_FILE, STATE)
-                await cb.message.edit_text(ai_typing_text(), reply_markup=ai_typing_kb())
-            elif data == "ai_typing_min":
-                pending[uid] = {"action": "ai_typing_min"}
-                await cb.message.edit_text("Мин. задержка набора (>=0.5):\n/cancel")
-            elif data == "ai_typing_max":
-                pending[uid] = {"action": "ai_typing_max"}
-                await cb.message.edit_text("Макс. задержка набора:\n/cancel")
-            elif data == "ai_typing_cps":
-                pending[uid] = {"action": "ai_typing_cps"}
-                await cb.message.edit_text("Скорость (симв/сек, 1-100):\n/cancel")
-
-            elif data == "ai_react_menu":
-                await cb.message.edit_text(ai_react_text(), reply_markup=ai_react_kb())
-            elif data == "ai_react_toggle":
-                ai = STATE.setdefault("ai_assistant", _default_ai())
-                ai["reactions_enabled"] = not ai.get("reactions_enabled", True)
-                save_json(STATE_FILE, STATE)
-                await cb.message.edit_text(ai_react_text(), reply_markup=ai_react_kb())
-            elif data == "ai_react_chance":
-                pending[uid] = {"action": "ai_react_chance"}
-                await cb.message.edit_text("Шанс реакции % (0-100):\n/cancel")
-
-            elif data == "ai_delay_menu":
-                await cb.message.edit_text(ai_delay_text(), reply_markup=ai_delay_kb())
-            elif data == "ai_delay_toggle":
-                ai = STATE.setdefault("ai_assistant", _default_ai())
-                ai["reply_delay_enabled"] = not ai.get("reply_delay_enabled", True)
-                save_json(STATE_FILE, STATE)
-                await cb.message.edit_text(ai_delay_text(), reply_markup=ai_delay_kb())
-            elif data == "ai_delay_min":
-                pending[uid] = {"action": "ai_delay_min"}
-                await cb.message.edit_text("Мин. задержка (сек, >=30):\n/cancel")
-            elif data == "ai_delay_max":
-                pending[uid] = {"action": "ai_delay_max"}
-                await cb.message.edit_text("Макс. задержка (сек, >=30):\n/cancel")
-
-            elif data == "cf_menu":
-                await cb.message.edit_text(cf_accounts_text(),
-                                            reply_markup=cf_accounts_kb())
-            elif data == "cf_refresh":
-                await cb.message.edit_text(cf_accounts_text(),
-                                            reply_markup=cf_accounts_kb())
-            elif data == "cf_add":
-                pending[uid] = {"action": "cf_add_id"}
-                await cb.message.edit_text("🔑 Cloudflare Account ID:\n/cancel")
-            elif data == "cf_list":
-                await cb.message.edit_text("Удалить аккаунт:", reply_markup=cf_list_kb())
-            elif data.startswith("cf_del:"):
-                acc_id = data.split(":", 1)[1]
-                if remove_cf_account(acc_id):
-                    await cb.answer("🗑")
-                else:
-                    await cb.answer("Не найден.")
-                    return
-                await cb.message.edit_text(cf_accounts_text(),
-                                            reply_markup=cf_accounts_kb())
-            elif data == "cf_test_block":
-                n = test_block_current_account()
-                await cb.answer(f"🧪 {n} заблокирован." if n else "Нет аккаунтов.",
-                                show_alert=True)
-                await cb.message.edit_text(cf_accounts_text(),
-                                            reply_markup=cf_accounts_kb())
-            elif data == "cf_unblock_all":
-                n = unblock_all_cf_accounts()
-                await cb.answer(f"🧹 Разблокировано: {n}")
-                await cb.message.edit_text(cf_accounts_text(),
-                                            reply_markup=cf_accounts_kb())
-
-            elif data == "ai_show_prompt":
-                prompt = await build_system_prompt()
-                if len(prompt) > 3500:
-                    prompt = prompt[:3500] + "\n…"
-                await cb.message.edit_text(
-                    f"📋 Промпт:\n\n{prompt}",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⬅️", callback_data="ai_menu")]]))
-            elif data == "ai_paused":
-                ai = STATE.get("ai_assistant") or {}
-                if not (ai.get("paused_users") or []):
-                    await cb.answer("Пусто.", show_alert=True)
-                    return
-                await cb.message.edit_text("📋 Приостановленные:",
-                                            reply_markup=ai_paused_kb())
-            elif data.startswith("ai_resume:"):
-                try:
-                    target = int(data.split(":", 1)[1])
-                except ValueError:
-                    return
-                _unpause_ai(target)
-                await cb.answer(f"▶️ {target} возобновлён.")
-                await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
-
-            elif data == "ai_train":
-                global await_count_cache
-                await_count_cache = await db_count_examples()
-                await cb.message.edit_text(ai_train_text(), reply_markup=ai_train_kb())
-
-            elif data == "ai_scheme":
-                await cb.message.edit_text(ai_scheme_text(), reply_markup=ai_scheme_kb())
-            elif data == "ai_scheme_edit":
-                pending[uid] = {"action": "ai_scheme_edit"}
-                await cb.message.edit_text(
-                    "🎬 Схема диалога. Опиши пошагово:\n\n"
-                    "1. Приветствие\n"
-                    "2. Узнаю про опыт\n"
-                    "3. Рассказываю про продукт\n"
-                    "4. Обработка возражений\n"
-                    "5. Закрытие/эскалация\n/cancel")
-            elif data == "ai_scheme_show":
-                scheme = (STATE.get("ai_assistant") or {}).get("dialog_scheme") or ""
-                await cb.message.edit_text(
-                    f"🎬 Схема:\n\n{scheme[:3500]}",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⬅️", callback_data="ai_scheme")]]))
-            elif data == "ai_scheme_clear":
-                ai = STATE.setdefault("ai_assistant", _default_ai())
-                ai["dialog_scheme"] = ""
-                save_json(STATE_FILE, STATE)
-                await cb.answer("🗑 Очищено.")
-                await cb.message.edit_text(ai_scheme_text(), reply_markup=ai_scheme_kb())
-
-            elif data == "ai_training":
-                await cb.message.edit_text(ai_training_text(),
-                                            reply_markup=ai_training_kb())
-            elif data == "ai_training_edit":
-                pending[uid] = {"action": "ai_training_edit"}
-                await cb.message.edit_text(
-                    "📖 Обучающие примеры. Формат свободный:\n\n"
-                    "ДИАЛОГ 1:\nКлиент: привет\nИИ: Привет! Ты откуда?\n...\n/cancel")
-            elif data == "ai_training_show":
-                train = (STATE.get("ai_assistant") or {}).get("training_examples") or ""
-                await cb.message.edit_text(
-                    f"📖 Примеры:\n\n{train[:3500]}",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⬅️", callback_data="ai_training")]]))
-            elif data == "ai_training_clear":
-                ai = STATE.setdefault("ai_assistant", _default_ai())
-                ai["training_examples"] = ""
-                save_json(STATE_FILE, STATE)
-                await cb.answer("🗑")
-                await cb.message.edit_text(ai_training_text(),
-                                            reply_markup=ai_training_kb())
-
-            elif data == "ai_optimize":
-                await cb.answer("🧠 Запускаю…")
-                await cb.message.edit_text("🧠 Оптимизирую…")
-                ok, res = await optimize_prompt()
-                if not ok:
-                    await cb.message.edit_text(
-                        f"❌ {res}",
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🔄", callback_data="ai_optimize")],
-                            [InlineKeyboardButton("⬅️", callback_data="ai_train")]]))
-                    return
-                pending[uid] = {"action": "ai_optimize_confirm", "result": res}
-                await cb.message.edit_text(_format_optimization_preview(res),
-                                            reply_markup=ai_optimize_preview_kb())
-
-            elif data == "ai_optimize_apply":
-                res = (pending.get(uid) or {}).get("result")
-                if not res:
-                    await cb.answer("Результат потерян.", show_alert=True)
-                    return
-                apply_optimization(res)
-                await cb.message.edit_text("✅ Применено!",
-                                            reply_markup=ai_optimize_applied_kb())
-            elif data == "ai_optimize_revert":
-                revert_optimization()
-                await cb.answer("♻️ Откачено.")
-                await cb.message.edit_text(ai_train_text(), reply_markup=ai_train_kb())
-
-            elif data == "ai_rules_list":
-                ai = STATE.get("ai_assistant") or {}
-                if not (ai.get("rules") or []):
-                    await cb.answer("Правил нет.", show_alert=True)
-                    return
-                await cb.message.edit_text("📋 Правила:",
-                                            reply_markup=ai_rules_list_kb())
-            elif data.startswith("ai_rule_show:"):
-                try:
-                    idx = int(data.split(":", 1)[1])
-                except ValueError:
-                    return
-                rules = (STATE.get("ai_assistant") or {}).get("rules") or []
-                if idx >= len(rules):
-                    await cb.answer("Не найдено.")
-                    return
-                await cb.message.edit_text(
-                    f"📝 Правило #{idx+1}:\n\n{rules[idx]}",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🗑 Удалить",
-                                              callback_data=f"ai_rule_del:{idx}")],
-                        [InlineKeyboardButton("⬅️", callback_data="ai_rules_list")]]))
-            elif data == "ai_rules_add":
-                pending[uid] = {"action": "ai_rule_add"}
-                await cb.message.edit_text("📝 Правило:\n/cancel")
-            elif data.startswith("ai_rule_del:"):
-                try:
-                    idx = int(data.split(":", 1)[1])
-                except ValueError:
-                    return
-                ai = STATE.setdefault("ai_assistant", _default_ai())
-                rules = ai.get("rules") or []
-                if 0 <= idx < len(rules):
-                    rules.pop(idx)
-                    ai["rules"] = rules
-                    save_json(STATE_FILE, STATE)
-                await cb.answer("Удалено.")
-                await cb.message.edit_text(ai_train_text(), reply_markup=ai_train_kb())
-            elif data == "ai_ex_toggle":
-                ai = STATE.setdefault("ai_assistant", _default_ai())
-                ai["examples_enabled"] = not ai.get("examples_enabled", True)
-                save_json(STATE_FILE, STATE)
-                await cb.message.edit_text(ai_train_text(), reply_markup=ai_train_kb())
-            elif data == "ai_ex_show":
-                examples = await db_get_examples(limit=20)
-                if not examples:
-                    await cb.answer("Примеров нет.", show_alert=True)
-                    return
-                lines = []
-                for i, ex in enumerate(examples[:10], 1):
-                    u = (ex.get("user_msg") or "")[:80]
-                    g = (ex.get("good_reply") or "")[:120]
-                    lines.append(f"{i}. 👤 {u}\n   ✅ {g}")
-                text = "📚 Примеры:\n\n" + "\n\n".join(lines)
-                await cb.message.edit_text(text[:3500],
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⬅️", callback_data="ai_train")]]))
-            elif data == "ai_ex_clear":
-                await db_clear_examples()
-                await cb.answer("🧹 Очищено.")
-                await cb.message.edit_text(ai_train_text(), reply_markup=ai_train_kb())
-
-            elif data == "ar_menu":
-                await cb.message.edit_text(autoreply_menu_text(),
-                                            reply_markup=autoreply_menu_kb())
-            elif data == "ar_toggle":
-                ar = STATE.setdefault("autoreply", _default_autoreply())
-                ar["enabled"] = not ar.get("enabled", False)
-                save_json(STATE_FILE, STATE)
-                await cb.message.edit_text(autoreply_menu_text(),
-                                            reply_markup=autoreply_menu_kb())
-            elif data == "ar_first":
-                pending[uid] = {"action": "ar_first"}
-                await cb.message.edit_text("Текст для НОВЫХ:\n/cancel")
-            elif data == "ar_known":
-                pending[uid] = {"action": "ar_known"}
-                await cb.message.edit_text("Текст для ЗНАКОМЫХ:\n/cancel")
-            elif data == "ar_inactive":
-                pending[uid] = {"action": "ar_inactive"}
-                await cb.message.edit_text("Минут неактивности:\n/cancel")
-            elif data == "ar_cooldown":
-                pending[uid] = {"action": "ar_cooldown"}
-                await cb.message.edit_text("Cooldown (мин):\n/cancel")
-            elif data == "ar_reset_known":
-                ar = STATE.setdefault("autoreply", _default_autoreply())
-                ar["known_users"] = []
-                ar["known_users_loaded"] = False
-                save_json(STATE_FILE, STATE)
-                await cb.message.edit_text("♻️ Сброшено.",
-                                            reply_markup=autoreply_menu_kb())
-
-            elif data == "stats_menu":
-                await cb.message.edit_text(stats_menu_text(),
-                                            reply_markup=stats_menu_kb())
-            elif data == "db_cleanup":
-                await db_cleanup(30)
-                await cb.answer("✅ Очищено.")
-
-            else:
-                await cb.answer("Неизвестная команда.")
-        except Exception as e:
-            log.exception("Ошибка callback")
-            try:
-                await cb.answer(f"Ошибка: {e}", show_alert=True)
-            except Exception:
-                pass
-
-    # ---------------- INPUT ----------------
-    @bot.on_message(filters.private & filters.user(CFG["admin_id"]))
-    async def on_admin_input(client, message):
-        uid = message.from_user.id
-        if uid not in authed:
-            return
-        act = pending.pop(uid, None)
-        if not act:
-            return
-        action = act.get("action")
-        text = (message.text or "").strip()
-        try:
-            # === Добавление аккаунта ===
-            if action == "acc_add_phone":
-                phone = text
-                if not phone.startswith("+") or len(phone) < 8:
-                    pending[uid] = {"action": "acc_add_phone"}
-                    await message.reply("❌ Неверный формат. Ещё раз или /cancel.")
-                    return
-                sname = f"userbot_{int(datetime.now().timestamp())}"
-                session_path = os.path.join(DATA_DIR, sname)
-                try:
-                    new_c = make_client(session_path)
-                    await new_c.connect()
-                    # force_sms=True — принудительно SMS-кой
-                    try:
-                        sent = await new_c.send_code(phone, force_sms=True)
-                    except TypeError:
-                        sent = await new_c.send_code(phone)
-                except Exception as e:
-                    await message.reply(f"❌ send_code: {e}")
-                    return
-                pending[uid] = {
-                    "action": "acc_add_code",
-                    "phone": phone,
-                    "hash": sent.phone_code_hash,
-                    "session_name": sname,
-                    "client": new_c,
-                }
-                await message.reply(
-                    "📩 Код отправлен SMS-кой на номер.\n\n"
-                    "Если SMS не пришло за 60 сек — напиши `/cancel` и попробуй снова.\n\n"
-                    "Введи код:")
-
-            elif action == "acc_add_code":
-                phone = act["phone"]
-                hash_ = act["hash"]
-                sname = act["session_name"]
-                new_c: Client = act["client"]
-                code = text.replace(" ", "")
-                try:
-                    await new_c.sign_in(phone_number=phone,
-                                         phone_code_hash=hash_,
-                                         phone_code=code)
-                except SessionPasswordNeeded:
-                    pending[uid] = {
-                        "action": "acc_add_password",
-                        "phone": phone,
-                        "session_name": sname,
-                        "client": new_c,
-                    }
-                    await message.reply("🔐 Пароль 2FA:")
-                    return
-                except PhoneCodeInvalid:
-                    pending[uid] = act
-                    await message.reply("❌ Неверный код. Ещё раз:")
-                    return
-                except PhoneCodeExpired:
-                    await message.reply("⚠️ Код истёк. /cancel и заново.")
-                    return
-                except Exception as e:
-                    await message.reply(f"❌ {e}")
-                    return
-
-                me = await new_c.get_me()
-                name = f"{me.first_name}" + (f" @{me.username}" if me.username else "")
-                acc = add_account(name, sname)
-                acc["user_id"] = me.id
-                acc["username"] = me.username
-                save_json(STATE_FILE, STATE)
-                user_clients[acc["id"]] = new_c
-                ME_IDS[acc["id"]] = me.id
-                await message.reply(
-                    f"✅ Аккаунт добавлен: **{name}** (id={me.id}).",
-                    reply_markup=main_menu_kb())
-
-            elif action == "acc_add_password":
-                phone = act["phone"]
-                sname = act["session_name"]
-                new_c: Client = act["client"]
-                try:
-                    await new_c.check_password(text)
-                except PasswordHashInvalid:
-                    pending[uid] = act
-                    await message.reply("❌ Неверный пароль. Ещё раз:")
-                    return
-                except Exception as e:
-                    await message.reply(f"❌ {e}")
-                    return
-
-                me = await new_c.get_me()
-                name = f"{me.first_name}" + (f" @{me.username}" if me.username else "")
-                acc = add_account(name, sname)
-                acc["user_id"] = me.id
-                acc["username"] = me.username
-                save_json(STATE_FILE, STATE)
-                user_clients[acc["id"]] = new_c
-                ME_IDS[acc["id"]] = me.id
-                await message.reply(
-                    f"✅ Аккаунт добавлен: **{name}** (id={me.id}).",
-                    reply_markup=main_menu_kb())
-
-            elif action == "acc_sub_load":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                if not acc:
-                    await message.reply("❌ Аккаунт не найден.")
-                    return
-
-                raw_text = ""
-                if message.document:
-                    try:
-                        path = await message.download()
-                        with open(path, "r", encoding="utf-8") as f:
-                            raw_text = f.read()
-                        try:
-                            os.remove(path)
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        await message.reply(f"❌ Не смог прочитать: {e}")
-                        return
-                else:
-                    raw_text = message.text or ""
-
-                if not raw_text.strip():
-                    pending[uid] = act
-                    await message.reply("Пусто. Ещё раз или /cancel.")
-                    return
-
-                groups = parse_groups_from_text(raw_text)
-                if not groups:
-                    await message.reply("❌ Не распарсил ни одной группы.")
-                    return
-
-                warnings = []
-                for other in STATE.get("accounts") or []:
-                    if other["id"] == acc_id:
-                        continue
-                    other_ids = {g.get("id") for g in (other.get("groups") or [])}
-                    for ref in groups:
-                        if isinstance(ref, int) and ref in other_ids:
-                            warnings.append(f"• `{ref}` уже у {other.get('name')}")
-                            break
-
-                existing_q = acc.setdefault("subscribe_queue", [])
-                existing_q_keys = {str(x) for x in existing_q}
-                added = 0
-                for ref in groups:
-                    if str(ref) not in existing_q_keys:
-                        existing_q.append(ref)
-                        existing_q_keys.add(str(ref))
-                        added += 1
-
-                acc["subscribe_status"] = "idle"
-                save_json(STATE_FILE, STATE)
-
-                msg = (f"✅ Загружено: **{added}** новых в очередь.\n"
-                       f"Всего в очереди: **{len(acc['subscribe_queue'])}**\n\n")
-                if warnings:
-                    msg += "⚠️ **Возможные пересечения:**\n" + "\n".join(warnings[:10]) + "\n\n"
-                msg += "Зайди в 📥 Массовая подписка → ▶️ Запустить"
-                await message.reply(msg, reply_markup=account_kb(acc_id))
-
-            elif action == "acc_sub_delay":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                if not acc:
-                    return
-                text_clean = text.replace("-", " ").replace(",", " ")
-                parts = [p for p in text_clean.split() if p.strip()]
-                if len(parts) < 2:
-                    pending[uid] = act
-                    await message.reply("❌ Нужно 2 числа. Пример: `40 120`",
-                                         parse_mode=enums.ParseMode.MARKDOWN)
-                    return
-                try:
-                    lo = int(parts[0])
-                    hi = int(parts[1])
-                    if lo < 5: raise ValueError("мин. 5")
-                    if hi < lo: raise ValueError("макс >= мин")
-                    if hi > 1800: raise ValueError("макс 1800")
-                except Exception as e:
-                    pending[uid] = act
-                    await message.reply(f"❌ {e}")
-                    return
-                acc["subscribe_delay_min"] = lo
-                acc["subscribe_delay_max"] = hi
-                save_json(STATE_FILE, STATE)
-                await message.reply(f"✅ Задержка: {lo}–{hi} сек.",
-                                     reply_markup=account_kb(acc_id))
-
-            elif action == "acc_text":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                if not acc:
-                    await message.reply("❌ Аккаунт не найден.")
-                    return
-                if not text:
-                    pending[uid] = act
-                    await message.reply("Пустой текст. Ещё раз или /cancel.")
-                    return
-                acc["text"] = text
-                acc["media_path"] = None
-                acc["media_type"] = None
-                acc["caption"] = ""
-                save_json(STATE_FILE, STATE)
-                await message.reply("✅ Текст сохранён.", reply_markup=account_kb(acc_id))
-
-            elif action == "acc_media":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                if not acc:
-                    return
-                if not (message.photo or message.video):
-                    pending[uid] = act
-                    await message.reply("Не медиа. Пришли фото/видео.")
-                    return
-                if message.photo:
-                    ext = "jpg"; acc["media_type"] = "photo"
-                else:
-                    ext = "mp4"; acc["media_type"] = "video"
-                path = os.path.join(MEDIA_DIR, f"media_{acc_id}.{ext}")
-                await message.download(file_name=path)
-                acc["media_path"] = path
-                acc["caption"] = message.caption or ""
-                acc["text"] = ""
-                save_json(STATE_FILE, STATE)
-                await message.reply("✅ Медиа сохранено.", reply_markup=account_kb(acc_id))
-
-            elif action == "acc_setint":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                try:
-                    v = int(text)
-                    if v < 60: raise ValueError("мин. 60")
-                    acc["interval"] = v
-                    save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ Интервал: {v} сек.",
-                                        reply_markup=account_kb(acc_id))
-                except Exception as e:
-                    pending[uid] = act
-                    await message.reply(f"❌ {e}")
-
-            elif action == "acc_setdmin":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                try:
-                    v = int(text)
-                    if v < 1: raise ValueError("мин. 1")
-                    acc["delay_min"] = v
-                    if acc["delay_max"] < v:
-                        acc["delay_max"] = v
-                    save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ Мин: {v}.",
-                                        reply_markup=account_kb(acc_id))
-                except Exception as e:
-                    pending[uid] = act
-                    await message.reply(f"❌ {e}")
-
-            elif action == "acc_setdmax":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                try:
-                    v = int(text)
-                    if v < acc["delay_min"]:
-                        raise ValueError(f">= {acc['delay_min']}")
-                    acc["delay_max"] = v
-                    save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ Макс: {v}.",
-                                        reply_markup=account_kb(acc_id))
-                except Exception as e:
-                    pending[uid] = act
-                    await message.reply(f"❌ {e}")
-
-            elif action == "acc_addgrp":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                c = user_clients.get(acc_id)
-                if not acc or not c:
-                    await message.reply("❌ Аккаунт не подключён.")
-                    return
-                ref = parse_chat_ref(text)
-                if ref is None:
-                    await message.reply("Не распарсил.")
-                    return
-                try:
-                    chat = await c.get_chat(ref)
-                except Exception as e:
-                    await message.reply(f"❌ {e}")
-                    return
-                gid = chat.id
-                title = chat.title or str(gid)
-                if any(g["id"] == gid for g in acc["groups"]):
-                    await message.reply("Уже в списке.")
-                    return
-                acc["groups"].append({
-                    "id": gid, "title": title,
-                    "type": chat.type.name if chat.type else "UNKNOWN",
-                    "manual": True})
-                save_json(STATE_FILE, STATE)
-                await message.reply(f"✅ {title}", reply_markup=account_kb(acc_id))
-
-            elif action == "ai_typing_min":
-                try:
-                    v = float(text.replace(",", "."))
-                    if v < 0.5: raise ValueError("мин. 0.5")
-                    STATE["ai_assistant"]["typing_min_delay"] = v
-                    save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ {v} сек.", reply_markup=ai_typing_kb())
-                except Exception as e:
-                    pending[uid] = act
-                    await message.reply(f"❌ {e}")
-
-            elif action == "ai_typing_max":
-                try:
-                    v = float(text.replace(",", "."))
-                    STATE["ai_assistant"]["typing_max_delay"] = v
-                    save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ {v} сек.", reply_markup=ai_typing_kb())
-                except Exception as e:
-                    pending[uid] = act
-                    await message.reply(f"❌ {e}")
-
-            elif action == "ai_typing_cps":
-                try:
-                    v = float(text.replace(",", "."))
-                    if v < 1 or v > 100: raise ValueError("1-100")
-                    STATE["ai_assistant"]["typing_cps"] = v
-                    save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ {v} симв/сек.", reply_markup=ai_typing_kb())
-                except Exception as e:
-                    pending[uid] = act
-                    await message.reply(f"❌ {e}")
-
-            elif action == "ai_react_chance":
-                try:
-                    v = int(text)
-                    if v < 0 or v > 100: raise ValueError("0-100")
-                    STATE["ai_assistant"]["reactions_chance"] = v
-                    save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ {v}%", reply_markup=ai_react_kb())
-                except Exception as e:
-                    pending[uid] = act
-                    await message.reply(f"❌ {e}")
-
-            elif action == "ai_delay_min":
-                try:
-                    v = int(text)
-                    if v < 30: raise ValueError("мин. 30")
-                    STATE["ai_assistant"]["reply_delay_min"] = v
-                    save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ {v} сек.", reply_markup=ai_delay_kb())
-                except Exception as e:
-                    pending[uid] = act
-                    await message.reply(f"❌ {e}")
-
-            elif action == "ai_delay_max":
-                try:
-                    v = int(text)
-                    if v < 30: raise ValueError("мин. 30")
-                    STATE["ai_assistant"]["reply_delay_max"] = v
-                    save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ {v} сек.", reply_markup=ai_delay_kb())
-                except Exception as e:
-                    pending[uid] = act
-                    await message.reply(f"❌ {e}")
-
-            elif action == "cf_add_id":
-                cleaned = clean_secret(text)
-                if not cleaned:
-                    pending[uid] = act
-                    await message.reply("Пусто.")
-                    return
-                pending[uid] = {"action": "cf_add_token", "account_id": cleaned}
-                await message.reply(f"✅ ID ({len(cleaned)}). Теперь API Token.\n/cancel")
-
-            elif action == "cf_add_token":
-                acc_id_str = act.get("account_id", "")
-                cleaned = clean_secret(text)
-                if not cleaned:
-                    pending[uid] = act
-                    await message.reply("Пусто.")
-                    return
-                acc = add_cf_account(
-                    name=f"CF {len((STATE.get('ai_assistant') or {}).get('cf_accounts') or []) + 1}",
-                    account_id=acc_id_str,
-                    api_token=cleaned)
-                await message.reply(f"✅ Добавлен {acc['name']}. Проверяю…")
-                ok, msg = await verify_cf_account(acc)
-                await message.reply(msg, reply_markup=cf_accounts_kb())
-
-            elif action == "ai_rule_add":
-                if not text:
-                    pending[uid] = act
-                    return
-                ai = STATE.setdefault("ai_assistant", _default_ai())
-                rules = ai.setdefault("rules", [])
-                rules.append(text)
-                save_json(STATE_FILE, STATE)
-                await message.reply(f"✅ Правило #{len(rules)}.",
-                                    reply_markup=ai_train_kb())
-
-            elif action == "ai_scheme_edit":
-                if not text or len(text) < 10:
-                    pending[uid] = act
-                    await message.reply("Мало текста. Ещё раз.")
-                    return
-                ai = STATE.setdefault("ai_assistant", _default_ai())
-                ai["dialog_scheme"] = text[:8000]
-                save_json(STATE_FILE, STATE)
-                await message.reply(f"✅ Схема сохранена ({len(text)} симв.).",
-                                    reply_markup=ai_scheme_kb())
-
-            elif action == "ai_training_edit":
-                if not text or len(text) < 10:
-                    pending[uid] = act
-                    await message.reply("Мало текста. Ещё раз.")
-                    return
-                ai = STATE.setdefault("ai_assistant", _default_ai())
-                existing = ai.get("training_examples") or ""
-                combined = (existing + "\n\n" + text) if len(existing) > 100 else text
-                ai["training_examples"] = combined[:10000]
-                save_json(STATE_FILE, STATE)
-                await message.reply(f"✅ Примеры сохранены ({len(combined)} симв.).",
-                                    reply_markup=ai_training_kb())
-
-            elif action == "ar_first":
-                STATE.setdefault("autoreply", _default_autoreply())["template_first"] = text
-                save_json(STATE_FILE, STATE)
-                await message.reply("✅ Сохранено.", reply_markup=autoreply_menu_kb())
-            elif action == "ar_known":
-                STATE.setdefault("autoreply", _default_autoreply())["template_known"] = text
-                save_json(STATE_FILE, STATE)
-                await message.reply("✅ Сохранено.", reply_markup=autoreply_menu_kb())
-            elif action == "ar_inactive":
-                try:
-                    v = int(text)
-                    if v < 1: raise ValueError("мин. 1")
-                    STATE["autoreply"]["inactive_minutes"] = v
-                    save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ {v} мин.", reply_markup=autoreply_menu_kb())
-                except Exception as e:
-                    pending[uid] = act
-                    await message.reply(f"❌ {e}")
-            elif action == "ar_cooldown":
-                try:
-                    v = int(text)
-                    if v < 0: raise ValueError("мин. 0")
-                    STATE["autoreply"]["cooldown_minutes"] = v
-                    save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ {v} мин.", reply_markup=autoreply_menu_kb())
-                except Exception as e:
-                    pending[uid] = act
-                    await message.reply(f"❌ {e}")
-
-        except Exception as e:
-            log.exception("on_admin_input")
-            await message.reply(f"❌ {e}")
 
 
 # ---------------------------------------------------------------------------
