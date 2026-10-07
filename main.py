@@ -104,7 +104,6 @@ SUSPICIOUS_PATTERNS = [
     "assistant", "ai system", "act as",
 ]
 
-# Словарик для замены английских косяков
 ENGLISH_FIXES = {
     r'\bprawfier\b': 'провайдер',
     r'\bprowfier\b': 'провайдер',
@@ -201,15 +200,11 @@ def process_links_for_markdown(text: str) -> str:
 
 
 def fix_ai_text(text: str) -> str:
-    """Постобработка ответа ИИ: чистка английских косяков."""
     if not text:
         return text
-    # Убираем типичные галлюцинации
     text = re.sub(r'\(?ПЕРЕДАЮ_РУКОВОДИТЕЛЮ[:\s]?\)?', '', text, flags=re.IGNORECASE)
-    # Заменяем английские слова на русские
     for pattern, repl in ENGLISH_FIXES.items():
         text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
-    # Чистим лишние пробелы
     text = re.sub(r'[ \t]+', ' ', text).strip()
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text
@@ -451,16 +446,14 @@ DEFAULT_SYSTEM_PROMPT = """Ты — Алексей (можно Леха), мен
 
 🚨 ЖЁСТКИЕ ПРАВИЛА (нарушать НЕЛЬЗЯ):
 1. Пиши ТОЛЬКО на русском языке. Никаких английских слов, транслита, вставок.
-   Если не знаешь русское слово — опиши его простыми словами.
 2. НИКОГДА не используй служебные фразы типа ПЕРЕДАЮ_РУКОВОДИТЕЛЮ в обычных сообщениях.
-   Эта фраза — только отдельный ответ в особом случае (см. ниже).
 3. Никогда не говори что ты бот, ИИ, ассистент.
 4. Не выдумывай несуществующие слова и не коверкай русские.
 
 СТИЛЬ:
 - Дружелюбно, по делу. Пиши как живой человек, НЕ как робот.
 - Сообщения короткие (1-3 предложения), не длинные полотна.
-- Умеренно эмодзи (🤝, 😊, 👍).
+- Умеренно эмодзи.
 
 СУТЬ:
 - Продаём IP-ключи (прокси). Опт 14$, розница 18$.
@@ -506,7 +499,7 @@ def _default_ai() -> dict:
         "reply_delay_min": 120,
         "reply_delay_max": 240,
         "reactions_enabled": True,
-        "reactions_chance": 20,   # % шанс поставить реакцию на сообщение
+        "reactions_chance": 20,
     }
 
 
@@ -781,7 +774,7 @@ def _was_sent_by_bot(user_id: int, text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Прочитано / реакции / имитация набора
+# Прочитано / реакции / набор
 # ---------------------------------------------------------------------------
 
 async def mark_chat_read(user_id: int) -> None:
@@ -794,7 +787,6 @@ async def mark_chat_read(user_id: int) -> None:
 
 
 async def try_send_reaction(user_id: int, message_id: int):
-    """Иногда ставит случайную реакцию на сообщение клиента."""
     ai = STATE.get("ai_assistant") or {}
     if not ai.get("reactions_enabled", True):
         return
@@ -929,7 +921,6 @@ async def build_system_prompt() -> str:
 
 
 async def ask_ai(user_id: int, user_message: str):
-    """Возвращает (reply, error_reason, escalate_reason)."""
     ai_cfg = STATE.get("ai_assistant") or {}
     if not ai_cfg.get("enabled"):
         return None, "disabled", None
@@ -1007,9 +998,7 @@ async def ask_ai(user_id: int, user_message: str):
                     if not raw_reply or len(raw_reply) < 2:
                         continue
 
-                    # Проверяем эскалацию ГДЕ УГОДНО в ответе
                     if ESCALATION_MARKER in raw_reply.upper():
-                        # Извлекаем причину
                         esc_reason = "не указана"
                         for line in raw_reply.split("\n"):
                             if ESCALATION_MARKER in line.upper():
@@ -1019,7 +1008,6 @@ async def ask_ai(user_id: int, user_message: str):
                         log.info(f"[AI] Эскалация: {esc_reason}")
                         return None, "escalate", esc_reason or "не указана"
 
-                    # Постобработка
                     reply = fix_ai_text(raw_reply)
                     if not reply or len(reply) < 2:
                         continue
@@ -1395,11 +1383,9 @@ def ai_react_text() -> str:
     enabled = ai.get("reactions_enabled", True)
     return (
         "😊 Реакции на сообщения клиента\n\n"
-        "Иногда бот ставит случайную реакцию (👍, 🔥, 🤝 и т.п.) на "
-        "сообщение клиента — это добавляет живости.\n\n"
+        "Иногда бот ставит случайную реакцию на сообщение клиента.\n\n"
         f"• Статус: {'🟢 вкл' if enabled else '🔴 выкл'}\n"
         f"• Шанс: {ai.get('reactions_chance', 20)}%\n\n"
-        "Рекомендую 10–30%. На 100% будет выглядеть подозрительно.\n"
         f"Список эмодзи: {' '.join(REACTION_EMOJIS)}"
     )
 
@@ -1820,7 +1806,6 @@ def register_user_handlers(client: Client) -> None:
             text_raw = (message.text or message.caption or "").strip()
             test_mode = bool(ai.get("test_mode"))
 
-            # /reset
             if is_test_client(user.id) and text_raw.lower() == "/reset":
                 cancel_pending_reply(user.id)
                 saved = await save_session_to_examples(user.id)
@@ -1835,7 +1820,6 @@ def register_user_handlers(client: Client) -> None:
                 log.info(f"[RESET] @mikureza: {saved} пар")
                 return
 
-            # Обучение
             if test_mode and is_test_client(user.id) and text_raw:
                 if text_raw.startswith("!"):
                     rule_text = text_raw[1:].strip()
@@ -1866,7 +1850,6 @@ def register_user_handlers(client: Client) -> None:
                                 "потом ответ ИИ, потом ?правку.")
                         return
 
-            # Защита от инъекций
             elif not is_test_client(user.id) and text_raw and is_suspicious(text_raw):
                 log.warning(f"[SECURITY] {user.id}: {text_raw[:150]}")
                 cancel_pending_reply(user.id)
@@ -1888,7 +1871,6 @@ def register_user_handlers(client: Client) -> None:
                     pass
                 return
 
-            # Голосовые
             if message.voice or message.video_note or message.audio:
                 cancel_pending_reply(user.id)
                 try:
@@ -1906,7 +1888,6 @@ def register_user_handlers(client: Client) -> None:
 
             await db_add_message(user.id, "user", text)
 
-            # Реакции на сообщение клиента (не для тестового)
             if not is_test_client(user.id):
                 asyncio.create_task(try_send_reaction(user.id, message.id))
 
@@ -2171,7 +2152,6 @@ def register_handlers(bot: Client) -> None:
                     f"➖ Осталось {len(STATE['groups'])}.",
                     reply_markup=groups_kb() if STATE["groups"] else main_menu_kb())
 
-            # ИИ
             elif data == "ai_menu":
                 await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
             elif data == "ai_toggle":
@@ -2202,7 +2182,6 @@ def register_handlers(bot: Client) -> None:
                 pending[uid] = {"action": "ai_typing_cps"}
                 await cb.message.edit_text("Скорость набора (симв/сек). Пример: 12\n/cancel")
 
-            # Реакции
             elif data == "ai_react_menu":
                 await cb.message.edit_text(ai_react_text(), reply_markup=ai_react_kb())
             elif data == "ai_react_toggle":
@@ -2217,7 +2196,6 @@ def register_handlers(bot: Client) -> None:
                     f"{(STATE.get('ai_assistant') or {}).get('reactions_chance', 20)}\n"
                     f"Рекомендую 10–30.\n/cancel")
 
-            # Задержка
             elif data == "ai_delay_menu":
                 await cb.message.edit_text(ai_delay_text(), reply_markup=ai_delay_kb())
             elif data == "ai_delay_toggle":
@@ -2232,7 +2210,6 @@ def register_handlers(bot: Client) -> None:
                 pending[uid] = {"action": "ai_delay_max"}
                 await cb.message.edit_text("Макс. задержка ответа в сек. Пример: 240\n/cancel")
 
-            # Cloudflare
             elif data == "cf_menu":
                 await cb.message.edit_text(cf_accounts_text(), reply_markup=cf_accounts_kb())
             elif data == "cf_refresh":
@@ -2323,7 +2300,6 @@ def register_handlers(bot: Client) -> None:
                 await cb.answer(f"▶️ {target} возобновлён.")
                 await cb.message.edit_text(ai_menu_text(), reply_markup=ai_menu_kb())
 
-            # Обучение
             elif data == "ai_train":
                 global await_count_cache
                 await_count_cache = await db_count_examples()
@@ -2422,7 +2398,6 @@ def register_handlers(bot: Client) -> None:
                 await cb.answer("🧹 Очищено.", show_alert=True)
                 await cb.message.edit_text(ai_train_text(), reply_markup=ai_train_kb())
 
-            # Автоответчик
             elif data == "ar_menu":
                 await cb.message.edit_text(autoreply_menu_text(), reply_markup=autoreply_menu_kb())
             elif data == "ar_toggle":
@@ -2449,7 +2424,6 @@ def register_handlers(bot: Client) -> None:
                 save_json(STATE_FILE, STATE)
                 await cb.message.edit_text("♻️ Сброшено.", reply_markup=autoreply_menu_kb())
 
-            # Статус
             elif data == "status":
                 s = STATE["stats"]
                 ai = STATE.get("ai_assistant") or {}
@@ -2703,7 +2677,6 @@ def register_handlers(bot: Client) -> None:
                     pending[uid] = {"action": "ai_typing_cps"}
                     await message.reply(f"❌ {e}")
 
-            # Реакции
             elif action == "ai_react_chance":
                 try:
                     v = int(text)
@@ -2737,7 +2710,6 @@ def register_handlers(bot: Client) -> None:
                     pending[uid] = {"action": "ai_delay_max"}
                     await message.reply(f"❌ {e}")
 
-            # Cloudflare — 2 шага
             elif action == "cf_add_id":
                 cleaned = clean_secret(text)
                 if not cleaned:
