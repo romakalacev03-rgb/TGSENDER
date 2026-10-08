@@ -30,10 +30,7 @@ from pyrogram.errors import (
     ChatWriteForbidden, ChatAdminRequired, UserBannedInChannel, UserNotParticipant,
     PeerIdInvalid, UserIsBlocked, ChannelPrivate, ChatForbidden,
     MessageTooLong, MediaCaptionTooLong,
-    ChatSendPlainForbidden, ChatSendMediaForbidden,
-    ChatSendPhotosForbidden, ChatSendVideosForbidden, ChatSendStickersForbidden,
-    ChatSendGifsForbidden, ChatSendAudiosForbidden, ChatSendDocsForbidden,
-    ChatSendPollForbidden, ChatSendInlineForbidden,
+    ChatSendMediaForbidden,
     SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, PasswordHashInvalid,
     UserAlreadyParticipant, UsernameInvalid, UsernameNotOccupied,
     InviteHashExpired, InviteHashInvalid, ChatIdInvalid,
@@ -106,9 +103,7 @@ MAIN_HANDLERS_REGISTERED = set()
 CAPTCHA_HANDLERS_REGISTERED = set()
 REACTION_HANDLERS_REGISTERED = set()
 
-# acc_id -> {chat_id: iso_timestamp}
 RECENT_JOINS: dict = {}
-# uid -> {acc_id: [results]}
 SEARCH_CACHE: dict = {}
 
 DEVICE_PARAMS = {
@@ -138,7 +133,7 @@ def clean_secret(s) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Классификация ошибок
+# Классификация ошибок (ИСПРАВЛЕНО)
 # ---------------------------------------------------------------------------
 
 def classify_error(e: Exception) -> str:
@@ -166,26 +161,8 @@ def classify_error(e: Exception) -> str:
         return "Текст слишком длинный"
     if isinstance(e, MediaCaptionTooLong):
         return "Подпись слишком длинная"
-    if isinstance(e, ChatSendPlainForbidden):
-        return "Запрещена отправка текста"
     if isinstance(e, ChatSendMediaForbidden):
         return "Запрещена отправка медиа"
-    if isinstance(e, ChatSendPhotosForbidden):
-        return "Запрещены фото"
-    if isinstance(e, ChatSendVideosForbidden):
-        return "Запрещены видео"
-    if isinstance(e, ChatSendStickersForbidden):
-        return "Запрещены стикеры"
-    if isinstance(e, ChatSendGifsForbidden):
-        return "Запрещены GIF"
-    if isinstance(e, ChatSendAudiosForbidden):
-        return "Запрещены аудио"
-    if isinstance(e, ChatSendDocsForbidden):
-        return "Запрещены документы"
-    if isinstance(e, ChatSendPollForbidden):
-        return "Запрещены опросы"
-    if isinstance(e, ChatSendInlineForbidden):
-        return "Запрещён inline"
     return f"{type(e).__name__}: {str(e)[:80]}"
 
 
@@ -298,8 +275,8 @@ def _new_account(name: str, session_name: str) -> dict:
         "groups": [], "running": False,
         "interval": 1800, "delay_min": 5, "delay_max": 15,
         "stats": {"sent": 0, "errors": 0, "rounds": 0, "last_round": None, "next_round": None},
-        "error_stats": {},          # {"Запрещено писать в группе": 12, ...}
-        "failed_groups": {},        # {gid: {"title":..,"error":..,"count":N,"last":ts}}
+        "error_stats": {},
+        "failed_groups": {},
         "subscribe_queue": [], "subscribe_status": "idle",
         "subscribe_delay_min": 40, "subscribe_delay_max": 120,
         "subscribe_stats": {"subscribed": 0, "skipped": 0, "errors": 0, "started_at": None},
@@ -308,7 +285,7 @@ def _new_account(name: str, session_name: str) -> dict:
         "folder_index": 0, "folder_size": 100,
         "group_reactions_enabled": True, "group_reactions_chance": 5,
         "captcha_enabled": True,
-        "auto_drop_dead": False,   # автоудаление битых групп
+        "auto_drop_dead": False,
     }
 
 
@@ -601,7 +578,6 @@ async def try_pass_captcha(client: Client, message, acc_id: str) -> bool:
     clicked = False
     joined_any = False
 
-    # 1) URL-кнопки (обязательные подписки)
     for row in kb:
         for btn in row:
             if getattr(btn, "url", None):
@@ -609,7 +585,6 @@ async def try_pass_captcha(client: Client, message, acc_id: str) -> bool:
                 if ok:
                     joined_any = True
 
-    # 2) callback-кнопки ("Я не бот" и т.п.)
     for row in kb:
         for btn in row:
             cb_data = getattr(btn, "callback_data", None)
@@ -629,7 +604,6 @@ async def try_pass_captcha(client: Client, message, acc_id: str) -> bool:
             except Exception as e:
                 log.debug(f"[{acc_id}] captcha cb error: {e}")
 
-    # Если подписались, но не нажали — пробуем ещё раз через 4 сек (кнопки могут появиться)
     if joined_any and not clicked:
         try:
             await asyncio.sleep(4)
@@ -749,7 +723,6 @@ async def search_public_groups(client: Client, query: str, limit: int = 50) -> l
     for chat in result.chats:
         try:
             if isinstance(chat, RawChannel):
-                # только супергруппы (megagroup=True, broadcast=False)
                 if getattr(chat, "broadcast", False):
                     continue
                 if not getattr(chat, "megagroup", False):
@@ -769,7 +742,6 @@ async def search_public_groups(client: Client, query: str, limit: int = 50) -> l
                     "type": "supergroup",
                 })
             elif isinstance(chat, RawChat):
-                # классическая группа
                 username = getattr(chat, "username", None)
                 if not username:
                     continue
@@ -795,7 +767,6 @@ async def search_public_groups(client: Client, query: str, limit: int = 50) -> l
 # ---------------------------------------------------------------------------
 
 async def distribute_to_folders(acc_id: str) -> tuple:
-    """Распределяет группы аккаунта в папки Telegram по folder_size штук."""
     acc = get_account(acc_id)
     c = user_clients.get(acc_id)
     if not acc or not c:
@@ -807,7 +778,6 @@ async def distribute_to_folders(acc_id: str) -> tuple:
     folder_size = max(10, int(acc.get("folder_size", 100)))
     folder_prefix = f"AP·{acc.get('name', 'acc')[:14]}"
 
-    # resolve peers
     input_peers = []
     resolve_failed = 0
     for g in groups:
@@ -818,7 +788,6 @@ async def distribute_to_folders(acc_id: str) -> tuple:
             resolve_failed += 1
         await asyncio.sleep(0.1)
 
-    # существующие папки
     existing_titles = {}
     try:
         res = await c.invoke(GetDialogFilters())
@@ -839,7 +808,6 @@ async def distribute_to_folders(acc_id: str) -> tuple:
         title = f"{folder_prefix} #{i}"
         folder_id = existing_titles.get(title)
         if folder_id is None:
-            # берём свободный id (2..255, но на практике до 10-20 папок)
             used = set(existing_titles.values())
             folder_id = 2
             while folder_id in used and folder_id < 255:
@@ -1078,7 +1046,6 @@ async def mailing_loop_for_account(acc_id: str):
                 await send_post_for_account(acc_id, gid)
                 sent += 1
                 acc["stats"]["sent"] = acc["stats"].get("sent", 0) + 1
-                # при успехе — уменьшаем счётчик ошибок
                 fg = acc.get("failed_groups") or {}
                 if str(gid) in fg:
                     fg.pop(str(gid), None)
@@ -1095,13 +1062,11 @@ async def mailing_loop_for_account(acc_id: str):
                 errors += 1
                 err_text = classify_error(e)
                 _bump_error(acc, gid, title, err_text)
-                # авто-удаление мёртвых групп
                 if drop_dead and err_text in (
                         "Запрещено писать в группе", "Забанен в группе",
                         "Не участник группы", "ID группы устарел",
                         "Приватная / уже вышел", "Чат запрещён для записи"):
                     to_remove.append(gid)
-            # задержка
             try:
                 lo = int(acc.get("delay_min", 5))
                 hi = int(acc.get("delay_max", 15))
@@ -1126,7 +1091,6 @@ async def mailing_loop_for_account(acc_id: str):
             datetime.now() + timedelta(seconds=interval)).isoformat(timespec="seconds")
         save_json(STATE_FILE, STATE)
 
-        # отчёт по кругу с разбором ошибок
         try:
             err_brief = ""
             es = acc.get("error_stats") or {}
