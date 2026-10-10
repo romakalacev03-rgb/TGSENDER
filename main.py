@@ -10,6 +10,7 @@ import os
 import random
 import re
 import logging
+import base64
 from datetime import datetime, timedelta
 
 import aiosqlite
@@ -22,6 +23,7 @@ from pyrogram.errors import (
     SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, PasswordHashInvalid,
     UserAlreadyParticipant, UsernameInvalid, UsernameNotOccupied,
     InviteHashExpired, InviteHashInvalid, ChatIdInvalid,
+    AuthKeyUnregistered, AuthKeyDuplicated, UserDeactivated, SessionRevoked,
 )
 
 
@@ -65,6 +67,7 @@ user_clients: dict = {}       # {acc_id: Client}
 mailing_tasks: dict = {}      # {acc_id: asyncio.Task}
 subscribe_tasks: dict = {}    # {acc_id: asyncio.Task}
 ME_IDS: dict = {}             # {acc_id: user_id}
+client_locks: dict = {}       # {acc_id: asyncio.Lock}
 
 authed: set = set()
 pending: dict = {}
@@ -75,6 +78,24 @@ DEVICE_PARAMS = {
     "system_version": "Android 13",
     "lang_code": "ru",
 }
+
+
+def validate_session_string(s: str) -> tuple[bool, str]:
+    """Проверяет, похожа ли строка на валидную session_string Pyrogram."""
+    if not s:
+        return False, "пустая"
+    if len(s) < 100:
+        return False, f"слишком короткая ({len(s)})"
+    # Pyrogram session strings обычно base64url-ish
+    try:
+        # Проверяем, что это base64
+        padded = s + "=" * (-len(s) % 4)
+        decoded = base64.urlsafe_b64decode(padded)
+        if len(decoded) < 200:
+            return False, f"декодированная длина мала ({len(decoded)})"
+    except Exception as e:
+        return False, f"не base64: {e}"
+    return True, "ok"
 
 
 def make_client(session_name_or_string: str) -> Client:
@@ -96,8 +117,6 @@ def make_client(session_name_or_string: str) -> Client:
             lang_code=DEVICE_PARAMS["lang_code"],
         )
 
-    if len(s) > 200:
-        s = f"userbot_{int(datetime.now().timestamp())}"
     log.info(f"[CLIENT] Файл: {s}")
     session_path = os.path.join(DATA_DIR, s)
     return Client(
@@ -203,7 +222,6 @@ def load_state() -> dict:
     raw = load_json(STATE_FILE, {}) or {}
     st = default_state()
 
-    # Миграция со старой схемы
     if not raw.get("accounts"):
         has_old = any(k in raw for k in ("text", "groups", "interval", "delay_min"))
         if has_old:
@@ -231,7 +249,6 @@ def load_state() -> dict:
     if not st.get("main_account_id") and st.get("accounts"):
         st["main_account_id"] = st["accounts"][0]["id"]
 
-    # Доп. поля на всякий случай
     for acc in st.get("accounts") or []:
         acc.setdefault("session_string", "")
         acc.setdefault("subscribe_queue", [])
@@ -573,7 +590,8 @@ def start_subscribe(acc_id: str):
     if t and not t.done():
         return
     subscribe_tasks[acc_id] = asyncio.create_task(subscribe_loop(acc_id))
-    
+
+
 # ---------------------------------------------------------------------------
 # Логин / запуск клиентов
 # ---------------------------------------------------------------------------
@@ -584,16 +602,24 @@ async def start_userbot_clients():
         acc_id = acc["id"]
         session_str = acc.get("session_string")
         if session_str:
-            try:
-                c = make_client(session_str)
-                user_clients[acc_id] = c
-                continue
-            except Exception as e:
-                log.warning(f"session_string {acc_id}: {e}")
+            ok, reason = validate_session_string(session_str)
+            if ok:
+                try:
+                    c = make_client(session_str)
+                    user_clients[acc_id] = c
+                    client_locks[acc_id] = asyncio.Lock()
+                    continue
+                except Exception as e:
+                    log.warning(f"session_string {acc_id}: {e}")
+            else:
+                log.warning(f"[{acc.get('name')}] session_string невалидна: {reason}")
+                acc["session_string"] = ""
+                save_json(STATE_FILE, STATE)
         session_name = acc.get("session_name") or f"userbot_{acc_id}"
         try:
             c = make_client(session_name)
             user_clients[acc_id] = c
+            client_locks[acc_id] = asyncio.Lock()
         except Exception as e:
             log.warning(f"client {acc_id}: {e}")
 
@@ -605,8 +631,9 @@ async def try_start_existing_clients():
         c = user_clients.get(acc_id)
         if not c:
             continue
+        # Проверяем, не «мёртвая» ли сессия — если auth key not found, удаляем
         try:
-            await c.start()
+            await asyncio.wait_for(c.start(), timeout=30)
             me = await c.get_me()
             if me:
                 ME_IDS[acc_id] = me.id
@@ -617,6 +644,24 @@ async def try_start_existing_clients():
                     start_mailing_for_account(acc_id)
                 if acc.get("subscribe_status") == "running":
                     start_subscribe(acc_id)
+        except asyncio.TimeoutError:
+            log.warning(f"[{acc.get('name')}] таймаут подключения — сессия удалена")
+            acc["session_string"] = ""
+            save_json(STATE_FILE, STATE)
+            try:
+                await c.stop()
+            except Exception:
+                pass
+            user_clients.pop(acc_id, None)
+        except (AuthKeyUnregistered, AuthKeyDuplicated, UserDeactivated, SessionRevoked) as e:
+            log.warning(f"[{acc.get('name')}] сессия недействительна: {e}")
+            acc["session_string"] = ""
+            save_json(STATE_FILE, STATE)
+            try:
+                await c.stop()
+            except Exception:
+                pass
+            user_clients.pop(acc_id, None)
         except Exception as e:
             log.warning(f"[{acc.get('name')}] не залогинен: {e}")
             try:
@@ -843,7 +888,8 @@ def stats_menu_text() -> str:
         lines.append(f"📢 {acc.get('name', '?')}: 🟢{s.get('sent', 0)} | ❌{s.get('errors', 0)}")
     lines.append(f"\nИтого: 🟢{total_sent} | ❌{total_err}")
     return "\n".join(lines)
-    
+
+
 # ---------------------------------------------------------------------------
 # Обработчики бота
 # ---------------------------------------------------------------------------
@@ -1170,18 +1216,25 @@ def register_handlers(bot: Client) -> None:
                 raw = (text or "").strip()
                 cleaned = re.sub(r"\s+", "", raw).strip('"').strip("'").strip("`")
                 log.info(f"[ADDSESSION] raw_len={len(raw)} clean_len={len(cleaned)}")
-                if not cleaned or len(cleaned) < 100:
+                if not cleaned:
+                    await message.reply("❌ Пустая строка.")
+                    return
+                ok, reason = validate_session_string(cleaned)
+                if not ok:
                     await message.reply(
-                        f"❌ Слишком короткая: **{len(cleaned)}** символов.",
+                        f"❌ Строка не похожа на валидную session_string: **{reason}**\n"
+                        f"Длина: {len(cleaned)}",
                         parse_mode=enums.ParseMode.MARKDOWN)
                     return
                 await message.reply("⏳ Подключаюсь к Telegram…")
                 try:
                     new_c = make_client(cleaned)
-                    await new_c.start()
+                    # Пытаемся подключиться с таймаутом
+                    await asyncio.wait_for(new_c.start(), timeout=30)
                     me = await new_c.get_me()
                     if not me:
-                        await message.reply("❌ Не удалось получить данные.")
+                        await new_c.stop()
+                        await message.reply("❌ Не удалось получить данные пользователя.")
                         return
                     name = f"{me.first_name}" + (f" @{me.username}" if me.username else "")
                     sname = f"string_session_{int(datetime.now().timestamp())}"
@@ -1195,6 +1248,12 @@ def register_handlers(bot: Client) -> None:
                     await message.reply(
                         f"✅ Аккаунт добавлен: **{name}** (id={me.id}).",
                         reply_markup=main_menu_kb())
+                except asyncio.TimeoutError:
+                    await message.reply("❌ Таймаут подключения. Проверь строку сессии.")
+                except (AuthKeyUnregistered, AuthKeyDuplicated, UserDeactivated, SessionRevoked) as e:
+                    await message.reply(f"❌ Сессия недействительна: `{e}`\n\n"
+                                        f"Получи новую session_string.",
+                                        parse_mode=enums.ParseMode.MARKDOWN)
                 except Exception as e:
                     log.exception(f"[ADDSESSION] {e}")
                     await message.reply(f"❌ Ошибка: `{e}`",
