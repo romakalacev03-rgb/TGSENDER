@@ -119,19 +119,32 @@ DEVICE_PARAMS = {
 
 
 def make_client(session_name_or_string: str) -> Client:
-    """Если передана длинная строка (>100 симв, без пробелов) — используем как session_string."""
-    if session_name_or_string and len(session_name_or_string) > 100 and " " not in session_name_or_string:
+    """Авто-определение: session_string или имя файла."""
+    raw = session_name_or_string or ""
+    # Чистим от любых пробелов/переносов/кавычек
+    s = re.sub(r"\s+", "", raw).strip('"').strip("'").strip("`")
+    log.info(f"[CLIENT] raw_len={len(raw)} clean_len={len(s)} head={s[:30]}")
+
+    # session_string: длинная строка
+    if len(s) > 100:
+        log.info("[CLIENT] ✅ Использую session_string")
         return Client(
             name=":memory:",
             api_id=CFG["api_id"],
             api_hash=CFG["api_hash"],
-            session_string=session_name_or_string,
+            session_string=s,
             app_version=DEVICE_PARAMS["app_version"],
             device_model=DEVICE_PARAMS["device_model"],
             system_version=DEVICE_PARAMS["system_version"],
             lang_code=DEVICE_PARAMS["lang_code"],
         )
-    session_path = os.path.join(DATA_DIR, session_name_or_string)
+
+    # Файл
+    if len(s) > 200:
+        # Защита: имя файла не должно быть слишком длинным
+        s = f"userbot_{int(datetime.now().timestamp())}"
+    log.info(f"[CLIENT] Использую файл: {s}")
+    session_path = os.path.join(DATA_DIR, s)
     return Client(
         name=session_path,
         api_id=CFG["api_id"],
