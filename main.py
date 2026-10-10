@@ -3147,7 +3147,7 @@ def register_handlers(bot: Client) -> None:
         action = act.get("action")
         text = (message.text or "").strip()
         try:
-                     if action == "add_session_string":
+                        if action == "add_session_string":
                 raw = (text or "").strip()
                 cleaned = re.sub(r"\s+", "", raw).strip('"').strip("'").strip("`")
                 log.info(f"[ADDSESSION] raw_len={len(raw)} clean_len={len(cleaned)} head={cleaned[:30]}")
@@ -3191,7 +3191,6 @@ def register_handlers(bot: Client) -> None:
                     await message.reply(f"❌ Ошибка подключения: `{e}`",
                                          parse_mode=enums.ParseMode.MARKDOWN)
                 return
-
             if action == "acc_add_phone":
                 phone = text
                 if not phone.startswith("+") or len(phone) < 8:
