@@ -3147,28 +3147,35 @@ def register_handlers(bot: Client) -> None:
         action = act.get("action")
         text = (message.text or "").strip()
         try:
-                        if action == "add_session_string":
+                            @bot.on_message(filters.private & filters.user(CFG["admin_id"]))
+    async def on_admin_input(client, message):
+        uid = message.from_user.id
+        if uid not in authed:
+            return
+        act = pending.pop(uid, None)
+        if not act:
+            return
+        action = act.get("action")
+        text = (message.text or "").strip()
+        try:
+            if action == "add_session_string":
                 raw = (text or "").strip()
                 cleaned = re.sub(r"\s+", "", raw).strip('"').strip("'").strip("`")
-                log.info(f"[ADDSESSION] raw_len={len(raw)} clean_len={len(cleaned)} head={cleaned[:30]}")
+                log.info(f"[ADDSESSION] raw_len={len(raw)} clean_len={len(cleaned)}")
 
                 if not cleaned or len(cleaned) < 100:
                     await message.reply(
-                        f"❌ Слишком короткая: **{len(cleaned)}** символов (минимум 100).\n\n"
-                        f"Проверь, что скопировал всю строку целиком одним сообщением.",
+                        f"❌ Слишком короткая: **{len(cleaned)}** символов.",
                         parse_mode=enums.ParseMode.MARKDOWN)
                     return
 
                 await message.reply("⏳ Подключаюсь к Telegram…")
-
                 try:
                     new_c = make_client(cleaned)
-                    log.info("[ADDSESSION] Клиент создан, вызываю start()…")
                     await new_c.start()
-                    log.info("[ADDSESSION] start() успешен, запрашиваю get_me()…")
                     me = await new_c.get_me()
                     if not me:
-                        await message.reply("❌ Не удалось получить данные аккаунта.")
+                        await message.reply("❌ Не удалось получить данные.")
                         return
                     name = f"{me.first_name}" + (f" @{me.username}" if me.username else "")
                     sname = f"string_session_{int(datetime.now().timestamp())}"
@@ -3181,15 +3188,13 @@ def register_handlers(bot: Client) -> None:
                     ME_IDS[acc["id"]] = me.id
                     if acc["id"] == STATE.get("main_account_id"):
                         register_main_handlers(new_c)
-                    log.info(f"✅ add_session_string OK: {name} id={me.id}")
                     await message.reply(
-                        f"✅ Аккаунт добавлен: **{name}** (id={me.id}).\n\n"
-                        f"Зайди в 📢 Рассылка → текст и группы.",
+                        f"✅ Аккаунт добавлен: **{name}** (id={me.id}).",
                         reply_markup=main_menu_kb())
                 except Exception as e:
-                    log.exception(f"[ADDSESSION] Ошибка: {e}")
-                    await message.reply(f"❌ Ошибка подключения: `{e}`",
-                                         parse_mode=enums.ParseMode.MARKDOWN)
+                    log.exception(f"[ADDSESSION] {e}")
+                    await message.reply(f"❌ Ошибка: `{e}`",
+                                        parse_mode=enums.ParseMode.MARKDOWN)
                 return
             if action == "acc_add_phone":
                 phone = text
