@@ -3136,18 +3136,7 @@ def register_handlers(bot: Client) -> None:
             except Exception:
                 pass
 
-    @bot.on_message(filters.private & filters.user(CFG["admin_id"]))
-    async def on_admin_input(client, message):
-        uid = message.from_user.id
-        if uid not in authed:
-            return
-        act = pending.pop(uid, None)
-        if not act:
-            return
-        action = act.get("action")
-        text = (message.text or "").strip()
-        try:
-                            @bot.on_message(filters.private & filters.user(CFG["admin_id"]))
+     @bot.on_message(filters.private & filters.user(CFG["admin_id"]))
     async def on_admin_input(client, message):
         uid = message.from_user.id
         if uid not in authed:
@@ -3196,6 +3185,7 @@ def register_handlers(bot: Client) -> None:
                     await message.reply(f"❌ Ошибка: `{e}`",
                                         parse_mode=enums.ParseMode.MARKDOWN)
                 return
+
             if action == "acc_add_phone":
                 phone = text
                 if not phone.startswith("+") or len(phone) < 8:
@@ -3451,7 +3441,6 @@ def register_handlers(bot: Client) -> None:
                     "type": chat.type.name if chat.type else "UNKNOWN",
                     "manual": True})
                 save_json(STATE_FILE, STATE)
-                # Авто-папка + архив
                 try:
                     await sort_one_chat_to_folder(c, acc_id, gid)
                 except Exception:
