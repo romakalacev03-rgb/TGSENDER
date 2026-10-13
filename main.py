@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Мульти-аккаунт автопостер + рассылка + массовая подписка.
-Отправка через forward_messages (реальная пересылка).
+Отправка через copy_message — премиум-эмодзи сохраняются,
+плашки «Переслано» в группах НЕТ.
+Никаких всплывающих alert'ов и лишних ответов бота.
 """
 
 import asyncio
@@ -28,7 +30,7 @@ from pyrogram.errors import (
 
 
 # ===========================================================================
-#  СЕССИЯ ПО УМОЛЧАНИЮ
+#  СЕССИЯ ПО УМОЛЧАНИЮ (вставь свою новую из Colab)
 # ===========================================================================
 DEFAULT_SESSION_STRING = (
     "ВСТАВЬ_СЮДА_СВОЮ_НОВУЮ_СТРОКУ_ИЗ_COLAB"
@@ -358,16 +360,10 @@ def parse_chat_ref(text: str):
 
 
 # ---------------------------------------------------------------------------
-# Рассылка — ФОРВАРД + ТАЙПИНГ
+# Отправка в группы — copy_message + тайпинг
 # ---------------------------------------------------------------------------
 
 async def send_post_for_account(acc_id: str, chat_id: int) -> None:
-    """
-    Отправляет пост в чат:
-      * 2 сек «печатает…»
-      * forward_messages из источника (реальная пересылка)
-      * fallback: если источника нет — текст/медиа из аккаунта
-    """
     c = user_clients.get(acc_id)
     if not c:
         raise RuntimeError("Клиент не подключён.")
@@ -386,15 +382,14 @@ async def send_post_for_account(acc_id: str, chat_id: int) -> None:
     src_msg = acc.get("source_message_id")
 
     if src_chat and src_msg:
-        # РЕАЛЬНАЯ ПЕРЕСЫЛКА
-        await c.forward_messages(
+        # КОПИРОВАНИЕ — без плашки «Переслано», премиум-эмодзи сохраняются
+        await c.copy_message(
             chat_id=chat_id,
             from_chat_id=int(src_chat),
-            message_ids=int(src_msg),
+            message_id=int(src_msg),
         )
         return
 
-    # Fallback — текст/медиа
     text = acc.get("text")
     media_path = acc.get("media_path")
     media_type = acc.get("media_type")
@@ -771,7 +766,7 @@ def account_kb(acc_id: str) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("⏸ Стоп рассылку" if running else "🚀 Запустить рассылку",
                               callback_data=f"acc_toggle:{acc_id}")],
-        [InlineKeyboardButton("📎 Источник (пересылка)",
+        [InlineKeyboardButton("📎 Источник (премиум)",
                               callback_data=f"acc_source:{acc_id}")],
         [InlineKeyboardButton("📝 Текст", callback_data=f"acc_text:{acc_id}")],
         [InlineKeyboardButton("🖼 Медиа", callback_data=f"acc_media:{acc_id}")],
@@ -827,7 +822,7 @@ def account_text(acc_id: str) -> str:
         f"• Интервал: {acc.get('interval', 1800)}с\n"
         f"• Задержка: {acc.get('delay_min', 5)}–{acc.get('delay_max', 15)}с\n"
         f"• Печатает: {acc.get('typing_seconds', 2)}с\n"
-        f"📎 Источник (forward): {src_line}\n"
+        f"📎 Источник (copy): {src_line}\n"
         f"📊 Sent: {s.get('sent', 0)} | Err: {s.get('errors', 0)} | Кругов: {s.get('rounds', 0)}\n"
         f"📥 Подписка: {sub_status} | ✅{sub_stats.get('subscribed', 0)}\n\n"
         f"📝 Текст (fallback):\n{preview}"
@@ -936,7 +931,7 @@ def stats_menu_text() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Обработчики бота
+# ХЕНДЛЕРЫ БОТА
 # ---------------------------------------------------------------------------
 
 def register_handlers(bot: Client) -> None:
@@ -944,7 +939,6 @@ def register_handlers(bot: Client) -> None:
     @bot.on_message(filters.command("start") & filters.private)
     async def cmd_start(client, message):
         if message.from_user.id != CFG["admin_id"]:
-            await message.reply("⛔")
             return
         if message.from_user.id not in authed:
             await message.reply("🔒 `/auth <PIN>`", parse_mode=enums.ParseMode.MARKDOWN)
@@ -957,7 +951,6 @@ def register_handlers(bot: Client) -> None:
             return
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) < 2 or parts[1].strip() != str(CFG.get("pin", DEFAULT_PIN)):
-            await message.reply("❌")
             return
         authed.add(message.from_user.id)
         pending.pop(message.from_user.id, None)
@@ -981,25 +974,423 @@ def register_handlers(bot: Client) -> None:
         if message.from_user.id != CFG["admin_id"] or message.from_user.id not in authed:
             return
         pending[message.from_user.id] = {"action": "add_session_string"}
-        await message.reply(
-            "📝 Отправь **строку сессии** одним сообщением.\n\n/cancel",
-            parse_mode=enums.ParseMode.MARKDOWN)
+        await message.reply("📝 Отправь строку сессии одним сообщением.\n/cancel")
 
+    # --- ГЛАВНЫЙ ОБРАБОТЧИК ВВОДА ОТ АДМИНА ---
+    @bot.on_message(filters.private & filters.user(CFG["admin_id"]))
+    async def on_admin_input(client, message):
+        uid = message.from_user.id
+        if uid not in authed:
+            return
+
+        act = pending.get(uid)  # ← НЕ pop, чтобы не терять состояние
+
+        # Если ждём источник (премиум-эмодзи) и пришло пересланное/своё сообщение
+        if act and act.get("action") == "acc_source_forward":
+            acc_id = act.get("acc_id")
+            acc = get_account(acc_id)
+            if not acc:
+                pending.pop(uid, None)
+                return
+            # Пересланное?
+            if message.forward_from_chat:
+                chat_id = message.forward_from_chat.id
+                msg_id = message.forward_from_message_id
+            elif message.forward_from:
+                chat_id = message.forward_from.id
+                msg_id = message.forward_from_message_id or message.id
+            else:
+                # своё сообщение — берём chat.id и message.id
+                chat_id = message.chat.id
+                msg_id = message.id
+            acc["source_chat_id"] = chat_id
+            acc["source_message_id"] = msg_id
+            save_json(STATE_FILE, STATE)
+            pending.pop(uid, None)
+            # молча — реакция вместо ответа
+            try:
+                await message.react(emoji="👍")
+            except Exception:
+                pass
+            return
+
+        if not act:
+            # Нет никакого ожидаемого ввода — молча выходим
+            return
+
+        action = act.get("action")
+        text = (message.text or "").strip()
+        try:
+            if action == "add_session_string":
+                pending.pop(uid, None)
+                raw = (text or "").strip()
+                cleaned = re.sub(r"\s+", "", raw).strip('"').strip("'").strip("`")
+                if not cleaned:
+                    return
+                ok, reason = validate_session_string(cleaned)
+                if not ok:
+                    await message.reply(
+                        f"❌ Строка не похожа на session_string: **{reason}**\n"
+                        f"Длина: {len(cleaned)}",
+                        parse_mode=enums.ParseMode.MARKDOWN)
+                    return
+                await message.reply("⏳ Подключаюсь…")
+                try:
+                    new_c = make_client(cleaned)
+                    await asyncio.wait_for(new_c.start(), timeout=30)
+                    me = await new_c.get_me()
+                    if not me:
+                        await new_c.stop()
+                        await message.reply("❌ Нет данных.")
+                        return
+                    name = f"{me.first_name}" + (f" @{me.username}" if me.username else "")
+                    sname = f"string_session_{int(datetime.now().timestamp())}"
+                    acc = add_account(name, sname)
+                    acc["user_id"] = me.id
+                    acc["username"] = me.username
+                    acc["session_string"] = cleaned
+                    save_json(STATE_FILE, STATE)
+                    user_clients[acc["id"]] = new_c
+                    ME_IDS[acc["id"]] = me.id
+                    await message.reply(f"✅ **{name}** (id={me.id}).",
+                                        reply_markup=main_menu_kb())
+                except (AuthKeyUnregistered, AuthKeyDuplicated, UserDeactivated, SessionRevoked) as e:
+                    await message.reply(f"❌ Сессия недействительна: `{e}`",
+                                        parse_mode=enums.ParseMode.MARKDOWN)
+                except Exception as e:
+                    await message.reply(f"❌ `{e}`", parse_mode=enums.ParseMode.MARKDOWN)
+                return
+
+            if action == "acc_source_manual":
+                pending.pop(uid, None)
+                acc_id = act["acc_id"]
+                acc = get_account(acc_id)
+                if not acc:
+                    return
+                parts = [p.strip() for p in text.split("\n") if p.strip()]
+                if len(parts) < 2:
+                    await message.reply("❌ Нужно 2 строки.")
+                    return
+                try:
+                    chat_id = int(parts[0]); msg_id = int(parts[1])
+                except ValueError:
+                    await message.reply("❌ Только числа.")
+                    return
+                acc["source_chat_id"] = chat_id
+                acc["source_message_id"] = msg_id
+                save_json(STATE_FILE, STATE)
+                try:
+                    await message.react(emoji="👍")
+                except Exception:
+                    pass
+                return
+
+            if action == "acc_add_phone":
+                phone = text
+                if not phone.startswith("+") or len(phone) < 8:
+                    await message.reply("❌ Неверный формат.")
+                    return
+                pending.pop(uid, None)
+                sname = f"userbot_{int(datetime.now().timestamp())}"
+                session_path = os.path.join(DATA_DIR, sname)
+                try:
+                    new_c = make_client(session_path)
+                    await new_c.connect()
+                    try:
+                        sent = await new_c.send_code(phone, force_sms=True)
+                    except TypeError:
+                        sent = await new_c.send_code(phone)
+                except Exception as e:
+                    await message.reply(f"❌ send_code: {e}")
+                    return
+                pending[uid] = {"action": "acc_add_code", "phone": phone,
+                                "hash": sent.phone_code_hash, "session_name": sname, "client": new_c}
+                await message.reply("📩 Код отправлен:")
+
+            elif action == "acc_add_code":
+                pending.pop(uid, None)
+                phone = act["phone"]; hash_ = act["hash"]
+                sname = act["session_name"]; new_c: Client = act["client"]
+                code = text.replace(" ", "")
+                try:
+                    await new_c.sign_in(phone_number=phone,
+                                        phone_code_hash=hash_, phone_code=code)
+                except SessionPasswordNeeded:
+                    pending[uid] = {"action": "acc_add_password", "phone": phone,
+                                    "session_name": sname, "client": new_c}
+                    await message.reply("🔐 Пароль 2FA:")
+                    return
+                except PhoneCodeInvalid:
+                    pending[uid] = act
+                    await message.reply("❌ Неверный код. Ещё раз:")
+                    return
+                except PhoneCodeExpired:
+                    await message.reply("⚠️ Код истёк.")
+                    return
+                except Exception as e:
+                    await message.reply(f"❌ {e}")
+                    return
+                me = await new_c.get_me()
+                name = f"{me.first_name}" + (f" @{me.username}" if me.username else "")
+                acc = add_account(name, sname)
+                acc["user_id"] = me.id
+                acc["username"] = me.username
+                save_json(STATE_FILE, STATE)
+                user_clients[acc["id"]] = new_c
+                ME_IDS[acc["id"]] = me.id
+                await message.reply(f"✅ **{name}**", reply_markup=main_menu_kb())
+
+            elif action == "acc_add_password":
+                pending.pop(uid, None)
+                phone = act["phone"]; sname = act["session_name"]
+                new_c: Client = act["client"]
+                try:
+                    await new_c.check_password(text)
+                except PasswordHashInvalid:
+                    pending[uid] = act
+                    await message.reply("❌ Неверный пароль. Ещё раз:")
+                    return
+                except Exception as e:
+                    await message.reply(f"❌ {e}")
+                    return
+                me = await new_c.get_me()
+                name = f"{me.first_name}" + (f" @{me.username}" if me.username else "")
+                acc = add_account(name, sname)
+                acc["user_id"] = me.id
+                acc["username"] = me.username
+                save_json(STATE_FILE, STATE)
+                user_clients[acc["id"]] = new_c
+                ME_IDS[acc["id"]] = me.id
+                await message.reply(f"✅ **{name}**", reply_markup=main_menu_kb())
+
+            elif action == "acc_sub_load":
+                pending.pop(uid, None)
+                acc_id = act["acc_id"]
+                acc = get_account(acc_id)
+                if not acc:
+                    return
+                raw_text = ""
+                if message.document:
+                    try:
+                        path = await message.download()
+                        with open(path, "r", encoding="utf-8") as f:
+                            raw_text = f.read()
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        await message.reply(f"❌ {e}")
+                        return
+                else:
+                    raw_text = message.text or ""
+                if not raw_text.strip():
+                    await message.reply("Пусто.")
+                    return
+                groups = parse_groups_from_text(raw_text)
+                if not groups:
+                    await message.reply("❌ Не распарсил.")
+                    return
+                existing_q = acc.setdefault("subscribe_queue", [])
+                existing_q_keys = {str(x) for x in existing_q}
+                added = 0
+                for ref in groups:
+                    if str(ref) not in existing_q_keys:
+                        existing_q.append(ref)
+                        existing_q_keys.add(str(ref))
+                        added += 1
+                acc["subscribe_status"] = "idle"
+                save_json(STATE_FILE, STATE)
+                try:
+                    await message.react(emoji="👍")
+                except Exception:
+                    pass
+
+            elif action == "acc_sub_delay":
+                pending.pop(uid, None)
+                acc_id = act["acc_id"]
+                acc = get_account(acc_id)
+                if not acc:
+                    return
+                text_clean = text.replace("-", " ").replace(",", " ")
+                parts = [p for p in text_clean.split() if p.strip()]
+                if len(parts) < 2:
+                    await message.reply("❌ Нужно 2 числа.")
+                    return
+                try:
+                    lo = int(parts[0]); hi = int(parts[1])
+                    if lo < 5: raise ValueError("мин. 5")
+                    if hi < lo: raise ValueError("макс >= мин")
+                    if hi > 1800: raise ValueError("макс 1800")
+                except Exception as e:
+                    await message.reply(f"❌ {e}")
+                    return
+                acc["subscribe_delay_min"] = lo
+                acc["subscribe_delay_max"] = hi
+                save_json(STATE_FILE, STATE)
+                try:
+                    await message.react(emoji="👍")
+                except Exception:
+                    pass
+
+            elif action == "acc_text":
+                pending.pop(uid, None)
+                acc_id = act["acc_id"]
+                acc = get_account(acc_id)
+                if not acc or not text:
+                    return
+                acc["text"] = text
+                acc["media_path"] = None
+                acc["media_type"] = None
+                acc["caption"] = ""
+                save_json(STATE_FILE, STATE)
+                try:
+                    await message.react(emoji="👍")
+                except Exception:
+                    pass
+
+            elif action == "acc_media":
+                pending.pop(uid, None)
+                acc_id = act["acc_id"]
+                acc = get_account(acc_id)
+                if not acc:
+                    return
+                if not (message.photo or message.video):
+                    return
+                if message.photo:
+                    ext = "jpg"; acc["media_type"] = "photo"
+                else:
+                    ext = "mp4"; acc["media_type"] = "video"
+                path = os.path.join(MEDIA_DIR, f"media_{acc_id}.{ext}")
+                await message.download(file_name=path)
+                acc["media_path"] = path
+                acc["caption"] = message.caption or ""
+                acc["text"] = ""
+                save_json(STATE_FILE, STATE)
+                try:
+                    await message.react(emoji="👍")
+                except Exception:
+                    pass
+
+            elif action == "acc_setint":
+                pending.pop(uid, None)
+                acc_id = act["acc_id"]
+                acc = get_account(acc_id)
+                try:
+                    v = int(text)
+                    if v < 60: raise ValueError("мин. 60")
+                    acc["interval"] = v
+                    save_json(STATE_FILE, STATE)
+                    try:
+                        await message.react(emoji="👍")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    await message.reply(f"❌ {e}")
+
+            elif action == "acc_setdmin":
+                pending.pop(uid, None)
+                acc_id = act["acc_id"]
+                acc = get_account(acc_id)
+                try:
+                    v = int(text)
+                    if v < 1: raise ValueError("мин. 1")
+                    acc["delay_min"] = v
+                    if acc["delay_max"] < v:
+                        acc["delay_max"] = v
+                    save_json(STATE_FILE, STATE)
+                    try:
+                        await message.react(emoji="👍")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    await message.reply(f"❌ {e}")
+
+            elif action == "acc_setdmax":
+                pending.pop(uid, None)
+                acc_id = act["acc_id"]
+                acc = get_account(acc_id)
+                try:
+                    v = int(text)
+                    if v < acc["delay_min"]:
+                        raise ValueError(f">= {acc['delay_min']}")
+                    acc["delay_max"] = v
+                    save_json(STATE_FILE, STATE)
+                    try:
+                        await message.react(emoji="👍")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    await message.reply(f"❌ {e}")
+
+            elif action == "acc_settyping":
+                pending.pop(uid, None)
+                acc_id = act["acc_id"]
+                acc = get_account(acc_id)
+                try:
+                    v = int(text)
+                    if v < 0 or v > 60:
+                        raise ValueError("0–60")
+                    acc["typing_seconds"] = v
+                    save_json(STATE_FILE, STATE)
+                    try:
+                        await message.react(emoji="👍")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    await message.reply(f"❌ {e}")
+
+            elif action == "acc_addgrp":
+                pending.pop(uid, None)
+                acc_id = act["acc_id"]
+                acc = get_account(acc_id)
+                c = user_clients.get(acc_id)
+                if not acc or not c:
+                    return
+                ref = parse_chat_ref(text)
+                if ref is None:
+                    return
+                try:
+                    chat = await c.get_chat(ref)
+                except Exception as e:
+                    await message.reply(f"❌ {e}")
+                    return
+                gid = chat.id
+                title = chat.title or str(gid)
+                if any(g["id"] == gid for g in acc["groups"]):
+                    return
+                acc["groups"].append({
+                    "id": gid, "title": title,
+                    "type": chat.type.name if chat.type else "UNKNOWN",
+                    "manual": True})
+                save_json(STATE_FILE, STATE)
+                try:
+                    await message.react(emoji="👍")
+                except Exception:
+                    pass
+
+        except Exception as e:
+            log.exception("on_admin_input")
+            pending.pop(uid, None)
+
+    # --- CALLBACK КНОПКИ ---
     @bot.on_callback_query()
     async def on_cb(client, cb):
         uid = cb.from_user.id
         if uid != CFG["admin_id"]:
-            await cb.answer("⛔", show_alert=True)
+            await cb.answer()
             return
         if uid not in authed:
-            await cb.answer("🔒 /auth <PIN>", show_alert=True)
+            await cb.answer()
             return
         data = cb.data or ""
         try:
+            # Все ответы answer() — БЕЗ show_alert и БЕЗ текста,
+            # чтобы не было всплывающих плашек.
             if data == "menu":
                 await cb.message.edit_text("🎛 Панель:", reply_markup=main_menu_kb())
             elif data == "noop":
-                await cb.answer("—")
+                await cb.answer()
             elif data == "sub_main":
                 await cb.message.edit_text(sub_main_text(), reply_markup=sub_main_kb())
             elif data == "accounts_menu":
@@ -1007,12 +1398,12 @@ def register_handlers(bot: Client) -> None:
             elif data == "acc_add":
                 pending[uid] = {"action": "acc_add_phone"}
                 await cb.message.edit_text(
-                    "➕ **Добавление**\n\nНомер в формате `+79991234567`.\n\n/cancel",
+                    "➕ Номер в формате `+79991234567`.\n/cancel",
                     parse_mode=enums.ParseMode.MARKDOWN)
             elif data == "acc_check_overlaps":
                 overlaps = check_group_overlaps()
                 if not overlaps:
-                    await cb.answer("✅ Нет пересечений!", show_alert=True)
+                    await cb.answer()
                     return
                 lines = ["⚠️ Пересечения:\n"]
                 id_to_name = {a["id"]: a.get("name", "?") for a in (STATE.get("accounts") or [])}
@@ -1030,39 +1421,39 @@ def register_handlers(bot: Client) -> None:
             elif data.startswith("acc_open:"):
                 acc_id = data.split(":", 1)[1]
                 if not get_account(acc_id):
-                    await cb.answer("Не найден.")
+                    await cb.answer()
                     return
                 await cb.message.edit_text(account_text(acc_id), reply_markup=account_kb(acc_id))
             elif data.startswith("acc_toggle:"):
                 acc_id = data.split(":", 1)[1]
                 acc = get_account(acc_id)
                 if not acc:
+                    await cb.answer()
                     return
                 if not user_clients.get(acc_id):
-                    await cb.answer("Клиент не подключён.", show_alert=True)
+                    await cb.answer()
                     return
                 if acc.get("running"):
                     acc["running"] = False
-                    save_json(STATE_FILE, STATE)
-                    await cb.answer("⏸")
                 else:
                     if not acc.get("groups"):
-                        await cb.answer("Нет групп!", show_alert=True)
+                        await cb.answer()
                         return
                     has_src = bool(acc.get("source_chat_id") and acc.get("source_message_id"))
                     has_text = bool(acc.get("text") or acc.get("media_path"))
                     if not (has_src or has_text):
-                        await cb.answer("Не задан источник/текст!", show_alert=True)
+                        await cb.answer()
                         return
                     acc["running"] = True
-                    save_json(STATE_FILE, STATE)
                     start_mailing_for_account(acc_id)
-                    await cb.answer("🚀")
+                save_json(STATE_FILE, STATE)
+                await cb.answer()
                 await cb.message.edit_text(account_text(acc_id), reply_markup=account_kb(acc_id))
             elif data.startswith("acc_source:"):
                 acc_id = data.split(":", 1)[1]
                 acc = get_account(acc_id)
                 if not acc:
+                    await cb.answer()
                     return
                 cur = "—"
                 if acc.get("source_chat_id") and acc.get("source_message_id"):
@@ -1077,23 +1468,24 @@ def register_handlers(bot: Client) -> None:
                     [InlineKeyboardButton("⬅️", callback_data=f"acc_open:{acc_id}")],
                 ])
                 await cb.message.edit_text(
-                    f"📎 **Источник для пересылки**\n\n"
+                    f"📎 **Источник (копирование)**\n\n"
                     f"Текущий: `{cur}`\n\n"
                     f"1. Отправь сообщение с премиум-эмодзи в «Избранное»\n"
                     f"2. Нажми «Переслать сообщение боту»\n"
                     f"3. Перешли это сообщение боту\n\n"
-                    f"Бот запомнит chat_id и message_id молча.",
+                    f"В группы уйдёт **копия** — без плашки «Переслано», "
+                    f"премиум-эмодзи сохранятся.",
                     reply_markup=kb)
             elif data.startswith("acc_source_forward:"):
                 acc_id = data.split(":", 1)[1]
                 pending[uid] = {"action": "acc_source_forward", "acc_id": acc_id}
                 await cb.message.edit_text(
-                    "📨 Перешли сюда сообщение с премиум-эмодзи.\n\n/cancel")
+                    "📨 Перешли сюда сообщение с премиум-эмодзи.\n/cancel")
             elif data.startswith("acc_source_manual:"):
                 acc_id = data.split(":", 1)[1]
                 pending[uid] = {"action": "acc_source_manual", "acc_id": acc_id}
                 await cb.message.edit_text(
-                    "✏️ Отправь двумя строками:\n`chat_id`\n`message_id`\n\n/cancel")
+                    "✏️ Отправь двумя строками:\n`chat_id`\n`message_id`\n/cancel")
             elif data.startswith("acc_source_clear:"):
                 acc_id = data.split(":", 1)[1]
                 acc = get_account(acc_id)
@@ -1101,7 +1493,7 @@ def register_handlers(bot: Client) -> None:
                     acc["source_chat_id"] = None
                     acc["source_message_id"] = None
                     save_json(STATE_FILE, STATE)
-                await cb.answer("🗑")
+                await cb.answer()
                 await cb.message.edit_text(account_text(acc_id), reply_markup=account_kb(acc_id))
             elif data.startswith("acc_text:"):
                 acc_id = data.split(":", 1)[1]
@@ -1115,6 +1507,7 @@ def register_handlers(bot: Client) -> None:
                 acc_id = data.split(":", 1)[1]
                 acc = get_account(acc_id)
                 if not acc:
+                    await cb.answer()
                     return
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton(f"⏱ Интервал: {acc.get('interval', 1800)}с",
@@ -1148,9 +1541,9 @@ def register_handlers(bot: Client) -> None:
                 acc_id = data.split(":", 1)[1]
                 c = user_clients.get(acc_id)
                 if not c:
-                    await cb.answer("Нет клиента.", show_alert=True)
+                    await cb.answer()
                     return
-                await cb.answer("Сканирую…")
+                await cb.answer()
                 await cb.message.edit_text("🔍 Сканирую…")
                 found = await scan_groups_for_account(acc_id)
                 acc = get_account(acc_id)
@@ -1170,7 +1563,7 @@ def register_handlers(bot: Client) -> None:
                 acc_id = data.split(":", 1)[1]
                 acc = get_account(acc_id)
                 if not acc or not acc.get("groups"):
-                    await cb.answer("Пусто.", show_alert=True)
+                    await cb.answer()
                     return
                 rows = []
                 for g in (acc.get("groups") or [])[:30]:
@@ -1182,24 +1575,26 @@ def register_handlers(bot: Client) -> None:
             elif data.startswith("acc_delg:"):
                 parts = data.split(":", 2)
                 if len(parts) < 3:
+                    await cb.answer()
                     return
                 acc_id, gid_s = parts[1], parts[2]
                 try:
                     gid = int(gid_s)
                 except ValueError:
+                    await cb.answer()
                     return
                 acc = get_account(acc_id)
                 if acc:
                     acc["groups"] = [g for g in acc["groups"] if g["id"] != gid]
                     save_json(STATE_FILE, STATE)
-                await cb.answer("Удалено.")
+                await cb.answer()
                 await cb.message.edit_text(account_text(acc_id), reply_markup=account_kb(acc_id))
             elif data.startswith("acc_setmain:"):
                 acc_id = data.split(":", 1)[1]
                 if get_account(acc_id):
                     STATE["main_account_id"] = acc_id
                     save_json(STATE_FILE, STATE)
-                    await cb.answer("⭐", show_alert=True)
+                await cb.answer()
                 await cb.message.edit_text(account_text(acc_id), reply_markup=account_kb(acc_id))
             elif data.startswith("acc_remove:"):
                 acc_id = data.split(":", 1)[1]
@@ -1231,12 +1626,12 @@ def register_handlers(bot: Client) -> None:
                             except Exception:
                                 pass
                     remove_account(acc_id)
-                    await cb.answer("🗑")
+                await cb.answer()
                 await cb.message.edit_text(accounts_menu_text(), reply_markup=accounts_menu_kb())
             elif data.startswith("acc_sub_menu:"):
                 acc_id = data.split(":", 1)[1]
                 if not get_account(acc_id):
-                    await cb.answer("Не найден.")
+                    await cb.answer()
                     return
                 await cb.message.edit_text(subscribe_menu_text(acc_id),
                                             reply_markup=subscribe_menu_kb(acc_id))
@@ -1247,7 +1642,7 @@ def register_handlers(bot: Client) -> None:
                     "📋 Отправь список групп:\n"
                     "• По одной на строку: `@group1`\n"
                     "• Через запятую: `@g1, @g2`\n"
-                    "• Или .txt файлом\n\n/cancel")
+                    "• Или .txt файлом\n/cancel")
             elif data.startswith("acc_sub_delay:"):
                 acc_id = data.split(":", 1)[1]
                 pending[uid] = {"action": "acc_sub_delay", "acc_id": acc_id}
@@ -1256,15 +1651,15 @@ def register_handlers(bot: Client) -> None:
                 acc_id = data.split(":", 1)[1]
                 acc = get_account(acc_id)
                 if not acc or not acc.get("subscribe_queue"):
-                    await cb.answer("Пусто.", show_alert=True)
+                    await cb.answer()
                     return
                 if not user_clients.get(acc_id):
-                    await cb.answer("Нет клиента.", show_alert=True)
+                    await cb.answer()
                     return
                 acc["subscribe_status"] = "running"
                 save_json(STATE_FILE, STATE)
                 start_subscribe(acc_id)
-                await cb.answer("▶️")
+                await cb.answer()
                 await cb.message.edit_text(subscribe_menu_text(acc_id),
                                             reply_markup=subscribe_menu_kb(acc_id))
             elif data.startswith("acc_sub_stop:"):
@@ -1273,7 +1668,7 @@ def register_handlers(bot: Client) -> None:
                 if acc:
                     acc["subscribe_status"] = "paused"
                     save_json(STATE_FILE, STATE)
-                await cb.answer("⏸")
+                await cb.answer()
                 await cb.message.edit_text(subscribe_menu_text(acc_id),
                                             reply_markup=subscribe_menu_kb(acc_id))
             elif data.startswith("acc_sub_clear:"):
@@ -1283,392 +1678,19 @@ def register_handlers(bot: Client) -> None:
                     acc["subscribe_queue"] = []
                     acc["subscribe_status"] = "idle"
                     save_json(STATE_FILE, STATE)
-                await cb.answer("🗑")
+                await cb.answer()
                 await cb.message.edit_text(subscribe_menu_text(acc_id),
                                             reply_markup=subscribe_menu_kb(acc_id))
             elif data == "stats_menu":
                 await cb.message.edit_text(stats_menu_text(), reply_markup=stats_menu_kb())
             else:
-                await cb.answer("Неизвестная команда.")
-        except Exception as e:
+                await cb.answer()
+        except Exception:
             log.exception("Ошибка callback")
             try:
-                await cb.answer(f"Ошибка: {e}", show_alert=True)
+                await cb.answer()
             except Exception:
                 pass
-
-    @bot.on_message(filters.private & filters.user(CFG["admin_id"]))
-    async def on_admin_input(client, message):
-        uid = message.from_user.id
-        if uid not in authed:
-            return
-        act = pending.pop(uid, None)
-        if not act:
-            return
-        action = act.get("action")
-        text = (message.text or "").strip()
-        try:
-            if action == "add_session_string":
-                raw = (text or "").strip()
-                cleaned = re.sub(r"\s+", "", raw).strip('"').strip("'").strip("`")
-                if not cleaned:
-                    await message.reply("❌ Пустая строка.")
-                    return
-                ok, reason = validate_session_string(cleaned)
-                if not ok:
-                    await message.reply(
-                        f"❌ Невалидная session_string: **{reason}**\nДлина: {len(cleaned)}",
-                        parse_mode=enums.ParseMode.MARKDOWN)
-                    return
-                await message.reply("⏳ Подключаюсь…")
-                try:
-                    new_c = make_client(cleaned)
-                    await asyncio.wait_for(new_c.start(), timeout=30)
-                    me = await new_c.get_me()
-                    if not me:
-                        await new_c.stop()
-                        await message.reply("❌ Нет данных.")
-                        return
-                    name = f"{me.first_name}" + (f" @{me.username}" if me.username else "")
-                    sname = f"string_session_{int(datetime.now().timestamp())}"
-                    acc = add_account(name, sname)
-                    acc["user_id"] = me.id
-                    acc["username"] = me.username
-                    acc["session_string"] = cleaned
-                    save_json(STATE_FILE, STATE)
-                    user_clients[acc["id"]] = new_c
-                    ME_IDS[acc["id"]] = me.id
-                    await message.reply(f"✅ **{name}** (id={me.id}).",
-                                        reply_markup=main_menu_kb())
-                except (AuthKeyUnregistered, AuthKeyDuplicated, UserDeactivated, SessionRevoked) as e:
-                    await message.reply(f"❌ Сессия недействительна: `{e}`",
-                                        parse_mode=enums.ParseMode.MARKDOWN)
-                except Exception as e:
-                    await message.reply(f"❌ `{e}`", parse_mode=enums.ParseMode.MARKDOWN)
-                return
-
-            if action == "acc_source_forward":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                if not acc:
-                    return
-                if message.forward_from_chat:
-                    chat_id = message.forward_from_chat.id
-                    msg_id = message.forward_from_message_id
-                elif message.forward_from:
-                    # Переслано от пользователя — сохраняем как user_id
-                    chat_id = message.forward_from.id
-                    msg_id = message.forward_from_message_id or message.id
-                else:
-                    # Может быть просто сообщение без forward — тогда сохраняем "как есть"
-                    chat_id = message.chat.id
-                    msg_id = message.id
-                acc["source_chat_id"] = chat_id
-                acc["source_message_id"] = msg_id
-                save_json(STATE_FILE, STATE)
-                # МОЛЧА, без спама
-                try:
-                    await message.react(emoji="👍")
-                except Exception:
-                    pass
-                return
-
-            if action == "acc_source_manual":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                if not acc:
-                    return
-                parts = [p.strip() for p in text.split("\n") if p.strip()]
-                if len(parts) < 2:
-                    pending[uid] = act
-                    await message.reply("❌ Нужно 2 строки.")
-                    return
-                try:
-                    chat_id = int(parts[0])
-                    msg_id = int(parts[1])
-                except ValueError:
-                    pending[uid] = act
-                    await message.reply("❌ Только числа.")
-                    return
-                acc["source_chat_id"] = chat_id
-                acc["source_message_id"] = msg_id
-                save_json(STATE_FILE, STATE)
-                try:
-                    await message.react(emoji="👍")
-                except Exception:
-                    pass
-                return
-
-            if action == "acc_add_phone":
-                phone = text
-                if not phone.startswith("+") or len(phone) < 8:
-                    pending[uid] = {"action": "acc_add_phone"}
-                    await message.reply("❌ Неверный формат.")
-                    return
-                sname = f"userbot_{int(datetime.now().timestamp())}"
-                session_path = os.path.join(DATA_DIR, sname)
-                try:
-                    new_c = make_client(session_path)
-                    await new_c.connect()
-                    try:
-                        sent = await new_c.send_code(phone, force_sms=True)
-                    except TypeError:
-                        sent = await new_c.send_code(phone)
-                except Exception as e:
-                    await message.reply(f"❌ send_code: {e}")
-                    return
-                pending[uid] = {"action": "acc_add_code", "phone": phone,
-                                "hash": sent.phone_code_hash, "session_name": sname, "client": new_c}
-                await message.reply("📩 Код отправлен:")
-
-            elif action == "acc_add_code":
-                phone = act["phone"]
-                hash_ = act["hash"]
-                sname = act["session_name"]
-                new_c: Client = act["client"]
-                code = text.replace(" ", "")
-                try:
-                    await new_c.sign_in(phone_number=phone,
-                                        phone_code_hash=hash_, phone_code=code)
-                except SessionPasswordNeeded:
-                    pending[uid] = {"action": "acc_add_password", "phone": phone,
-                                    "session_name": sname, "client": new_c}
-                    await message.reply("🔐 Пароль 2FA:")
-                    return
-                except PhoneCodeInvalid:
-                    pending[uid] = act
-                    await message.reply("❌ Неверный код. Ещё раз:")
-                    return
-                except PhoneCodeExpired:
-                    await message.reply("⚠️ Код истёк.")
-                    return
-                except Exception as e:
-                    await message.reply(f"❌ {e}")
-                    return
-                me = await new_c.get_me()
-                name = f"{me.first_name}" + (f" @{me.username}" if me.username else "")
-                acc = add_account(name, sname)
-                acc["user_id"] = me.id
-                acc["username"] = me.username
-                save_json(STATE_FILE, STATE)
-                user_clients[acc["id"]] = new_c
-                ME_IDS[acc["id"]] = me.id
-                await message.reply(f"✅ **{name}**", reply_markup=main_menu_kb())
-
-            elif action == "acc_add_password":
-                phone = act["phone"]
-                sname = act["session_name"]
-                new_c: Client = act["client"]
-                try:
-                    await new_c.check_password(text)
-                except PasswordHashInvalid:
-                    pending[uid] = act
-                    await message.reply("❌ Неверный пароль. Ещё раз:")
-                    return
-                except Exception as e:
-                    await message.reply(f"❌ {e}")
-                    return
-                me = await new_c.get_me()
-                name = f"{me.first_name}" + (f" @{me.username}" if me.username else "")
-                acc = add_account(name, sname)
-                acc["user_id"] = me.id
-                acc["username"] = me.username
-                save_json(STATE_FILE, STATE)
-                user_clients[acc["id"]] = new_c
-                ME_IDS[acc["id"]] = me.id
-                await message.reply(f"✅ **{name}**", reply_markup=main_menu_kb())
-
-            elif action == "acc_sub_load":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                if not acc:
-                    await message.reply("❌ Не найден.")
-                    return
-                raw_text = ""
-                if message.document:
-                    try:
-                        path = await message.download()
-                        with open(path, "r", encoding="utf-8") as f:
-                            raw_text = f.read()
-                        try:
-                            os.remove(path)
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        await message.reply(f"❌ {e}")
-                        return
-                else:
-                    raw_text = message.text or ""
-                if not raw_text.strip():
-                    pending[uid] = act
-                    await message.reply("Пусто.")
-                    return
-                groups = parse_groups_from_text(raw_text)
-                if not groups:
-                    await message.reply("❌ Не распарсил.")
-                    return
-                existing_q = acc.setdefault("subscribe_queue", [])
-                existing_q_keys = {str(x) for x in existing_q}
-                added = 0
-                for ref in groups:
-                    if str(ref) not in existing_q_keys:
-                        existing_q.append(ref)
-                        existing_q_keys.add(str(ref))
-                        added += 1
-                acc["subscribe_status"] = "idle"
-                save_json(STATE_FILE, STATE)
-                await message.reply(
-                    f"✅ Загружено: **{added}**\nВсего: **{len(acc['subscribe_queue'])}**",
-                    reply_markup=account_kb(acc_id))
-
-            elif action == "acc_sub_delay":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                if not acc:
-                    return
-                text_clean = text.replace("-", " ").replace(",", " ")
-                parts = [p for p in text_clean.split() if p.strip()]
-                if len(parts) < 2:
-                    pending[uid] = act
-                    await message.reply("❌ Нужно 2 числа.")
-                    return
-                try:
-                    lo = int(parts[0]); hi = int(parts[1])
-                    if lo < 5: raise ValueError("мин. 5")
-                    if hi < lo: raise ValueError("макс >= мин")
-                    if hi > 1800: raise ValueError("макс 1800")
-                except Exception as e:
-                    pending[uid] = act
-                    await message.reply(f"❌ {e}")
-                    return
-                acc["subscribe_delay_min"] = lo
-                acc["subscribe_delay_max"] = hi
-                save_json(STATE_FILE, STATE)
-                await message.reply(f"✅ {lo}–{hi}с", reply_markup=account_kb(acc_id))
-
-            elif action == "acc_text":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                if not acc:
-                    return
-                if not text:
-                    pending[uid] = act
-                    return
-                acc["text"] = text
-                acc["media_path"] = None
-                acc["media_type"] = None
-                acc["caption"] = ""
-                save_json(STATE_FILE, STATE)
-                await message.reply("✅ Текст сохранён.", reply_markup=account_kb(acc_id))
-
-            elif action == "acc_media":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                if not acc:
-                    return
-                if not (message.photo or message.video):
-                    pending[uid] = act
-                    await message.reply("Не медиа.")
-                    return
-                if message.photo:
-                    ext = "jpg"; acc["media_type"] = "photo"
-                else:
-                    ext = "mp4"; acc["media_type"] = "video"
-                path = os.path.join(MEDIA_DIR, f"media_{acc_id}.{ext}")
-                await message.download(file_name=path)
-                acc["media_path"] = path
-                acc["caption"] = message.caption or ""
-                acc["text"] = ""
-                save_json(STATE_FILE, STATE)
-                await message.reply("✅ Медиа сохранено.", reply_markup=account_kb(acc_id))
-
-            elif action == "acc_setint":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                try:
-                    v = int(text)
-                    if v < 60: raise ValueError("мин. 60")
-                    acc["interval"] = v
-                    save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ {v}с", reply_markup=account_kb(acc_id))
-                except Exception as e:
-                    pending[uid] = act
-                    await message.reply(f"❌ {e}")
-
-            elif action == "acc_setdmin":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                try:
-                    v = int(text)
-                    if v < 1: raise ValueError("мин. 1")
-                    acc["delay_min"] = v
-                    if acc["delay_max"] < v:
-                        acc["delay_max"] = v
-                    save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ {v}", reply_markup=account_kb(acc_id))
-                except Exception as e:
-                    pending[uid] = act
-                    await message.reply(f"❌ {e}")
-
-            elif action == "acc_setdmax":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                try:
-                    v = int(text)
-                    if v < acc["delay_min"]:
-                        raise ValueError(f">= {acc['delay_min']}")
-                    acc["delay_max"] = v
-                    save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ {v}", reply_markup=account_kb(acc_id))
-                except Exception as e:
-                    pending[uid] = act
-                    await message.reply(f"❌ {e}")
-
-            elif action == "acc_settyping":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                try:
-                    v = int(text)
-                    if v < 0 or v > 60:
-                        raise ValueError("0–60")
-                    acc["typing_seconds"] = v
-                    save_json(STATE_FILE, STATE)
-                    await message.reply(f"✅ {v}с", reply_markup=account_kb(acc_id))
-                except Exception as e:
-                    pending[uid] = act
-                    await message.reply(f"❌ {e}")
-
-            elif action == "acc_addgrp":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                c = user_clients.get(acc_id)
-                if not acc or not c:
-                    await message.reply("❌ Не подключён.")
-                    return
-                ref = parse_chat_ref(text)
-                if ref is None:
-                    await message.reply("Не распарсил.")
-                    return
-                try:
-                    chat = await c.get_chat(ref)
-                except Exception as e:
-                    await message.reply(f"❌ {e}")
-                    return
-                gid = chat.id
-                title = chat.title or str(gid)
-                if any(g["id"] == gid for g in acc["groups"]):
-                    await message.reply("Уже в списке.")
-                    return
-                acc["groups"].append({
-                    "id": gid, "title": title,
-                    "type": chat.type.name if chat.type else "UNKNOWN",
-                    "manual": True})
-                save_json(STATE_FILE, STATE)
-                await message.reply(f"✅ {title}", reply_markup=account_kb(acc_id))
-
-        except Exception as e:
-            log.exception("on_admin_input")
-            await message.reply(f"❌ {e}")
 
 
 # ---------------------------------------------------------------------------
