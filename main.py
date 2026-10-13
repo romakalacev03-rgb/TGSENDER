@@ -1,10 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Мульти-аккаунт автопостер + рассылка + массовая подписка.
-Без ИИ и автоответчика.
-
-Отправка постов идёт через copy_message — премиум-эмодзи сохраняются,
-плашки «Переслано» в группах НЕ будет.
+Отправка через forward_messages (реальная пересылка).
 """
 
 import asyncio
@@ -31,7 +28,7 @@ from pyrogram.errors import (
 
 
 # ===========================================================================
-#  СЕССИЯ ПО УМОЛЧАНИЮ (вставь свою новую строку из Colab)
+#  СЕССИЯ ПО УМОЛЧАНИЮ
 # ===========================================================================
 DEFAULT_SESSION_STRING = (
     "ВСТАВЬ_СЮДА_СВОЮ_НОВУЮ_СТРОКУ_ИЗ_COLAB"
@@ -109,27 +106,20 @@ def validate_session_string(s: str):
 def make_client(session_name_or_string: str) -> Client:
     raw = session_name_or_string or ""
     s = re.sub(r"\s+", "", raw).strip('"').strip("'").strip("`")
-    log.info(f"[CLIENT] raw_len={len(raw)} clean_len={len(s)} head={s[:30]}")
-
     if len(s) > 100:
-        log.info("[CLIENT] session_string")
         return Client(
             name=":memory:",
-            api_id=CFG["api_id"],
-            api_hash=CFG["api_hash"],
+            api_id=CFG["api_id"], api_hash=CFG["api_hash"],
             session_string=s,
             app_version=DEVICE_PARAMS["app_version"],
             device_model=DEVICE_PARAMS["device_model"],
             system_version=DEVICE_PARAMS["system_version"],
             lang_code=DEVICE_PARAMS["lang_code"],
         )
-
-    log.info(f"[CLIENT] Файл: {s}")
     session_path = os.path.join(DATA_DIR, s)
     return Client(
         name=session_path,
-        api_id=CFG["api_id"],
-        api_hash=CFG["api_hash"],
+        api_id=CFG["api_id"], api_hash=CFG["api_hash"],
         app_version=DEVICE_PARAMS["app_version"],
         device_model=DEVICE_PARAMS["device_model"],
         system_version=DEVICE_PARAMS["system_version"],
@@ -225,25 +215,9 @@ def load_state() -> dict:
     raw = load_json(STATE_FILE, {}) or {}
     st = default_state()
 
-    if not raw.get("accounts"):
-        has_old = any(k in raw for k in ("text", "groups", "interval", "delay_min"))
-        if has_old:
-            acc = _new_account("Основной", "userbot")
-            acc["text"] = raw.get("text") or ""
-            acc["caption"] = raw.get("caption") or ""
-            acc["media_path"] = raw.get("media_path")
-            acc["media_type"] = raw.get("media_type")
-            acc["groups"] = raw.get("groups") or []
-            acc["running"] = raw.get("running", False)
-            acc["interval"] = raw.get("interval", 1800)
-            acc["delay_min"] = raw.get("delay_min", 5)
-            acc["delay_max"] = raw.get("delay_max", 15)
-            st["accounts"] = [acc]
-            st["main_account_id"] = acc["id"]
-
     if isinstance(raw.get("accounts"), list):
         st["accounts"] = raw["accounts"]
-    st["main_account_id"] = raw.get("main_account_id") or st.get("main_account_id") or ""
+    st["main_account_id"] = raw.get("main_account_id") or ""
     if not isinstance(raw.get("global_stats"), dict):
         st["global_stats"] = default_state()["global_stats"]
     for k in ("total_sent", "total_errors", "total_subscribed"):
@@ -288,7 +262,7 @@ def bootstrap_default_session():
     STATE["main_account_id"] = acc["id"]
     STATE["_bootstrapped"] = True
     save_json(STATE_FILE, STATE)
-    log.info(f"[BOOTSTRAP] Добавлен аккаунт «Основной» с дефолтной сессией")
+    log.info("[BOOTSTRAP] Добавлен аккаунт «Основной»")
 
 
 def get_account(acc_id: str) -> dict:
@@ -384,15 +358,15 @@ def parse_chat_ref(text: str):
 
 
 # ---------------------------------------------------------------------------
-# Рассылка
+# Рассылка — ФОРВАРД + ТАЙПИНГ
 # ---------------------------------------------------------------------------
 
 async def send_post_for_account(acc_id: str, chat_id: int) -> None:
     """
     Отправляет пост в чат:
-      * имитирует «печатает…» на N секунд
-      * копирует исходное сообщение (премиум-эмодзи сохраняются, плашки «Переслано» НЕТ)
-      * fallback: если источника нет — отправляет текст/медиа из аккаунта
+      * 2 сек «печатает…»
+      * forward_messages из источника (реальная пересылка)
+      * fallback: если источника нет — текст/медиа из аккаунта
     """
     c = user_clients.get(acc_id)
     if not c:
@@ -411,16 +385,16 @@ async def send_post_for_account(acc_id: str, chat_id: int) -> None:
     src_chat = acc.get("source_chat_id")
     src_msg = acc.get("source_message_id")
 
-    # Приоритет — копирование исходного сообщения
     if src_chat and src_msg:
-        await c.copy_message(
+        # РЕАЛЬНАЯ ПЕРЕСЫЛКА
+        await c.forward_messages(
             chat_id=chat_id,
-            from_chat_id=src_chat,
-            message_id=int(src_msg),
+            from_chat_id=int(src_chat),
+            message_ids=int(src_msg),
         )
         return
 
-    # Fallback: текст/медиа из аккаунта
+    # Fallback — текст/медиа
     text = acc.get("text")
     media_path = acc.get("media_path")
     media_type = acc.get("media_type")
@@ -468,10 +442,6 @@ async def mailing_loop_for_account(acc_id: str):
                 except Exception:
                     errors += 1
                     acc["stats"]["errors"] = acc["stats"].get("errors", 0) + 1
-            except (ChatWriteForbidden, ChatAdminRequired, UserBannedInChannel,
-                    PeerIdInvalid, UserIsBlocked, ChannelPrivate):
-                errors += 1
-                acc["stats"]["errors"] = acc["stats"].get("errors", 0) + 1
             except Exception as e:
                 log.warning(f"[{acc.get('name')}] send error: {e}")
                 errors += 1
@@ -655,7 +625,7 @@ def start_subscribe(acc_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Логин / запуск клиентов
+# Логин
 # ---------------------------------------------------------------------------
 
 async def start_userbot_clients():
@@ -706,7 +676,7 @@ async def try_start_existing_clients():
                 if acc.get("subscribe_status") == "running":
                     start_subscribe(acc_id)
         except asyncio.TimeoutError:
-            log.warning(f"[{acc.get('name')}] таймаут подключения — сессия удалена")
+            log.warning(f"[{acc.get('name')}] таймаут — сессия удалена")
             acc["session_string"] = ""
             save_json(STATE_FILE, STATE)
             try:
@@ -801,7 +771,7 @@ def account_kb(acc_id: str) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("⏸ Стоп рассылку" if running else "🚀 Запустить рассылку",
                               callback_data=f"acc_toggle:{acc_id}")],
-        [InlineKeyboardButton("📎 Источник (премиум-эмодзи)",
+        [InlineKeyboardButton("📎 Источник (пересылка)",
                               callback_data=f"acc_source:{acc_id}")],
         [InlineKeyboardButton("📝 Текст", callback_data=f"acc_text:{acc_id}")],
         [InlineKeyboardButton("🖼 Медиа", callback_data=f"acc_media:{acc_id}")],
@@ -848,7 +818,7 @@ def account_text(acc_id: str) -> str:
     if src_chat and src_msg:
         src_line = f"✅ chat={src_chat} msg={src_msg}"
     else:
-        src_line = "❌ не задан (используется текст/медиа)"
+        src_line = "❌ не задан"
     return (
         f"📢 **{acc.get('name', '?')}** {is_main}\n\n"
         f"• Статус: {'🟢' if acc.get('running') else '⚪️'}\n"
@@ -857,7 +827,7 @@ def account_text(acc_id: str) -> str:
         f"• Интервал: {acc.get('interval', 1800)}с\n"
         f"• Задержка: {acc.get('delay_min', 5)}–{acc.get('delay_max', 15)}с\n"
         f"• Печатает: {acc.get('typing_seconds', 2)}с\n"
-        f"📎 Источник: {src_line}\n"
+        f"📎 Источник (forward): {src_line}\n"
         f"📊 Sent: {s.get('sent', 0)} | Err: {s.get('errors', 0)} | Кругов: {s.get('rounds', 0)}\n"
         f"📥 Подписка: {sub_status} | ✅{sub_stats.get('subscribed', 0)}\n\n"
         f"📝 Текст (fallback):\n{preview}"
@@ -952,7 +922,6 @@ def stats_menu_kb() -> InlineKeyboardMarkup:
 
 
 def stats_menu_text() -> str:
-    gs = STATE.get("global_stats") or {}
     lines = ["📊 Статистика\n"]
     accounts = STATE.get("accounts") or []
     total_sent = 0
@@ -1013,8 +982,7 @@ def register_handlers(bot: Client) -> None:
             return
         pending[message.from_user.id] = {"action": "add_session_string"}
         await message.reply(
-            "📝 Отправь **строку сессии** одним сообщением.\n\n"
-            "⚠️ Никому не пересылай! /cancel",
+            "📝 Отправь **строку сессии** одним сообщением.\n\n/cancel",
             parse_mode=enums.ParseMode.MARKDOWN)
 
     @bot.on_callback_query()
@@ -1100,37 +1068,32 @@ def register_handlers(bot: Client) -> None:
                 if acc.get("source_chat_id") and acc.get("source_message_id"):
                     cur = f"chat={acc['source_chat_id']} msg={acc['source_message_id']}"
                 kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✏️ Задать вручную",
-                                          callback_data=f"acc_source_manual:{acc_id}")],
                     [InlineKeyboardButton("📨 Переслать сообщение боту",
                                           callback_data=f"acc_source_forward:{acc_id}")],
+                    [InlineKeyboardButton("✏️ Задать вручную",
+                                          callback_data=f"acc_source_manual:{acc_id}")],
                     [InlineKeyboardButton("🗑 Сбросить",
                                           callback_data=f"acc_source_clear:{acc_id}")],
                     [InlineKeyboardButton("⬅️", callback_data=f"acc_open:{acc_id}")],
                 ])
                 await cb.message.edit_text(
-                    f"📎 **Источник для копирования**\n\n"
+                    f"📎 **Источник для пересылки**\n\n"
                     f"Текущий: `{cur}`\n\n"
-                    f"Как это работает:\n"
-                    f"1. Отправь своё сообщение с премиум-эмодзи в «Избранное» (Saved Messages)\n"
-                    f"2. Перешли его сюда боту кнопкой «Переслать сообщение боту»\n"
-                    f"3. Бот сам запомнит chat_id и message_id\n\n"
-                    f"Дальше в группы уходит **копия** — без плашки «Переслано», "
-                    f"с сохранением премиум-эмодзи.",
+                    f"1. Отправь сообщение с премиум-эмодзи в «Избранное»\n"
+                    f"2. Нажми «Переслать сообщение боту»\n"
+                    f"3. Перешли это сообщение боту\n\n"
+                    f"Бот запомнит chat_id и message_id молча.",
                     reply_markup=kb)
-            elif data.startswith("acc_source_manual:"):
-                acc_id = data.split(":", 1)[1]
-                pending[uid] = {"action": "acc_source_manual", "acc_id": acc_id}
-                await cb.message.edit_text(
-                    "✏️ Отправь двумя строками:\n"
-                    "`chat_id`\n`message_id`\n\n"
-                    "Например:\n`123456789`\n`42`\n\n/cancel")
             elif data.startswith("acc_source_forward:"):
                 acc_id = data.split(":", 1)[1]
                 pending[uid] = {"action": "acc_source_forward", "acc_id": acc_id}
                 await cb.message.edit_text(
-                    "📨 Перешли сюда сообщение с премиум-эмодзи.\n"
-                    "Бот запомнит его chat_id и message_id.\n\n/cancel")
+                    "📨 Перешли сюда сообщение с премиум-эмодзи.\n\n/cancel")
+            elif data.startswith("acc_source_manual:"):
+                acc_id = data.split(":", 1)[1]
+                pending[uid] = {"action": "acc_source_manual", "acc_id": acc_id}
+                await cb.message.edit_text(
+                    "✏️ Отправь двумя строками:\n`chat_id`\n`message_id`\n\n/cancel")
             elif data.startswith("acc_source_clear:"):
                 acc_id = data.split(":", 1)[1]
                 acc = get_account(acc_id)
@@ -1348,25 +1311,23 @@ def register_handlers(bot: Client) -> None:
             if action == "add_session_string":
                 raw = (text or "").strip()
                 cleaned = re.sub(r"\s+", "", raw).strip('"').strip("'").strip("`")
-                log.info(f"[ADDSESSION] raw_len={len(raw)} clean_len={len(cleaned)}")
                 if not cleaned:
                     await message.reply("❌ Пустая строка.")
                     return
                 ok, reason = validate_session_string(cleaned)
                 if not ok:
                     await message.reply(
-                        f"❌ Строка не похожа на валидную session_string: **{reason}**\n"
-                        f"Длина: {len(cleaned)}",
+                        f"❌ Невалидная session_string: **{reason}**\nДлина: {len(cleaned)}",
                         parse_mode=enums.ParseMode.MARKDOWN)
                     return
-                await message.reply("⏳ Подключаюсь к Telegram…")
+                await message.reply("⏳ Подключаюсь…")
                 try:
                     new_c = make_client(cleaned)
                     await asyncio.wait_for(new_c.start(), timeout=30)
                     me = await new_c.get_me()
                     if not me:
                         await new_c.stop()
-                        await message.reply("❌ Не удалось получить данные пользователя.")
+                        await message.reply("❌ Нет данных.")
                         return
                     name = f"{me.first_name}" + (f" @{me.username}" if me.username else "")
                     sname = f"string_session_{int(datetime.now().timestamp())}"
@@ -1377,19 +1338,39 @@ def register_handlers(bot: Client) -> None:
                     save_json(STATE_FILE, STATE)
                     user_clients[acc["id"]] = new_c
                     ME_IDS[acc["id"]] = me.id
-                    await message.reply(
-                        f"✅ Аккаунт добавлен: **{name}** (id={me.id}).",
-                        reply_markup=main_menu_kb())
-                except asyncio.TimeoutError:
-                    await message.reply("❌ Таймаут подключения. Проверь строку сессии.")
+                    await message.reply(f"✅ **{name}** (id={me.id}).",
+                                        reply_markup=main_menu_kb())
                 except (AuthKeyUnregistered, AuthKeyDuplicated, UserDeactivated, SessionRevoked) as e:
-                    await message.reply(f"❌ Сессия недействительна: `{e}`\n\n"
-                                        f"Получи новую session_string.",
+                    await message.reply(f"❌ Сессия недействительна: `{e}`",
                                         parse_mode=enums.ParseMode.MARKDOWN)
                 except Exception as e:
-                    log.exception(f"[ADDSESSION] {e}")
-                    await message.reply(f"❌ Ошибка: `{e}`",
-                                        parse_mode=enums.ParseMode.MARKDOWN)
+                    await message.reply(f"❌ `{e}`", parse_mode=enums.ParseMode.MARKDOWN)
+                return
+
+            if action == "acc_source_forward":
+                acc_id = act["acc_id"]
+                acc = get_account(acc_id)
+                if not acc:
+                    return
+                if message.forward_from_chat:
+                    chat_id = message.forward_from_chat.id
+                    msg_id = message.forward_from_message_id
+                elif message.forward_from:
+                    # Переслано от пользователя — сохраняем как user_id
+                    chat_id = message.forward_from.id
+                    msg_id = message.forward_from_message_id or message.id
+                else:
+                    # Может быть просто сообщение без forward — тогда сохраняем "как есть"
+                    chat_id = message.chat.id
+                    msg_id = message.id
+                acc["source_chat_id"] = chat_id
+                acc["source_message_id"] = msg_id
+                save_json(STATE_FILE, STATE)
+                # МОЛЧА, без спама
+                try:
+                    await message.react(emoji="👍")
+                except Exception:
+                    pass
                 return
 
             if action == "acc_source_manual":
@@ -1400,54 +1381,29 @@ def register_handlers(bot: Client) -> None:
                 parts = [p.strip() for p in text.split("\n") if p.strip()]
                 if len(parts) < 2:
                     pending[uid] = act
-                    await message.reply("❌ Нужно 2 строки: chat_id и message_id.")
+                    await message.reply("❌ Нужно 2 строки.")
                     return
                 try:
                     chat_id = int(parts[0])
                     msg_id = int(parts[1])
                 except ValueError:
                     pending[uid] = act
-                    await message.reply("❌ Оба значения должны быть числами.")
+                    await message.reply("❌ Только числа.")
                     return
                 acc["source_chat_id"] = chat_id
                 acc["source_message_id"] = msg_id
                 save_json(STATE_FILE, STATE)
-                await message.reply(f"✅ Источник: chat={chat_id} msg={msg_id}",
-                                    reply_markup=account_kb(acc_id))
-                return
-
-            if action == "acc_source_forward":
-                acc_id = act["acc_id"]
-                acc = get_account(acc_id)
-                if not acc:
-                    return
-                # Пользователь переслал сообщение — берём его origin
-                if message.forward_from_chat:
-                    chat_id = message.forward_from_chat.id
-                    msg_id = message.forward_from_message_id
-                else:
-                    # Переслано от пользователя (без public chat)
-                    await message.reply(
-                        "❌ Не удалось определить источник.\n"
-                        "Перешли сообщение именно из канала/чата, "
-                        "либо задай вручную chat_id и message_id.",
-                        reply_markup=account_kb(acc_id))
-                    return
-                acc["source_chat_id"] = chat_id
-                acc["source_message_id"] = msg_id
-                save_json(STATE_FILE, STATE)
-                await message.reply(
-                    f"✅ Источник сохранён: chat={chat_id} msg={msg_id}\n"
-                    f"Теперь в группы пойдёт **копия** этого сообщения — "
-                    f"премиум-эмодзи сохранятся, плашки «Переслано» не будет.",
-                    reply_markup=account_kb(acc_id))
+                try:
+                    await message.react(emoji="👍")
+                except Exception:
+                    pass
                 return
 
             if action == "acc_add_phone":
                 phone = text
                 if not phone.startswith("+") or len(phone) < 8:
                     pending[uid] = {"action": "acc_add_phone"}
-                    await message.reply("❌ Неверный формат. Ещё раз или /cancel.")
+                    await message.reply("❌ Неверный формат.")
                     return
                 sname = f"userbot_{int(datetime.now().timestamp())}"
                 session_path = os.path.join(DATA_DIR, sname)
@@ -1463,7 +1419,7 @@ def register_handlers(bot: Client) -> None:
                     return
                 pending[uid] = {"action": "acc_add_code", "phone": phone,
                                 "hash": sent.phone_code_hash, "session_name": sname, "client": new_c}
-                await message.reply("📩 Код отправлен. Введи его:")
+                await message.reply("📩 Код отправлен:")
 
             elif action == "acc_add_code":
                 phone = act["phone"]
@@ -1484,7 +1440,7 @@ def register_handlers(bot: Client) -> None:
                     await message.reply("❌ Неверный код. Ещё раз:")
                     return
                 except PhoneCodeExpired:
-                    await message.reply("⚠️ Код истёк. /cancel и /login заново.")
+                    await message.reply("⚠️ Код истёк.")
                     return
                 except Exception as e:
                     await message.reply(f"❌ {e}")
@@ -1562,8 +1518,7 @@ def register_handlers(bot: Client) -> None:
                 acc["subscribe_status"] = "idle"
                 save_json(STATE_FILE, STATE)
                 await message.reply(
-                    f"✅ Загружено: **{added}**\nВсего: **{len(acc['subscribe_queue'])}**\n\n"
-                    f"→ 📥 Массовая подписка → ▶️ Запустить",
+                    f"✅ Загружено: **{added}**\nВсего: **{len(acc['subscribe_queue'])}**",
                     reply_markup=account_kb(acc_id))
 
             elif action == "acc_sub_delay":
@@ -1578,8 +1533,7 @@ def register_handlers(bot: Client) -> None:
                     await message.reply("❌ Нужно 2 числа.")
                     return
                 try:
-                    lo = int(parts[0])
-                    hi = int(parts[1])
+                    lo = int(parts[0]); hi = int(parts[1])
                     if lo < 5: raise ValueError("мин. 5")
                     if hi < lo: raise ValueError("макс >= мин")
                     if hi > 1800: raise ValueError("макс 1800")
@@ -1753,10 +1707,7 @@ async def main():
         accounts = STATE.get("accounts") or []
         await bot_client.send_message(
             CFG["admin_id"],
-            f"🤖 Бот запущен.\n"
-            f"• Аккаунтов: {len(accounts)}\n"
-            f"• В рассылке: {sum(1 for a in accounts if a.get('running'))}\n"
-            f"• Со session_string: {sum(1 for a in accounts if a.get('session_string'))}\n"
+            f"🤖 Бот запущен.\n• Аккаунтов: {len(accounts)}\n"
             f"Для доступа: `/auth <PIN>`",
             parse_mode=enums.ParseMode.MARKDOWN)
     except Exception as e:
