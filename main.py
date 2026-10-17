@@ -5,6 +5,10 @@
 Плашки «Переслано» в группах НЕТ.
 Скан/добавление — ТОЛЬКО группы.
 Есть исключения, проблемные группы, уведомления о новых ЛС и статистика отписей.
+
+ВАЖНО: уведомления о входящих ЛС имеют whitelist-фильтр
+(не бот, не сам себя, не админ, только private, только не исходящее)
+и кулдаун на пользователя — никакого спама.
 """
 
 import asyncio
@@ -14,6 +18,7 @@ import random
 import re
 import logging
 import base64
+import time
 from datetime import datetime, timedelta
 
 import aiosqlite
@@ -70,6 +75,10 @@ PROBLEM_PER_PAGE = 8
 EXCLUDED_PER_PAGE = 10
 INCOMING_LOG_PER_PAGE = 10
 
+# ===== АНТИСПАМ для уведомлений о входящих ЛС =====
+INCOMING_NOTIFY_COOLDOWN_SEC = 300   # 5 минут на пользователя
+INCOMING_WARMUP_SEC = 3              # не уведомляем первые N сек после старта клиента
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(message)s",
@@ -90,6 +99,11 @@ client_locks: dict = {}
 
 authed: set = set()
 pending: dict = {}
+
+# Антиспам для входящих
+_incoming_ready: dict = {}          # acc_id -> bool
+_last_notify_by_user: dict = {}     # str(user_id) -> unix ts
+_handled_message_ids: set = set()   # защита от повторной обработки (acc_id, msg_id)
 
 DEVICE_PARAMS = {
     "app_version": "9.3.1",
@@ -174,7 +188,6 @@ def is_target_group(chat) -> bool:
 
 
 def build_chat_link(chat) -> str:
-    """Возвращает ссылку на чат: @username, t.me/+invite или tg://openmessage."""
     try:
         username = getattr(chat, "username", None)
         if username:
@@ -185,7 +198,6 @@ def build_chat_link(chat) -> str:
         cid = getattr(chat, "id", None)
         if cid:
             s = str(cid)
-            # Убираем -100 префикс для супергрупп
             if s.startswith("-100"):
                 s = s[4:]
             return f"tg://openmessage?chat_id={s}"
@@ -352,11 +364,8 @@ def default_state() -> dict:
         "accounts": [],
         "main_account_id": "",
         "global_stats": {"total_sent": 0, "total_errors": 0, "total_subscribed": 0},
-        # Уникальные входящие ЛС: {uid: {"first_iso","name","username","first_text","days":{...}}}
         "incoming_users": {},
-        # Статистика по дням: {"YYYY-MM-DD": {"new": N, "messages": M}}
         "incoming_daily": {},
-        # Последние уведомления о входящих ЛС (для меню)
         "incoming_log": [],
     }
 
@@ -398,7 +407,6 @@ def load_state() -> dict:
         acc.setdefault("typing_seconds", DEFAULT_TYPING_SECONDS)
         acc.setdefault("excluded", [])
         acc.setdefault("problem", [])
-        # нормализуем группы: добавляем link/username, если нет
         for g in acc.get("groups") or []:
             g.setdefault("link", "")
             g.setdefault("username", None)
@@ -568,7 +576,6 @@ def remove_from_excluded(acc: dict, gid) -> bool:
 
 
 def mark_problem(acc: dict, g: dict, error: str):
-    """Записывает проблему: если уже есть — увеличивает счётчик."""
     if not acc or not g:
         return
     key = _group_key(g)
@@ -668,10 +675,6 @@ def register_incoming(user_id: int, name: str, username: str, text: str) -> bool
 
 
 def stats_for_period(days: int) -> dict:
-    """
-    Возвращает {'new': N, 'messages': M, 'unique_users': U} за N дней.
-    days=1 — сегодня, 7 — неделя, 30 — месяц.
-    """
     daily = STATE.get("incoming_daily") or {}
     cutoff = datetime.now().date() - timedelta(days=days - 1)
     new_total = 0
@@ -916,10 +919,6 @@ def start_mailing_for_account(acc_id: str):
 
 
 async def scan_groups_for_account(acc_id: str) -> tuple:
-    """
-    Возвращает (found_list, skipped_count).
-    Исключённые группы не добавляются.
-    """
     c = user_clients.get(acc_id)
     if not c:
         return [], 0
@@ -1049,44 +1048,87 @@ async def subscribe_loop(acc_id: str):
 
 def start_subscribe(acc_id: str):
     t = subscribe_tasks.get(acc_id)
-    if t and not t.done():
-        return
-    subscribe_tasks[acc_id] = asyncio.create_task(subscribe_loop(acc_id))
+    if not t or t.done():
+        subscribe_tasks[acc_id] = asyncio.create_task(subscribe_loop(acc_id))
 
 
-# ---------------------------------------------------------------------------
-# Слушатель входящих ЛС на userbot-аккаунтах
+# ===========================================================================
+#  Слушатель входящих ЛС с жёсткой защитой от спама
 # ===========================================================================
 
 def attach_incoming_listener(client: Client, acc_id: str):
     """
     Вешаем хендлер входящих ЛС на userbot-клиента.
-    При новом сообщении — уведомление админу в бот.
+    Отправляем уведомление админу ТОЛЬКО если:
+      • ready (прошло INCOMING_WARMUP_SEC после старта клиента);
+      • from_user есть;
+      • from_user.id != admin_id;
+      • from_user.id != me.id;
+      • from_user.is_bot == False;
+      • chat.type == PRIVATE;
+      • not message.outgoing;
+      • не обрабатывали этот msg_id;
+      • кулдаун по from_user.id прошёл (INCOMING_NOTIFY_COOLDOWN_SEC).
     """
+    _incoming_ready[acc_id] = False
+
     @client.on_message(filters.private & ~filters.me, group=100)
     async def _on_incoming(userbot: Client, message):
         try:
-            from_user = message.from_user
-            if not from_user:
+            # 1) warmup
+            if not _incoming_ready.get(acc_id):
                 return
-            # Пропускаем сообщения от самого админа (если он вдруг напишет)
-            if int(from_user.id) == int(CFG.get("admin_id", 0)):
+
+            # 2) базовая валидация
+            if message.outgoing:
                 return
+            if not message.from_user:
+                return
+            if message.chat is None or message.chat.type != ChatType.PRIVATE:
+                return
+
+            fu = message.from_user
+            if getattr(fu, "is_bot", False):
+                return
+            if int(fu.id) == int(CFG.get("admin_id", 0)):
+                return
+            my_id = ME_IDS.get(acc_id)
+            if my_id is not None and int(fu.id) == int(my_id):
+                return
+
+            # 3) защита от дублей (несколько userbot-клиентов могут ловить одно и то же)
+            key = (acc_id, int(message.id))
+            if key in _handled_message_ids:
+                return
+            _handled_message_ids.add(key)
+            if len(_handled_message_ids) > 5000:
+                _handled_message_ids.clear()
+                _handled_message_ids.add(key)
+
+            # 4) кулдаун по пользователю
+            now_ts = time.time()
+            uid_key = str(fu.id)
+            last = _last_notify_by_user.get(uid_key, 0)
+            if now_ts - last < INCOMING_NOTIFY_COOLDOWN_SEC:
+                # тихо записываем в статистику, но уведомление не шлём
+                text = message.text or message.caption or "<медиа>"
+                name = (fu.first_name or "") + (f" {fu.last_name}" if fu.last_name else "")
+                register_incoming(int(fu.id), name.strip(), fu.username or "", text)
+                return
+            _last_notify_by_user[uid_key] = now_ts
+
             text = message.text or message.caption or "<медиа>"
-            name = (from_user.first_name or "") + (
-                f" {from_user.last_name}" if from_user.last_name else "")
-            username = from_user.username or ""
-            is_new_today = register_incoming(
-                int(from_user.id), name.strip(), username, text)
+            name = (fu.first_name or "") + (f" {fu.last_name}" if fu.last_name else "")
+            username = fu.username or ""
+            is_new_today = register_incoming(int(fu.id), name.strip(), username, text)
 
             acc = get_account(acc_id) or {}
             acc_name = acc.get("name") or acc_id
 
-            # Ссылка на профиль
             if username:
                 profile = f"https://t.me/{username}"
             else:
-                profile = f"tg://user?id={from_user.id}"
+                profile = f"tg://user?id={fu.id}"
 
             header = "🆕 **Новое ЛС!**" if is_new_today else "💬 Новое сообщение"
             try:
@@ -1095,7 +1137,7 @@ def attach_incoming_listener(client: Client, acc_id: str):
                     f"{header}\n"
                     f"👤 {name or '—'}"
                     f"{' (@' + username + ')' if username else ''}\n"
-                    f"🆔 `{from_user.id}`\n"
+                    f"🆔 `{fu.id}`\n"
                     f"📥 Аккаунт: **{acc_name}**\n"
                     f"🔗 [Открыть профиль]({profile})\n\n"
                     f"✉️ {(text or '')[:500]}",
@@ -1106,6 +1148,12 @@ def attach_incoming_listener(client: Client, acc_id: str):
                 log.warning(f"incoming notify: {e}")
         except Exception:
             log.exception("incoming listener")
+
+
+async def _mark_incoming_ready(acc_id: str, delay: int = INCOMING_WARMUP_SEC):
+    await asyncio.sleep(delay)
+    _incoming_ready[acc_id] = True
+    log.info(f"[{acc_id}] incoming listener ready (warmup={delay}s)")
 
 
 # ===========================================================================
@@ -1155,7 +1203,10 @@ async def try_start_existing_clients():
                 acc["user_id"] = me.id
                 acc["username"] = me.username
                 log.info(f"✅ [{acc.get('name')}] {me.first_name} id={me.id}")
+
                 attach_incoming_listener(c, acc_id)
+                asyncio.create_task(_mark_incoming_ready(acc_id))
+
                 if acc.get("running"):
                     start_mailing_for_account(acc_id)
                 if acc.get("subscribe_status") == "running":
@@ -1331,8 +1382,6 @@ def account_text(acc_id: str) -> str:
     )
 
 
-# ---------------- Список групп ----------------
-
 def _fmt_group_line(idx: int, g: dict) -> str:
     title = (g.get("title") or str(g.get("id")))[:40]
     gtype = (g.get("type") or "?").lower()
@@ -1418,8 +1467,6 @@ def groups_clear_confirm_kb(acc_id: str) -> InlineKeyboardMarkup:
     ])
 
 
-# ---------------- Исключённые ----------------
-
 def excluded_kb(acc_id: str, page: int = 0) -> InlineKeyboardMarkup:
     acc = get_account(acc_id)
     items = acc.get("excluded") or []
@@ -1476,8 +1523,6 @@ def excluded_text(acc_id: str, page: int = 0) -> str:
     return "\n".join(lines)
 
 
-# ---------------- Проблемные ----------------
-
 def problem_kb(acc_id: str, page: int = 0) -> InlineKeyboardMarkup:
     acc = get_account(acc_id)
     items = acc.get("problem") or []
@@ -1530,7 +1575,7 @@ def problem_text(acc_id: str, page: int = 0) -> str:
     page_items = items[start:end]
 
     lines = [f"⚠️ **Проблемные группы** ({acc.get('name')}) — всего {total}\n",
-             "_Сюда попадают группы, куда не удалось отправить. Тап — очистить проблему._\n"]
+             "_Сюда попадают группы, куда не удалось отправить. Тап — очистить._\n"]
     if not total:
         lines.append("_Пусто. Отлично!_")
     else:
@@ -1547,8 +1592,6 @@ def problem_text(acc_id: str, page: int = 0) -> str:
                 f"      _ошибка:_ {err}")
     return "\n".join(lines)
 
-
-# ---------------- Меню «Отписи» ----------------
 
 def incoming_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -1567,7 +1610,7 @@ def incoming_menu_text() -> str:
     total_users = len(STATE.get("incoming_users") or {})
     return (
         "📈 **Отписи (входящие ЛС)**\n\n"
-        f"• Сегодня: новых **{day['new']}**, всего сообщений {day['messages']}\n"
+        f"• Сегодня: новых **{day['new']}**, сообщений {day['messages']}\n"
         f"• За 7 дней: новых **{week['new']}**, сообщений {week['messages']}\n"
         f"• За 30 дней: новых **{month['new']}**, сообщений {month['messages']}\n\n"
         f"👥 Всего уникальных: **{total_users}**\n\n"
@@ -1621,8 +1664,6 @@ def incoming_last_text(page: int = 0) -> str:
                 f"   ✉️ {(item.get('text') or '')[:200]}")
     return "\n".join(lines)
 
-
-# ---------------- Подписка ----------------
 
 def subscribe_menu_kb(acc_id: str) -> InlineKeyboardMarkup:
     acc = get_account(acc_id)
@@ -1796,6 +1837,7 @@ async def _handle_pending(client, message, uid, act):
             user_clients[acc["id"]] = new_c
             ME_IDS[acc["id"]] = me.id
             attach_incoming_listener(new_c, acc["id"])
+            asyncio.create_task(_mark_incoming_ready(acc["id"]))
             await message.reply(f"✅ **{name}** (id={me.id}).",
                                 reply_markup=main_menu_kb())
         except (AuthKeyUnregistered, AuthKeyDuplicated, UserDeactivated, SessionRevoked) as e:
@@ -1884,6 +1926,7 @@ async def _handle_pending(client, message, uid, act):
         user_clients[acc["id"]] = new_c
         ME_IDS[acc["id"]] = me.id
         attach_incoming_listener(new_c, acc["id"])
+        asyncio.create_task(_mark_incoming_ready(acc["id"]))
         await message.reply(f"✅ **{name}**", reply_markup=main_menu_kb())
         return
 
@@ -1909,6 +1952,7 @@ async def _handle_pending(client, message, uid, act):
         user_clients[acc["id"]] = new_c
         ME_IDS[acc["id"]] = me.id
         attach_incoming_listener(new_c, acc["id"])
+        asyncio.create_task(_mark_incoming_ready(acc["id"]))
         await message.reply(f"✅ **{name}**", reply_markup=main_menu_kb())
         return
 
@@ -2129,7 +2173,6 @@ async def _handle_pending(client, message, uid, act):
         if any(g["id"] == gid for g in acc["groups"]):
             await message.reply("⚠️ Уже в списке.")
             return
-        # Если была в исключениях — убираем
         remove_from_excluded(acc, gid)
         acc["groups"].append(build_group_record(chat, manual=True))
         save_json(STATE_FILE, STATE)
@@ -2267,7 +2310,6 @@ def register_handlers(bot: Client) -> None:
             return
         data = cb.data or ""
         try:
-            # ------- главное меню -------
             if data == "menu":
                 await cb.message.edit_text("🎛 Панель:", reply_markup=main_menu_kb())
             elif data == "noop":
@@ -2279,25 +2321,21 @@ def register_handlers(bot: Client) -> None:
             elif data == "stats_menu":
                 await cb.message.edit_text(stats_menu_text(), reply_markup=stats_menu_kb())
 
-            # ------- отписи -------
             elif data == "incoming_menu":
                 await cb.message.edit_text(incoming_menu_text(),
                                             reply_markup=incoming_menu_kb())
             elif data == "incoming_day":
                 s = stats_for_period(1)
-                await cb.answer(
-                    f"Сегодня: {s['new']} новых, {s['messages']} сообщений",
-                    show_alert=True)
+                await cb.answer(f"Сегодня: {s['new']} новых, {s['messages']} сообщений",
+                                show_alert=True)
             elif data == "incoming_week":
                 s = stats_for_period(7)
-                await cb.answer(
-                    f"7 дней: {s['new']} новых, {s['messages']} сообщений",
-                    show_alert=True)
+                await cb.answer(f"7 дней: {s['new']} новых, {s['messages']} сообщений",
+                                show_alert=True)
             elif data == "incoming_month":
                 s = stats_for_period(30)
-                await cb.answer(
-                    f"30 дней: {s['new']} новых, {s['messages']} сообщений",
-                    show_alert=True)
+                await cb.answer(f"30 дней: {s['new']} новых, {s['messages']} сообщений",
+                                show_alert=True)
             elif data.startswith("incoming_last:"):
                 try:
                     page = int(data.split(":", 1)[1])
@@ -2306,14 +2344,12 @@ def register_handlers(bot: Client) -> None:
                 await cb.message.edit_text(incoming_last_text(page),
                                             reply_markup=incoming_last_kb(page))
 
-            # ------- добавление аккаунта -------
             elif data == "acc_add":
                 pending[uid] = {"action": "acc_add_phone"}
                 await cb.message.edit_text(
                     "➕ Номер в формате `+79991234567`.\n/cancel",
                     parse_mode=enums.ParseMode.MARKDOWN)
 
-            # ------- карточка аккаунта -------
             elif data.startswith("acc_open:"):
                 acc_id = data.split(":", 1)[1]
                 if not get_account(acc_id):
@@ -2429,7 +2465,6 @@ def register_handlers(bot: Client) -> None:
                 pending[uid] = {"action": "acc_settyping", "acc_id": acc_id}
                 await cb.message.edit_text("Секунд «печатает…» (1–60):\n/cancel")
 
-            # ------- скан -------
             elif data.startswith("acc_scan:"):
                 acc_id = data.split(":", 1)[1]
                 c = user_clients.get(acc_id)
@@ -2452,7 +2487,6 @@ def register_handlers(bot: Client) -> None:
                     f"🚫 Пропущено исключённых: {len(acc.get('excluded') or [])}",
                     reply_markup=groups_list_kb(acc_id, 0))
 
-            # ------- список групп -------
             elif data.startswith("acc_grp_list:"):
                 _, acc_id, page_s = data.split(":", 2)
                 try:
@@ -2532,7 +2566,6 @@ def register_handlers(bot: Client) -> None:
                 await cb.message.edit_text(groups_list_text(acc_id, 0),
                                             reply_markup=groups_list_kb(acc_id, 0))
 
-            # ------- исключённые -------
             elif data.startswith("acc_grp_excl:"):
                 _, acc_id, page_s = data.split(":", 2)
                 try:
@@ -2559,7 +2592,6 @@ def register_handlers(bot: Client) -> None:
                 if not acc:
                     await cb.answer()
                     return
-                # Находим в excluded
                 item = next((x for x in (acc.get("excluded") or [])
                              if str(x.get("id")) == str(gid)), None)
                 if item:
@@ -2596,7 +2628,6 @@ def register_handlers(bot: Client) -> None:
                 await cb.message.edit_text(excluded_text(acc_id, 0),
                                             reply_markup=excluded_kb(acc_id, 0))
 
-            # ------- проблемные -------
             elif data.startswith("acc_grp_prob:"):
                 _, acc_id, page_s = data.split(":", 2)
                 try:
@@ -2651,7 +2682,6 @@ def register_handlers(bot: Client) -> None:
                 prob = list(acc.get("problem") or [])
                 for p in prob:
                     add_to_excluded(acc, p)
-                # Убираем эти группы из основного списка
                 prob_ids = {str(p.get("id")) for p in prob}
                 acc["groups"] = [g for g in (acc.get("groups") or [])
                                  if str(g.get("id")) not in prob_ids]
@@ -2661,7 +2691,6 @@ def register_handlers(bot: Client) -> None:
                 await cb.message.edit_text(account_text(acc_id),
                                             reply_markup=account_kb(acc_id))
 
-            # ------- добавить группу -------
             elif data.startswith("acc_addgrp:"):
                 acc_id = data.split(":", 1)[1]
                 pending[uid] = {"action": "acc_addgrp", "acc_id": acc_id}
@@ -2670,7 +2699,6 @@ def register_handlers(bot: Client) -> None:
                     "_(каналы и личка не принимаются)_\n/cancel",
                     parse_mode=enums.ParseMode.MARKDOWN)
 
-            # ------- прочее про аккаунт -------
             elif data.startswith("acc_setmain:"):
                 acc_id = data.split(":", 1)[1]
                 if get_account(acc_id):
@@ -2712,7 +2740,6 @@ def register_handlers(bot: Client) -> None:
                 await cb.message.edit_text(accounts_menu_text(),
                                             reply_markup=accounts_menu_kb())
 
-            # ------- подписка -------
             elif data.startswith("acc_sub_menu:"):
                 acc_id = data.split(":", 1)[1]
                 if not get_account(acc_id):
