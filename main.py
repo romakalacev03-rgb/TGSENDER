@@ -2440,7 +2440,7 @@ async def _handle_pending(client, message, uid, act):
             f"✅ Добавлено в очередь: {added}. Всего: {len(existing_q)}.",
             reply_markup=subscribe_menu_kb(acc_id))
              return
-         if action == "acc_sub_delay":
+        if action == "acc_sub_delay":
         pending.pop(uid, None)
         acc_id = act["acc_id"]
         acc = get_account(acc_id)
