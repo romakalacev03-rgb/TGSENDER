@@ -78,9 +78,8 @@ TEXTS_PER_PAGE = 5
 INCOMING_NOTIFY_COOLDOWN_SEC = 300
 INCOMING_WARMUP_SEC = 3
 
-# Рандомизация таймингов между отправками
-SHORT_PAUSE_PROB = 0.85          # 85% — короткая пауза delay_min..delay_max
-LONG_PAUSE_EVERY_MIN = 8         # каждые N отправок — длинная пауза
+SHORT_PAUSE_PROB = 0.85
+LONG_PAUSE_EVERY_MIN = 8
 LONG_PAUSE_EVERY_MAX = 15
 LONG_PAUSE_MIN = 45
 LONG_PAUSE_MAX = 180
@@ -117,10 +116,6 @@ DEVICE_PARAMS = {
     "lang_code": "ru",
 }
 
-
-# ===========================================================================
-#  Утилиты
-# ===========================================================================
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -222,31 +217,11 @@ def build_group_record(chat, manual: bool = False) -> dict:
     }
 
 
-# ===========================================================================
-#  ПРОКСИ
-# ===========================================================================
-
-# Записи в account["proxy"]:
-#   {"enabled": bool, "type": "socks5"|"http"|"mtproxy",
-#    "host": "...", "port": 1080, "username": "", "password": "", "secret": ""}
-
 def parse_proxy_line(line: str) -> dict:
-    """
-    Поддерживает:
-      socks5://user:pass@host:port
-      socks5://host:port
-      http://user:pass@host:port
-      https://host:port
-      mtproxy://secret@host:port
-      host:port:user:pass      (для socks5)
-      host:port
-    Возвращает dict или бросит ValueError.
-    """
     s = (line or "").strip()
     if not s:
         raise ValueError("пустая строка")
 
-    # URL-формат
     m = re.match(r"^(socks5|http|https|mtproxy)://(.+)$", s, re.IGNORECASE)
     if m:
         scheme = m.group(1).lower()
@@ -269,12 +244,9 @@ def parse_proxy_line(line: str) -> dict:
 
         if scheme == "mtproxy":
             return {
-                "enabled": True,
-                "type": "mtproxy",
-                "host": host,
-                "port": port,
-                "username": "",
-                "password": "",
+                "enabled": True, "type": "mtproxy",
+                "host": host, "port": port,
+                "username": "", "password": "",
                 "secret": secret or "",
             }
 
@@ -287,14 +259,11 @@ def parse_proxy_line(line: str) -> dict:
         return {
             "enabled": True,
             "type": "http" if scheme in ("http", "https") else "socks5",
-            "host": host,
-            "port": port,
-            "username": username,
-            "password": password,
+            "host": host, "port": port,
+            "username": username, "password": password,
             "secret": "",
         }
 
-    # host:port[:user:pass]
     parts = s.split(":")
     if len(parts) == 2:
         host, port_s = parts
@@ -310,18 +279,14 @@ def parse_proxy_line(line: str) -> dict:
     if not (1 <= port <= 65535):
         raise ValueError("порт вне диапазона")
     return {
-        "enabled": True,
-        "type": "socks5",
-        "host": host,
-        "port": port,
-        "username": user,
-        "password": pwd,
+        "enabled": True, "type": "socks5",
+        "host": host, "port": port,
+        "username": user, "password": pwd,
         "secret": "",
     }
 
 
 def proxy_dict_for_pyrogram(proxy: dict):
-    """Pyrogram 2.x понимает: socks5/http/mtproxy — словарь."""
     if not proxy or not proxy.get("enabled"):
         return None
     try:
@@ -329,9 +294,8 @@ def proxy_dict_for_pyrogram(proxy: dict):
         host = proxy["host"]
         port = int(proxy["port"])
         if ptype == "mtproxy":
-            d = {"scheme": "mtproxy", "hostname": host, "port": port,
-                 "secret": proxy.get("secret") or ""}
-            return d
+            return {"scheme": "mtproxy", "hostname": host, "port": port,
+                    "secret": proxy.get("secret") or ""}
         d = {"scheme": ptype, "hostname": host, "port": port}
         if proxy.get("username"):
             d["username"] = proxy["username"]
@@ -348,10 +312,6 @@ def proxy_is_active_for_account(acc: dict) -> bool:
     p = (acc or {}).get("proxy") or {}
     return bool(p.get("enabled") and p.get("host") and p.get("port"))
 
-
-# ===========================================================================
-#  БАЗА / JSON
-# ===========================================================================
 
 def load_json(path: str, default):
     if os.path.exists(path):
@@ -386,10 +346,6 @@ async def db_init():
         await db.commit()
 
 
-# ===========================================================================
-#  КОНФИГ
-# ===========================================================================
-
 ENV_MAP = {
     "API_ID": ("api_id", int),
     "API_HASH": ("api_hash", str),
@@ -419,7 +375,7 @@ def load_cfg() -> dict:
             cfg["api_id"] = int(cfg["api_id"])
     except Exception:
         pass
-    cfg.setdefault("proxy_enabled", False)  # глобальный выключатель
+    cfg.setdefault("proxy_enabled", False)
     return cfg
 
 
@@ -469,41 +425,28 @@ def make_client(session_name_or_string: str, proxy: dict = None) -> Client:
     )
 
 
-# ===========================================================================
-#  STATE
-# ===========================================================================
-
 def _new_account(name: str, session_name: str) -> dict:
     return {
         "id": f"acc_{int(datetime.now().timestamp() * 1000)}_{random.randint(100, 999)}",
         "name": name, "session_name": session_name, "session_string": "",
         "user_id": None, "username": None,
-
-        # базовый (не используется, если есть пул текстов)
         "text": "", "text_entities": [],
         "caption": "", "caption_entities": [],
         "media_path": None, "media_type": None,
-
-        # пул текстов: список {text, entities, media_path, media_type, caption, caption_entities}
         "text_pool": [],
         "pool_index": 0,
-        "rotate_every": 17,     # каждые N сообщений меняем вариант
-
+        "rotate_every": 17,
         "source_chat_id": None, "source_message_id": None,
         "groups": [], "excluded": [], "problem": [],
         "running": False,
         "interval": 1800, "delay_min": 5, "delay_max": 15,
         "typing_seconds": DEFAULT_TYPING_SECONDS,
-
         "stats": {"sent": 0, "errors": 0, "rounds": 0,
                   "last_round": None, "next_round": None},
-
         "subscribe_queue": [], "subscribe_status": "idle",
         "subscribe_delay_min": 40, "subscribe_delay_max": 120,
         "subscribe_stats": {"subscribed": 0, "skipped": 0, "errors": 0,
                             "started_at": None},
-
-        # прокси для аккаунта (используется только если CFG["proxy_enabled"] == True)
         "proxy": {"enabled": False, "type": "socks5",
                   "host": "", "port": 0,
                   "username": "", "password": "", "secret": ""},
@@ -702,10 +645,6 @@ def parse_index_list(text: str) -> list:
     return sorted(i for i in out if i > 0)
 
 
-# ---------------------------------------------------------------------------
-#  Проблемные/исключённые
-# ---------------------------------------------------------------------------
-
 def _group_key(g: dict) -> str:
     return str(g.get("id") or "")
 
@@ -773,10 +712,6 @@ def clear_problem(acc: dict, gid) -> bool:
                       if str(x.get("id")) != key]
     return len(acc["problem"]) != before
 
-
-# ---------------------------------------------------------------------------
-#  Учёт входящих ЛС
-# ---------------------------------------------------------------------------
 
 def register_incoming(user_id: int, name: str, username: str, text: str) -> bool:
     users = STATE.setdefault("incoming_users", {})
@@ -847,19 +782,13 @@ def stats_for_period(days: int) -> dict:
     return {"new": new_total, "messages": msg_total, "unique_users": len(unique_users)}
 
 
-# ===========================================================================
-#  Ротация текста
-# ===========================================================================
-
 def account_has_content(acc: dict) -> bool:
     return bool(acc.get("text") or acc.get("media_path") or acc.get("text_pool"))
 
 
 def current_pool_item(acc: dict) -> dict:
-    """Возвращает элемент пула для текущей отправки (учитывая rotate_every)."""
     pool = acc.get("text_pool") or []
     if not pool:
-        # fallback на базовые поля
         return {
             "text": acc.get("text") or "",
             "text_entities": acc.get("text_entities") or [],
@@ -877,10 +806,6 @@ def current_pool_item(acc: dict) -> dict:
     acc["pool_index"] = idx
     return pool[idx]
 
-
-# ===========================================================================
-#  Отправка в группы
-# ===========================================================================
 
 async def _send_media(c: Client, chat_id: int, media_path: str, media_type: str,
                       caption: str, caption_entities):
@@ -928,12 +853,6 @@ async def _simulate_typing(c: Client, chat_id: int, base_sec: int) -> None:
 
 
 def _pick_pause_seconds(acc: dict, sent_count_in_round: int) -> float:
-    """
-    Рандомизация таймингов:
-    - 85% короткие паузы delay_min..delay_max с рандомным множителем 1.0..1.6
-    - 15% длинные паузы delay_max*2..delay_max*4
-    - Каждые LONG_PAUSE_EVERY_MIN..MAX отправок — «человеческая» длинная пауза
-    """
     lo = max(1, int(acc.get("delay_min", 5)))
     hi = max(lo, int(acc.get("delay_max", 15)))
 
@@ -1000,8 +919,7 @@ async def send_post_for_account(acc_id: str, chat_id: int) -> None:
     raise ValueError("Не задан ни источник, ни текст, ни медиа")
 
 
-async def _store_from_message(acc: dict, message, acc_id: str) -> bool:
-    """Сохраняет сообщение в 'пул' (или в базовые поля если пул пуст)."""
+async def _store_from_message(acc: dict, message, acc_id: str) -> dict:
     msg_text = message.text or message.caption or ""
     msg_entities = message.entities or message.caption_entities or []
     entities_json = entities_to_json(msg_entities)
@@ -1051,7 +969,6 @@ async def _store_from_message(acc: dict, message, acc_id: str) -> bool:
 async def _store_pool_item(acc: dict, item: dict):
     acc["text_pool"].append(item)
     if len(acc["text_pool"]) > 8:
-        # Ограничим максимум 8 вариантов
         acc["text_pool"] = acc["text_pool"][-8:]
         acc["pool_index"] = 0
     save_json(STATE_FILE, STATE)
@@ -1096,7 +1013,6 @@ async def mailing_loop_for_account(acc_id: str):
                 mark_problem(acc, g, str(e))
             save_json(STATE_FILE, STATE)
 
-            # Рандомизированная пауза
             pause = _pick_pause_seconds(acc, sent_in_round)
             try:
                 await asyncio.sleep(pause)
@@ -1163,10 +1079,6 @@ async def scan_groups_for_account(acc_id: str) -> tuple:
              f"skipped={skipped} excluded={excluded_hit}")
     return found, skipped
 
-
-# ---------------------------------------------------------------------------
-# Массовая подписка
-# ---------------------------------------------------------------------------
 
 async def subscribe_one_group(client: Client, ref):
     try:
@@ -1269,10 +1181,6 @@ def start_subscribe(acc_id: str):
         subscribe_tasks[acc_id] = asyncio.create_task(subscribe_loop(acc_id))
 
 
-# ===========================================================================
-#  Слушатель входящих ЛС с антиспамом
-# ===========================================================================
-
 def attach_incoming_listener(client: Client, acc_id: str):
     _incoming_ready[acc_id] = False
 
@@ -1353,10 +1261,6 @@ async def _mark_incoming_ready(acc_id: str, delay: int = INCOMING_WARMUP_SEC):
     _incoming_ready[acc_id] = True
     log.info(f"[{acc_id}] incoming listener ready (warmup={delay}s)")
 
-
-# ===========================================================================
-#  Логин
-# ===========================================================================
 
 async def start_userbot_clients():
     accounts = STATE.get("accounts") or []
@@ -1440,10 +1344,6 @@ async def try_start_existing_clients():
                 pass
     save_json(STATE_FILE, STATE)
 
-
-# ===========================================================================
-#  Клавиатуры
-# ===========================================================================
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     accounts = STATE.get("accounts") or []
@@ -1618,8 +1518,6 @@ def account_text(acc_id: str) -> str:
     )
 
 
-# ---------------- Пул текстов ----------------
-
 def pool_kb(acc_id: str, page: int = 0) -> InlineKeyboardMarkup:
     acc = get_account(acc_id)
     pool = acc.get("text_pool") or []
@@ -1691,8 +1589,6 @@ def pool_clear_confirm_kb(acc_id: str) -> InlineKeyboardMarkup:
     ])
 
 
-# ---------------- Прокси ----------------
-
 def proxy_global_kb() -> InlineKeyboardMarkup:
     on = bool(CFG.get("proxy_enabled"))
     return InlineKeyboardMarkup([
@@ -1711,10 +1607,9 @@ def proxy_global_text() -> str:
         "🧦 **Прокси — глобальный переключатель**\n\n"
         f"Сейчас: **{'ВКЛ' if on else 'ВЫКЛ'}**\n"
         f"Аккаунтов с заданным прокси: {with_proxy}/{len(accounts)}\n\n"
-        "_Когда глобально выключено — прокси не применяется ни к одному аккаунту, "
-        "даже если он задан в карточке._\n"
+        "_Когда глобально выключено — прокси не применяется ни к одному аккаунту._\n"
         "_Когда включено — каждый аккаунт подключается через свой прокси "
-        "(если он задан, иначе напрямую)._"
+        "(если задан, иначе напрямую)._"
     )
 
 
@@ -1727,7 +1622,7 @@ def account_proxy_text(acc_id: str) -> str:
     has = proxy_is_active_for_account(acc)
     if has:
         line = (f"✅ `{p.get('type')}://{p.get('host')}:{p.get('port')}`"
-                + (f" (user: {p.get('username')})" if p.get('username') else ""))
+                + (f" (user: {p.get('username')})" if p.get("username") else ""))
     else:
         line = "❌ не задан (напрямую)"
     return (
@@ -1749,8 +1644,6 @@ def account_proxy_kb(acc_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Назад", callback_data=f"acc_open:{acc_id}")],
     ])
 
-
-# ---------------- Список групп / проблемные / исключённые ----------------
 
 def _fmt_group_line(idx: int, g: dict) -> str:
     title = (g.get("title") or str(g.get("id")))[:40]
@@ -1962,8 +1855,6 @@ def problem_text(acc_id: str, page: int = 0) -> str:
     return "\n".join(lines)
 
 
-# ---------------- Отписи ----------------
-
 def incoming_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📅 За сегодня", callback_data="incoming_day")],
@@ -2034,8 +1925,6 @@ def incoming_last_text(page: int = 0) -> str:
                 f"   ✉️ {(item.get('text') or '')[:200]}")
     return "\n".join(lines)
 
-
-# ---------------- Подписка ----------------
 
 def subscribe_menu_kb(acc_id: str) -> InlineKeyboardMarkup:
     acc = get_account(acc_id)
@@ -2138,10 +2027,6 @@ def stats_menu_text() -> str:
     return "\n".join(lines)
 
 
-# ===========================================================================
-#  PENDING
-# ===========================================================================
-
 async def _handle_pending(client, message, uid, act):
     action = act.get("action")
     raw_text = message.text or ""
@@ -2208,8 +2093,10 @@ async def _handle_pending(client, message, uid, act):
         acc = get_account(acc_id)
         try:
             v = int(text)
-            if v < 5: raise ValueError("мин. 5")
-            if v > 100: raise ValueError("макс 100")
+            if v < 5:
+                raise ValueError("мин. 5")
+            if v > 100:
+                raise ValueError("макс 100")
             acc["rotate_every"] = v
             save_json(STATE_FILE, STATE)
             await message.reply(
@@ -2238,9 +2125,7 @@ async def _handle_pending(client, message, uid, act):
         pending.pop(uid, None)
         await message.reply(
             "✅ Прокси сохранён.\n"
-            "⚠️ Чтобы применился — **перезапусти аккаунт**: /panel → "
-            "Аккаунты → аккаунт → Удалить, затем добавь сессию снова. "
-            "Или перезапусти сервис в Amvera.",
+            "⚠️ Чтобы применился — перезапусти сервис или пересоздай аккаунт.",
             reply_markup=account_kb(acc_id))
         return
 
@@ -2296,7 +2181,8 @@ async def _handle_pending(client, message, uid, act):
             await message.reply("❌ Нужно 2 строки: chat_id и message_id.")
             return
         try:
-            chat_id = int(parts[0]); msg_id = int(parts[1])
+            chat_id = int(parts[0])
+            msg_id = int(parts[1])
         except ValueError:
             await message.reply("❌ Только числа.")
             return
@@ -2334,8 +2220,10 @@ async def _handle_pending(client, message, uid, act):
 
     if action == "acc_add_code":
         pending.pop(uid, None)
-        phone = act["phone"]; hash_ = act["hash"]
-        sname = act["session_name"]; new_c: Client = act["client"]
+        phone = act["phone"]
+        hash_ = act["hash"]
+        sname = act["session_name"]
+        new_c: Client = act["client"]
         code = text.replace(" ", "")
         try:
             await new_c.sign_in(phone_number=phone,
@@ -2370,7 +2258,8 @@ async def _handle_pending(client, message, uid, act):
 
     if action == "acc_add_password":
         pending.pop(uid, None)
-        phone = act["phone"]; sname = act["session_name"]
+        phone = act["phone"]
+        sname = act["session_name"]
         new_c: Client = act["client"]
         try:
             await new_c.check_password(text)
@@ -2431,7 +2320,7 @@ async def _handle_pending(client, message, uid, act):
                 existing_q_keys.add(str(ref))
                 added += 1
         acc["subscribe_status"] = "idle"
-                save_json(STATE_FILE, STATE)
+        save_json(STATE_FILE, STATE)
         try:
             await message.react(emoji="👍")
         except Exception:
@@ -2453,10 +2342,14 @@ async def _handle_pending(client, message, uid, act):
             await message.reply("❌ Нужно 2 числа (мин и макс).")
             return
         try:
-            lo = int(parts[0]); hi = int(parts[1])
-            if lo < 5: raise ValueError("мин. 5")
-            if hi < lo: raise ValueError("макс >= мин")
-            if hi > 1800: raise ValueError("макс 1800")
+            lo = int(parts[0])
+            hi = int(parts[1])
+            if lo < 5:
+                raise ValueError("мин. 5")
+            if hi < lo:
+                raise ValueError("макс >= мин")
+            if hi > 1800:
+                raise ValueError("макс 1800")
         except Exception as e:
             await message.reply(f"❌ {e}")
             return
@@ -2536,7 +2429,8 @@ async def _handle_pending(client, message, uid, act):
         acc = get_account(act["acc_id"])
         try:
             v = int(text)
-            if v < 60: raise ValueError("мин. 60")
+            if v < 60:
+                raise ValueError("мин. 60")
             acc["interval"] = v
             save_json(STATE_FILE, STATE)
             await message.reply(f"✅ Интервал: {v}с.", reply_markup=account_kb(acc["id"]))
@@ -2549,7 +2443,8 @@ async def _handle_pending(client, message, uid, act):
         acc = get_account(act["acc_id"])
         try:
             v = int(text)
-            if v < 1: raise ValueError("мин. 1")
+            if v < 1:
+                raise ValueError("мин. 1")
             acc["delay_min"] = v
             if acc["delay_max"] < v:
                 acc["delay_max"] = v
@@ -2578,7 +2473,8 @@ async def _handle_pending(client, message, uid, act):
         acc = get_account(act["acc_id"])
         try:
             v = int(text)
-            if v < 1 or v > 60: raise ValueError("1–60")
+            if v < 1 or v > 60:
+                raise ValueError("1–60")
             acc["typing_seconds"] = v
             save_json(STATE_FILE, STATE)
             await message.reply(
@@ -2656,10 +2552,6 @@ async def _handle_pending(client, message, uid, act):
     pending.pop(uid, None)
     await message.reply("⚠️ Действие устарело, начни заново через /panel.")
 
-
-# ===========================================================================
-#  РЕГИСТРАЦИЯ ХЕНДЛЕРОВ БОТА
-# ===========================================================================
 
 def register_handlers(bot: Client) -> None:
     admin_id = int(CFG["admin_id"])
@@ -2762,7 +2654,6 @@ def register_handlers(bot: Client) -> None:
             elif data == "stats_menu":
                 await cb.message.edit_text(stats_menu_text(), reply_markup=stats_menu_kb())
 
-            # ================= ПРОКСИ (глобально) =================
             elif data == "proxy_global_menu":
                 await cb.message.edit_text(proxy_global_text(),
                                             reply_markup=proxy_global_kb())
@@ -2773,7 +2664,6 @@ def register_handlers(bot: Client) -> None:
                 await cb.message.edit_text(proxy_global_text(),
                                             reply_markup=proxy_global_kb())
 
-            # ================= ОТПИСИ =================
             elif data == "incoming_menu":
                 await cb.message.edit_text(incoming_menu_text(),
                                             reply_markup=incoming_menu_kb())
@@ -2803,7 +2693,6 @@ def register_handlers(bot: Client) -> None:
                     "➕ Номер в формате `+79991234567`.\n/cancel",
                     parse_mode=enums.ParseMode.MARKDOWN)
 
-            # ================= КАРТОЧКА АККАУНТА =================
             elif data.startswith("acc_open:"):
                 acc_id = data.split(":", 1)[1]
                 if not get_account(acc_id):
@@ -2832,7 +2721,6 @@ def register_handlers(bot: Client) -> None:
                 await cb.answer()
                 await cb.message.edit_text(account_text(acc_id), reply_markup=account_kb(acc_id))
 
-            # ================= ПРОКСИ АККАУНТА =================
             elif data.startswith("acc_proxy:"):
                 acc_id = data.split(":", 1)[1]
                 if not get_account(acc_id):
@@ -2863,7 +2751,6 @@ def register_handlers(bot: Client) -> None:
                 await cb.message.edit_text(account_proxy_text(acc_id),
                                             reply_markup=account_proxy_kb(acc_id))
 
-            # ================= ПУЛ ТЕКСТОВ =================
             elif data.startswith("acc_pool:"):
                 parts = data.split(":")
                 acc_id = parts[1]
@@ -2893,7 +2780,8 @@ def register_handlers(bot: Client) -> None:
                     return
                 acc_id = parts[1]
                 try:
-                    idx = int(parts[2]); page = int(parts[3])
+                    idx = int(parts[2])
+                    page = int(parts[3])
                 except ValueError:
                     await cb.answer()
                     return
@@ -2931,7 +2819,6 @@ def register_handlers(bot: Client) -> None:
                 await cb.message.edit_text(pool_text(acc_id, 0),
                                             reply_markup=pool_kb(acc_id, 0))
 
-            # ================= РОТАЦИЯ =================
             elif data.startswith("acc_rotate:"):
                 acc_id = data.split(":", 1)[1]
                 acc = get_account(acc_id)
@@ -2943,7 +2830,6 @@ def register_handlers(bot: Client) -> None:
                     f"🔄 Сейчас: каждые {acc.get('rotate_every', 17)} отправок.\n"
                     f"Сколько отправок между сменой текста? (5–100)\n/cancel")
 
-            # ================= ИСТОЧНИК (copy) =================
             elif data.startswith("acc_source:"):
                 acc_id = data.split(":", 1)[1]
                 acc = get_account(acc_id)
@@ -3083,7 +2969,8 @@ def register_handlers(bot: Client) -> None:
                     return
                 _, acc_id, gid_s, page_s = parts
                 try:
-                    gid = int(gid_s); page = int(page_s)
+                    gid = int(gid_s)
+                    page = int(page_s)
                 except ValueError:
                     await cb.answer()
                     return
@@ -3162,7 +3049,8 @@ def register_handlers(bot: Client) -> None:
                     return
                 _, acc_id, gid_s, page_s = parts
                 try:
-                    gid = int(gid_s); page = int(page_s)
+                    gid = int(gid_s)
+                    page = int(page_s)
                 except ValueError:
                     await cb.answer()
                     return
@@ -3224,7 +3112,8 @@ def register_handlers(bot: Client) -> None:
                     return
                 _, acc_id, gid_s, page_s = parts
                 try:
-                    gid = int(gid_s); page = int(page_s)
+                    gid = int(gid_s)
+                    page = int(page_s)
                 except ValueError:
                     await cb.answer()
                     return
@@ -3380,10 +3269,6 @@ def register_handlers(bot: Client) -> None:
             except Exception:
                 pass
 
-
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
 
 async def main():
     global CFG, STATE, bot_client
