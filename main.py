@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Мульти-аккаунт автопостер + рассылка + массовая подписка.
+Мульти-аккаунт автопостер + рассылка + массовая подписка + автоответчик.
 Премиум-эмодзи через MessageEntity (CUSTOM_EMOJI).
-Плашки «Переслано» в группах НЕТ.
-Скан/добавление — ТОЛЬКО группы.
-Исключения, проблемные, уведомления о входящих ЛС, статистика отписей.
-Прокси на каждый аккаунт (глобальный вкл/выкл).
-8 вариантов текста с автоподменой каждые 15-20 сообщений.
-Рандомизация таймингов + периодические длинные паузы.
+Глобальный пул текстов (на все аккаунты).
+SQLite-персистентность (аккаунты, пул, тайминги, статистика).
+Активные задачи, массовый запуск, выбор аккаунтов.
+Автоответчик в ЛС когда админ не в сети.
 """
 
 import asyncio
@@ -26,7 +24,7 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, MessageEntity,
 )
-from pyrogram.enums import MessageEntityType, ChatType
+from pyrogram.enums import MessageEntityType, ChatType, UserStatus
 from pyrogram.errors import (
     FloodWait, ChatWriteForbidden, ChatAdminRequired, UserBannedInChannel,
     PeerIdInvalid, UserIsBlocked, ChannelPrivate,
@@ -55,10 +53,8 @@ def _pick_data_dir() -> str:
 
 
 DATA_DIR = _pick_data_dir()
-CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
-STATE_FILE = os.path.join(DATA_DIR, "state.json")
 MEDIA_DIR = os.path.join(DATA_DIR, "media")
-DB_FILE = os.path.join(DATA_DIR, "chat_history.db")
+DB_FILE = os.path.join(DATA_DIR, "bot_data.db")
 SESSION_BOT = os.path.join(DATA_DIR, "control_bot")
 
 try:
@@ -74,6 +70,7 @@ PROBLEM_PER_PAGE = 8
 EXCLUDED_PER_PAGE = 10
 INCOMING_LOG_PER_PAGE = 10
 TEXTS_PER_PAGE = 5
+POOL_MAX = 8
 
 INCOMING_NOTIFY_COOLDOWN_SEC = 300
 INCOMING_WARMUP_SEC = 3
@@ -84,13 +81,15 @@ LONG_PAUSE_EVERY_MAX = 15
 LONG_PAUSE_MIN = 45
 LONG_PAUSE_MAX = 180
 
+DEFAULT_REPLY_COOLDOWN = 3600  # 1 час на пользователя
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("autoposter")
-log.info(f"DATA_DIR = {DATA_DIR}")
+log.info(f"DATA_DIR = {DATA_DIR}  DB = {DB_FILE}")
 
 CFG: dict = {}
 STATE: dict = {}
@@ -108,6 +107,8 @@ pending: dict = {}
 _incoming_ready: dict = {}
 _last_notify_by_user: dict = {}
 _handled_message_ids: set = set()
+_last_reply_by_user: dict = {}
+_admin_last_seen: dict = {"ts": 0.0}
 
 DEVICE_PARAMS = {
     "app_version": "9.3.1",
@@ -117,6 +118,9 @@ DEVICE_PARAMS = {
 }
 
 
+# ===========================================================================
+#  УТИЛИТЫ
+# ===========================================================================
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -313,76 +317,6 @@ def proxy_is_active_for_account(acc: dict) -> bool:
     return bool(p.get("enabled") and p.get("host") and p.get("port"))
 
 
-def load_json(path: str, default):
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            log.error(f"Ошибка чтения {path}: {e}")
-    return default
-
-
-def save_json(path: str, data) -> None:
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log.error(f"Ошибка записи {path}: {e}")
-
-
-async def db_init():
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                timestamp TEXT NOT NULL
-            )
-        """)
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_user_id ON messages(user_id)")
-        await db.commit()
-
-
-ENV_MAP = {
-    "API_ID": ("api_id", int),
-    "API_HASH": ("api_hash", str),
-    "BOT_TOKEN": ("bot_token", str),
-    "ADMIN_ID": ("admin_id", int),
-    "PIN": ("pin", str),
-}
-
-
-def load_cfg() -> dict:
-    cfg = load_json(CONFIG_FILE, {}) or {}
-    for env, (key, typ) in ENV_MAP.items():
-        v = os.getenv(env)
-        if v is None or v == "":
-            continue
-        try:
-            cfg[key] = typ(v)
-        except Exception:
-            log.warning(f"Некорректное значение {env}={v!r}")
-    try:
-        if cfg.get("admin_id") is not None:
-            cfg["admin_id"] = int(cfg["admin_id"])
-    except Exception:
-        pass
-    try:
-        if cfg.get("api_id") is not None:
-            cfg["api_id"] = int(cfg["api_id"])
-    except Exception:
-        pass
-    cfg.setdefault("proxy_enabled", False)
-    return cfg
-
-
-def cfg_ok(cfg: dict) -> bool:
-    return all(cfg.get(k) for k in ("api_id", "api_hash", "bot_token", "admin_id"))
-
-
 def validate_session_string(s: str):
     if not s:
         return False, "пустая"
@@ -423,160 +357,6 @@ def make_client(session_name_or_string: str, proxy: dict = None) -> Client:
         lang_code=DEVICE_PARAMS["lang_code"],
         proxy=proxy_arg,
     )
-
-
-def _new_account(name: str, session_name: str) -> dict:
-    return {
-        "id": f"acc_{int(datetime.now().timestamp() * 1000)}_{random.randint(100, 999)}",
-        "name": name, "session_name": session_name, "session_string": "",
-        "user_id": None, "username": None,
-        "text": "", "text_entities": [],
-        "caption": "", "caption_entities": [],
-        "media_path": None, "media_type": None,
-        "text_pool": [],
-        "pool_index": 0,
-        "rotate_every": 17,
-        "source_chat_id": None, "source_message_id": None,
-        "groups": [], "excluded": [], "problem": [],
-        "running": False,
-        "interval": 1800, "delay_min": 5, "delay_max": 15,
-        "typing_seconds": DEFAULT_TYPING_SECONDS,
-        "stats": {"sent": 0, "errors": 0, "rounds": 0,
-                  "last_round": None, "next_round": None},
-        "subscribe_queue": [], "subscribe_status": "idle",
-        "subscribe_delay_min": 40, "subscribe_delay_max": 120,
-        "subscribe_stats": {"subscribed": 0, "skipped": 0, "errors": 0,
-                            "started_at": None},
-        "proxy": {"enabled": False, "type": "socks5",
-                  "host": "", "port": 0,
-                  "username": "", "password": "", "secret": ""},
-    }
-
-
-def default_state() -> dict:
-    return {
-        "accounts": [],
-        "main_account_id": "",
-        "global_stats": {"total_sent": 0, "total_errors": 0, "total_subscribed": 0},
-        "incoming_users": {},
-        "incoming_daily": {},
-        "incoming_log": [],
-    }
-
-
-def load_state() -> dict:
-    raw = load_json(STATE_FILE, {}) or {}
-    st = default_state()
-
-    if isinstance(raw.get("accounts"), list):
-        st["accounts"] = raw["accounts"]
-    st["main_account_id"] = raw.get("main_account_id") or ""
-    if isinstance(raw.get("global_stats"), dict):
-        for k in ("total_sent", "total_errors", "total_subscribed"):
-            st["global_stats"][k] = int(raw["global_stats"].get(k, 0))
-    st["incoming_users"] = raw.get("incoming_users") or {}
-    st["incoming_daily"] = raw.get("incoming_daily") or {}
-    st["incoming_log"] = raw.get("incoming_log") or []
-
-    if not st.get("main_account_id") and st.get("accounts"):
-        st["main_account_id"] = st["accounts"][0]["id"]
-
-    for acc in st.get("accounts") or []:
-        acc.setdefault("session_string", "")
-        acc.setdefault("text", "")
-        acc.setdefault("text_entities", [])
-        acc.setdefault("caption", "")
-        acc.setdefault("caption_entities", [])
-        acc.setdefault("media_path", None)
-        acc.setdefault("media_type", None)
-        acc.setdefault("text_pool", [])
-        acc.setdefault("pool_index", 0)
-        acc.setdefault("rotate_every", 17)
-        acc.setdefault("subscribe_queue", [])
-        acc.setdefault("subscribe_status", "idle")
-        acc.setdefault("subscribe_delay_min", 40)
-        acc.setdefault("subscribe_delay_max", 120)
-        acc.setdefault("subscribe_stats",
-                       {"subscribed": 0, "skipped": 0, "errors": 0, "started_at": None})
-        acc.setdefault("stats", {"sent": 0, "errors": 0, "rounds": 0})
-        acc.setdefault("source_chat_id", None)
-        acc.setdefault("source_message_id", None)
-        acc.setdefault("typing_seconds", DEFAULT_TYPING_SECONDS)
-        acc.setdefault("excluded", [])
-        acc.setdefault("problem", [])
-        if not isinstance(acc.get("proxy"), dict):
-            acc["proxy"] = {"enabled": False, "type": "socks5",
-                            "host": "", "port": 0,
-                            "username": "", "password": "", "secret": ""}
-        else:
-            for k, v in {"enabled": False, "type": "socks5",
-                          "host": "", "port": 0,
-                          "username": "", "password": "", "secret": ""}.items():
-                acc["proxy"].setdefault(k, v)
-        for g in acc.get("groups") or []:
-            g.setdefault("link", "")
-            g.setdefault("username", None)
-
-    st["_bootstrapped"] = raw.get("_bootstrapped", False)
-    return st
-
-
-def bootstrap_default_session():
-    global STATE
-    if not DEFAULT_SESSION_STRING or DEFAULT_SESSION_STRING.startswith("ВСТАВЬ"):
-        return
-    if STATE.get("_bootstrapped"):
-        return
-    if STATE.get("accounts"):
-        STATE["_bootstrapped"] = True
-        save_json(STATE_FILE, STATE)
-        return
-    ok, reason = validate_session_string(DEFAULT_SESSION_STRING)
-    if not ok:
-        log.warning(f"[BOOTSTRAP] DEFAULT_SESSION_STRING невалидна: {reason}")
-        return
-    acc = _new_account("Основной", f"string_{int(datetime.now().timestamp())}")
-    acc["session_string"] = DEFAULT_SESSION_STRING
-    STATE.setdefault("accounts", []).append(acc)
-    STATE["main_account_id"] = acc["id"]
-    STATE["_bootstrapped"] = True
-    save_json(STATE_FILE, STATE)
-    log.info("[BOOTSTRAP] Добавлен аккаунт «Основной»")
-
-
-def get_account(acc_id: str) -> dict:
-    for a in STATE.get("accounts") or []:
-        if a.get("id") == acc_id:
-            return a
-    return {}
-
-
-def add_account(name: str, session_name: str) -> dict:
-    acc = _new_account(name, session_name)
-    STATE.setdefault("accounts", []).append(acc)
-    if not STATE.get("main_account_id"):
-        STATE["main_account_id"] = acc["id"]
-    save_json(STATE_FILE, STATE)
-    return acc
-
-
-def remove_account(acc_id: str) -> bool:
-    accounts = STATE.get("accounts") or []
-    new_list = [a for a in accounts if a.get("id") != acc_id]
-    if len(new_list) == len(accounts):
-        return False
-    STATE["accounts"] = new_list
-    if STATE.get("main_account_id") == acc_id:
-        STATE["main_account_id"] = new_list[0]["id"] if new_list else ""
-    save_json(STATE_FILE, STATE)
-    return True
-
-
-def normalize_group_ref(g) -> str:
-    if isinstance(g, dict):
-        gid = g.get("id")
-        return str(gid) if gid else ""
-    return str(g)
 
 
 def parse_groups_from_text(text: str) -> list:
@@ -649,6 +429,327 @@ def _group_key(g: dict) -> str:
     return str(g.get("id") or "")
 
 
+# ===========================================================================
+#  SQLITE — ПЕРСИСТЕНТНОСТЬ
+# ===========================================================================
+async def db_connect() -> aiosqlite.Connection:
+    db = await aiosqlite.connect(DB_FILE)
+    db.row_factory = aiosqlite.Row
+    return db
+
+
+async def db_init():
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS kv (
+                k TEXT PRIMARY KEY,
+                v TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS accounts (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pool (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS replies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_uid ON messages(user_id);
+        """)
+        await db.commit()
+
+
+async def db_kv_get(key: str, default=None):
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT v FROM kv WHERE k=?", (key,)) as cur:
+            row = await cur.fetchone()
+            if not row:
+                return default
+            try:
+                return json.loads(row[0])
+            except Exception:
+                return default
+
+
+async def db_kv_set(key: str, value):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO kv(k,v) VALUES(?,?) "
+            "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            (key, json.dumps(value, ensure_ascii=False)))
+        await db.commit()
+
+
+async def db_accounts_load() -> list:
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT data FROM accounts ORDER BY rowid") as cur:
+            rows = await cur.fetchall()
+    out = []
+    for r in rows:
+        try:
+            out.append(json.loads(r[0]))
+        except Exception:
+            continue
+    return out
+
+
+async def db_account_upsert(acc: dict):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO accounts(id,name,data) VALUES(?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET name=excluded.name, data=excluded.data",
+            (acc["id"], acc.get("name") or "", json.dumps(acc, ensure_ascii=False)))
+        await db.commit()
+
+
+async def db_account_delete(acc_id: str):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("DELETE FROM accounts WHERE id=?", (acc_id,))
+        await db.commit()
+
+
+async def db_pool_load() -> list:
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT data FROM pool ORDER BY id") as cur:
+            rows = await cur.fetchall()
+    out = []
+    for r in rows:
+        try:
+            out.append(json.loads(r[0]))
+        except Exception:
+            continue
+    return out
+
+
+async def db_pool_add(item: dict):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("INSERT INTO pool(data) VALUES(?)",
+                         (json.dumps(item, ensure_ascii=False),))
+        await db.commit()
+
+
+async def db_pool_delete(idx: int):
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT id FROM pool ORDER BY id LIMIT 1 OFFSET ?",
+                              (idx,)) as cur:
+            row = await cur.fetchone()
+        if row:
+            await db.execute("DELETE FROM pool WHERE id=?", (row[0],))
+            await db.commit()
+
+
+async def db_pool_clear():
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("DELETE FROM pool")
+        await db.commit()
+
+
+async def db_replies_load() -> list:
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT data FROM replies ORDER BY id") as cur:
+            rows = await cur.fetchall()
+    out = []
+    for r in rows:
+        try:
+            out.append(json.loads(r[0]))
+        except Exception:
+            continue
+    return out
+
+
+async def db_replies_add(item: dict):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("INSERT INTO replies(data) VALUES(?)",
+                         (json.dumps(item, ensure_ascii=False),))
+        await db.commit()
+
+
+async def db_replies_delete(idx: int):
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT id FROM replies ORDER BY id LIMIT 1 OFFSET ?",
+                              (idx,)) as cur:
+            row = await cur.fetchone()
+        if row:
+            await db.execute("DELETE FROM replies WHERE id=?", (row[0],))
+            await db.commit()
+
+
+async def db_replies_clear():
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("DELETE FROM replies")
+        await db.commit()
+
+
+async def state_save():
+    """Сохраняет мета-состояние (не аккаунты/пул/реплаи — они в своих таблицах)."""
+    try:
+        meta = {
+            "main_account_id": STATE.get("main_account_id", ""),
+            "global_stats": STATE.get("global_stats", {}),
+            "incoming_users": STATE.get("incoming_users", {}),
+            "incoming_daily": STATE.get("incoming_daily", {}),
+            "incoming_log": STATE.get("incoming_log", []),
+            "proxy_enabled": CFG.get("proxy_enabled", False),
+            "auto_reply_enabled": STATE.get("auto_reply_enabled", False),
+            "auto_reply_cooldown": STATE.get("auto_reply_cooldown", DEFAULT_REPLY_COOLDOWN),
+            "selected_for_bulk": STATE.get("selected_for_bulk", {}),
+            "bootstrapped": STATE.get("_bootstrapped", False),
+        }
+        await db_kv_set("meta", meta)
+    except Exception as e:
+        log.error(f"state_save: {e}")
+
+
+async def save_acc(acc: dict):
+    await db_account_upsert(acc)
+
+
+async def state_load():
+    meta = await db_kv_get("meta", {}) or {}
+    accounts = await db_accounts_load()
+    pool = await db_pool_load()
+    replies = await db_replies_load()
+
+    STATE.clear()
+    STATE.update({
+        "accounts": accounts,
+        "main_account_id": meta.get("main_account_id", ""),
+        "global_stats": meta.get("global_stats", {}) or {},
+        "incoming_users": meta.get("incoming_users", {}) or {},
+        "incoming_daily": meta.get("incoming_daily", {}) or {},
+        "incoming_log": meta.get("incoming_log", []) or [],
+        "auto_reply_enabled": meta.get("auto_reply_enabled", False),
+        "auto_reply_cooldown": meta.get("auto_reply_cooldown", DEFAULT_REPLY_COOLDOWN),
+        "selected_for_bulk": meta.get("selected_for_bulk", {}) or {},
+        "_bootstrapped": meta.get("bootstrapped", False),
+        "pool": pool,
+        "replies": replies,
+    })
+
+    CFG["proxy_enabled"] = meta.get("proxy_enabled", CFG.get("proxy_enabled", False))
+
+    # --- миграция старых per-account пулов в глобальный ---
+    if not pool:
+        migrated = []
+        for acc in accounts:
+            for item in (acc.get("text_pool") or []):
+                migrated.append(item)
+                if len(migrated) >= POOL_MAX:
+                    break
+            if len(migrated) >= POOL_MAX:
+                break
+        if migrated:
+            for item in migrated:
+                await db_pool_add(item)
+            STATE["pool"] = migrated
+            log.info(f"[MIGRATE] перенесено {len(migrated)} текстов в глобальный пул")
+        for acc in accounts:
+            if acc.get("text_pool"):
+                acc["text_pool"] = []
+                await db_account_upsert(acc)
+
+    if not STATE.get("main_account_id") and STATE.get("accounts"):
+        STATE["main_account_id"] = STATE["accounts"][0]["id"]
+
+
+# ===========================================================================
+#  АККАУНТЫ
+# ===========================================================================
+def _new_account(name: str, session_name: str) -> dict:
+    return {
+        "id": f"acc_{int(datetime.now().timestamp() * 1000)}_{random.randint(100, 999)}",
+        "name": name, "session_name": session_name, "session_string": "",
+        "user_id": None, "username": None,
+        "text": "", "text_entities": [],
+        "caption": "", "caption_entities": [],
+        "media_path": None, "media_type": None,
+        "text_pool": [],  # legacy, не используется
+        "source_chat_id": None, "source_message_id": None,
+        "groups": [], "excluded": [], "problem": [],
+        "running": False,
+        "interval": 1800, "delay_min": 5, "delay_max": 15,
+        "typing_seconds": DEFAULT_TYPING_SECONDS,
+        "stats": {"sent": 0, "errors": 0, "rounds": 0,
+                  "last_round": None, "next_round": None},
+        "subscribe_queue": [], "subscribe_status": "idle",
+        "subscribe_delay_min": 40, "subscribe_delay_max": 120,
+        "subscribe_stats": {"subscribed": 0, "skipped": 0, "errors": 0,
+                            "started_at": None},
+        "proxy": {"enabled": False, "type": "socks5",
+                  "host": "", "port": 0,
+                  "username": "", "password": "", "secret": ""},
+    }
+
+
+def get_account(acc_id: str) -> dict:
+    for a in STATE.get("accounts") or []:
+        if a.get("id") == acc_id:
+            return a
+    return {}
+
+
+async def add_account_async(name: str, session_name: str) -> dict:
+    acc = _new_account(name, session_name)
+    STATE.setdefault("accounts", []).append(acc)
+    if not STATE.get("main_account_id"):
+        STATE["main_account_id"] = acc["id"]
+    await db_account_upsert(acc)
+    await state_save()
+    return acc
+
+
+async def remove_account_async(acc_id: str) -> bool:
+    accounts = STATE.get("accounts") or []
+    new_list = [a for a in accounts if a.get("id") != acc_id]
+    if len(new_list) == len(accounts):
+        return False
+    STATE["accounts"] = new_list
+    if STATE.get("main_account_id") == acc_id:
+        STATE["main_account_id"] = new_list[0]["id"] if new_list else ""
+    sel = STATE.setdefault("selected_for_bulk", {})
+    sel.pop(acc_id, None)
+    await db_account_delete(acc_id)
+    await state_save()
+    return True
+
+
+async def bootstrap_default_session():
+    if not DEFAULT_SESSION_STRING or DEFAULT_SESSION_STRING.startswith("ВСТАВЬ"):
+        return
+    if STATE.get("_bootstrapped"):
+        return
+    if STATE.get("accounts"):
+        STATE["_bootstrapped"] = True
+        await state_save()
+        return
+    ok, reason = validate_session_string(DEFAULT_SESSION_STRING)
+    if not ok:
+        log.warning(f"[BOOTSTRAP] DEFAULT_SESSION_STRING невалидна: {reason}")
+        return
+    acc = _new_account("Основной", f"string_{int(datetime.now().timestamp())}")
+    acc["session_string"] = DEFAULT_SESSION_STRING
+    STATE.setdefault("accounts", []).append(acc)
+    STATE["main_account_id"] = acc["id"]
+    STATE["_bootstrapped"] = True
+    await db_account_upsert(acc)
+    await state_save()
+    log.info("[BOOTSTRAP] Добавлен аккаунт «Основной»")
+
+
+# ===========================================================================
+#  ГРУППЫ / ПРОБЛЕМЫ / ИСКЛЮЧЕНИЯ
+# ===========================================================================
 def add_to_excluded(acc: dict, g: dict):
     if not acc or not g:
         return
@@ -713,6 +814,9 @@ def clear_problem(acc: dict, gid) -> bool:
     return len(acc["problem"]) != before
 
 
+# ===========================================================================
+#  ВХОДЯЩИЕ
+# ===========================================================================
 def register_incoming(user_id: int, name: str, username: str, text: str) -> bool:
     users = STATE.setdefault("incoming_users", {})
     daily = STATE.setdefault("incoming_daily", {})
@@ -756,7 +860,6 @@ def register_incoming(user_id: int, name: str, username: str, text: str) -> bool
     if len(log_list) > 300:
         STATE["incoming_log"] = log_list[-300:]
 
-    save_json(STATE_FILE, STATE)
     return is_new_today
 
 
@@ -783,11 +886,11 @@ def stats_for_period(days: int) -> dict:
 
 
 def account_has_content(acc: dict) -> bool:
-    return bool(acc.get("text") or acc.get("media_path") or acc.get("text_pool"))
+    return bool(acc.get("text") or acc.get("media_path") or STATE.get("pool"))
 
 
 def current_pool_item(acc: dict) -> dict:
-    pool = acc.get("text_pool") or []
+    pool = STATE.get("pool") or []
     if not pool:
         return {
             "text": acc.get("text") or "",
@@ -803,10 +906,12 @@ def current_pool_item(acc: dict) -> dict:
     if rotate_every < 1:
         rotate_every = 1
     idx = (sent_total // rotate_every) % len(pool)
-    acc["pool_index"] = idx
     return pool[idx]
 
 
+# ===========================================================================
+#  ОТПРАВКА
+# ===========================================================================
 async def _send_media(c: Client, chat_id: int, media_path: str, media_type: str,
                       caption: str, caption_entities):
     kwargs = {"chat_id": chat_id}
@@ -884,8 +989,8 @@ async def send_post_for_account(acc_id: str, chat_id: int) -> None:
     if src_chat and src_msg:
         try:
             await c.copy_message(chat_id=chat_id,
-                                  from_chat_id=int(src_chat),
-                                  message_id=int(src_msg))
+                                 from_chat_id=int(src_chat),
+                                 message_id=int(src_msg))
             return
         except Exception as e:
             log.warning(f"[{acc.get('name')}] copy_message упал, fallback: {e}")
@@ -919,61 +1024,9 @@ async def send_post_for_account(acc_id: str, chat_id: int) -> None:
     raise ValueError("Не задан ни источник, ни текст, ни медиа")
 
 
-async def _store_from_message(acc: dict, message, acc_id: str) -> dict:
-    msg_text = message.text or message.caption or ""
-    msg_entities = message.entities or message.caption_entities or []
-    entities_json = entities_to_json(msg_entities)
-
-    media_kind = None
-    ext = "bin"
-    if message.photo:
-        media_kind, ext = "photo", "jpg"
-    elif message.video:
-        media_kind, ext = "video", "mp4"
-    elif message.animation:
-        media_kind, ext = "animation", "mp4"
-    elif message.document:
-        name = (message.document.file_name or "file.bin")
-        media_kind, ext = "document", (name.rsplit(".", 1)[-1] or "bin")
-    elif message.audio:
-        name = (message.audio.file_name or "audio.mp3")
-        media_kind, ext = "audio", (name.rsplit(".", 1)[-1] or "mp3")
-    elif message.voice:
-        media_kind, ext = "voice", "ogg"
-
-    if media_kind:
-        path = os.path.join(MEDIA_DIR, f"media_{acc_id}_{int(time.time()*1000)}.{ext}")
-        try:
-            await message.download(file_name=path)
-            return {
-                "text": "",
-                "text_entities": [],
-                "media_path": path,
-                "media_type": media_kind,
-                "caption": msg_text,
-                "caption_entities": entities_json,
-            }
-        except Exception as e:
-            log.warning(f"[{acc.get('name')}] download media упал: {e}")
-
-    return {
-        "text": msg_text,
-        "text_entities": entities_json,
-        "media_path": None,
-        "media_type": None,
-        "caption": "",
-        "caption_entities": [],
-    }
-
-
-async def _store_pool_item(acc: dict, item: dict):
-    acc["text_pool"].append(item)
-    if len(acc["text_pool"]) > 8:
-        acc["text_pool"] = acc["text_pool"][-8:]
-        acc["pool_index"] = 0
-    save_json(STATE_FILE, STATE)
-
-
+# ===========================================================================
+#  РАССЫЛКА
+# ===========================================================================
 async def mailing_loop_for_account(acc_id: str):
     acc = get_account(acc_id)
     if not acc:
@@ -982,7 +1035,7 @@ async def mailing_loop_for_account(acc_id: str):
     while acc.get("running"):
         groups = list(acc.get("groups") or [])
         if not groups:
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
             continue
         sent = errors = 0
         sent_in_round = 0
@@ -1011,7 +1064,7 @@ async def mailing_loop_for_account(acc_id: str):
                 errors += 1
                 acc["stats"]["errors"] = acc["stats"].get("errors", 0) + 1
                 mark_problem(acc, g, str(e))
-            save_json(STATE_FILE, STATE)
+            await db_account_upsert(acc)
 
             pause = _pick_pause_seconds(acc, sent_in_round)
             try:
@@ -1023,14 +1076,15 @@ async def mailing_loop_for_account(acc_id: str):
         acc["stats"]["last_round"] = now_iso()
         STATE["global_stats"]["total_sent"] = STATE["global_stats"].get("total_sent", 0) + sent
         STATE["global_stats"]["total_errors"] = STATE["global_stats"].get("total_errors", 0) + errors
-        save_json(STATE_FILE, STATE)
+        await db_account_upsert(acc)
+        await state_save()
 
         if not acc.get("running"):
             break
         interval = int(acc.get("interval", 1800))
         acc["stats"]["next_round"] = (
             datetime.now() + timedelta(seconds=interval)).isoformat(timespec="seconds")
-        save_json(STATE_FILE, STATE)
+        await db_account_upsert(acc)
         try:
             await bot_client.send_message(
                 CFG["admin_id"],
@@ -1080,6 +1134,9 @@ async def scan_groups_for_account(acc_id: str) -> tuple:
     return found, skipped
 
 
+# ===========================================================================
+#  МАССОВАЯ ПОДПИСКА
+# ===========================================================================
 async def subscribe_one_group(client: Client, ref):
     try:
         chat = await client.join_chat(ref)
@@ -1114,15 +1171,15 @@ async def subscribe_loop(acc_id: str):
     c = user_clients.get(acc_id)
     if not c:
         acc["subscribe_status"] = "error"
-        save_json(STATE_FILE, STATE)
+        await db_account_upsert(acc)
         return
     acc["subscribe_status"] = "running"
-    save_json(STATE_FILE, STATE)
+    await db_account_upsert(acc)
     while acc.get("subscribe_status") == "running":
         queue = acc.get("subscribe_queue") or []
         if not queue:
             acc["subscribe_status"] = "done"
-            save_json(STATE_FILE, STATE)
+            await db_account_upsert(acc)
             break
         ref = queue[0]
         try:
@@ -1151,7 +1208,7 @@ async def subscribe_loop(acc_id: str):
             stats["errors"] += 1
             queue.pop(0)
         acc["subscribe_queue"] = queue
-        save_json(STATE_FILE, STATE)
+        await db_account_upsert(acc)
         if acc.get("subscribe_status") == "running" and queue:
             lo = int(acc.get("subscribe_delay_min", 40))
             hi = int(acc.get("subscribe_delay_max", 120))
@@ -1179,6 +1236,60 @@ def start_subscribe(acc_id: str):
     t = subscribe_tasks.get(acc_id)
     if not t or t.done():
         subscribe_tasks[acc_id] = asyncio.create_task(subscribe_loop(acc_id))
+
+
+# ===========================================================================
+#  ВХОДЯЩИЕ + АВТООТВЕТЧИК
+# ===========================================================================
+def _admin_online() -> bool:
+    ts = _admin_last_seen.get("ts", 0)
+    return (time.time() - ts) < 300  # админ «в сети», если жал кнопки <5 мин назад
+
+
+async def _auto_reply(client: Client, message, acc_id: str):
+    if not STATE.get("auto_reply_enabled"):
+        return
+    replies = STATE.get("replies") or []
+    if not replies:
+        return
+    if _admin_online():
+        return
+    fu = message.from_user
+    if not fu or getattr(fu, "is_bot", False):
+        return
+    if int(fu.id) == int(CFG.get("admin_id", 0)):
+        return
+    uid_key = str(fu.id)
+    now_ts = time.time()
+    last = _last_reply_by_user.get(uid_key, 0)
+    cd = int(STATE.get("auto_reply_cooldown", DEFAULT_REPLY_COOLDOWN) or DEFAULT_REPLY_COOLDOWN)
+    if now_ts - last < cd:
+        return
+    _last_reply_by_user[uid_key] = now_ts
+
+    item = random.choice(replies)
+    text = item.get("text") or ""
+    ents = entities_from_json(item.get("text_entities"))
+    if not text:
+        return
+    try:
+        if ents:
+            await client.send_message(message.chat.id, text, entities=ents)
+        else:
+            try:
+                await client.send_message(message.chat.id, text,
+                                          parse_mode=enums.ParseMode.MARKDOWN)
+            except Exception:
+                await client.send_message(message.chat.id, text)
+        try:
+            await bot_client.send_message(
+                CFG["admin_id"],
+                f"🤖 Автоответ → {fu.first_name or ''} (@{fu.username or '—'})\n"
+                f"Аккаунт: {get_account(acc_id).get('name')}")
+        except Exception:
+            pass
+    except Exception as e:
+        log.warning(f"auto_reply send: {e}")
 
 
 def attach_incoming_listener(client: Client, acc_id: str):
@@ -1215,19 +1326,19 @@ def attach_incoming_listener(client: Client, acc_id: str):
 
             now_ts = time.time()
             uid_key = str(fu.id)
-            last = _last_notify_by_user.get(uid_key, 0)
-            if now_ts - last < INCOMING_NOTIFY_COOLDOWN_SEC:
-                text = message.text or message.caption or "<медиа>"
-                name = (fu.first_name or "") + (f" {fu.last_name}" if fu.last_name else "")
-                register_incoming(int(fu.id), name.strip(), fu.username or "", text)
-                return
-            _last_notify_by_user[uid_key] = now_ts
 
             text = message.text or message.caption or "<медиа>"
             name = (fu.first_name or "") + (f" {fu.last_name}" if fu.last_name else "")
-            username = fu.username or ""
-            is_new_today = register_incoming(int(fu.id), name.strip(), username, text)
+            is_new_today = register_incoming(int(fu.id), name.strip(), fu.username or "", text)
 
+            await _auto_reply(userbot, message, acc_id)
+
+            last = _last_notify_by_user.get(uid_key, 0)
+            if now_ts - last < INCOMING_NOTIFY_COOLDOWN_SEC:
+                return
+            _last_notify_by_user[uid_key] = now_ts
+
+            username = fu.username or ""
             acc = get_account(acc_id) or {}
             acc_name = acc.get("name") or acc_id
 
@@ -1262,6 +1373,9 @@ async def _mark_incoming_ready(acc_id: str, delay: int = INCOMING_WARMUP_SEC):
     log.info(f"[{acc_id}] incoming listener ready (warmup={delay}s)")
 
 
+# ===========================================================================
+#  КЛИЕНТЫ
+# ===========================================================================
 async def start_userbot_clients():
     accounts = STATE.get("accounts") or []
     for acc in accounts:
@@ -1281,7 +1395,7 @@ async def start_userbot_clients():
             else:
                 log.warning(f"[{acc.get('name')}] session_string невалидна: {reason}")
                 acc["session_string"] = ""
-                save_json(STATE_FILE, STATE)
+                await db_account_upsert(acc)
         session_name = acc.get("session_name") or f"userbot_{acc_id}"
         try:
             c = make_client(session_name, proxy=proxy)
@@ -1317,7 +1431,7 @@ async def try_start_existing_clients():
         except asyncio.TimeoutError:
             log.warning(f"[{acc.get('name')}] таймаут — сессия удалена")
             acc["session_string"] = ""
-            save_json(STATE_FILE, STATE)
+            await db_account_upsert(acc)
             try:
                 c.disconnect_handler = None
                 if getattr(c, "network_task", None):
@@ -1329,7 +1443,7 @@ async def try_start_existing_clients():
         except (AuthKeyUnregistered, AuthKeyDuplicated, UserDeactivated, SessionRevoked) as e:
             log.warning(f"[{acc.get('name')}] сессия недействительна: {e}")
             acc["session_string"] = ""
-            save_json(STATE_FILE, STATE)
+            await db_account_upsert(acc)
             try:
                 await c.stop()
             except Exception:
@@ -1342,20 +1456,35 @@ async def try_start_existing_clients():
                     await c.connect()
             except Exception:
                 pass
-    save_json(STATE_FILE, STATE)
+    await state_save()
 
 
+# ===========================================================================
+#  ГЛАВНОЕ МЕНЮ И ЭКРАНЫ
+# ===========================================================================
 def main_menu_kb() -> InlineKeyboardMarkup:
     accounts = STATE.get("accounts") or []
     running_count = sum(1 for a in accounts if a.get("running"))
     subs_count = sum(1 for a in accounts if a.get("subscribe_status") == "running")
     subs_mark = f" 📥{subs_count}" if subs_count else ""
     px_mark = "🟢" if CFG.get("proxy_enabled") else "⚪️"
+    reply_mark = "🤖" if STATE.get("auto_reply_enabled") else "💤"
+    active = running_count + subs_count
+    active_mark = f" ({active})" if active else ""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"📢 Рассылка ({running_count}/{len(accounts)})",
                               callback_data="accounts_menu")],
+        [InlineKeyboardButton(f"🟢 Активные задачи{active_mark}",
+                              callback_data="active_tasks")],
+        [InlineKeyboardButton("🚀 Массовый запуск / выбор",
+                              callback_data="bulk_start_menu")],
         [InlineKeyboardButton(f"📥 Массовая подписка{subs_mark}",
                               callback_data="sub_main")],
+        [InlineKeyboardButton(f"🧩 Пул текстов ({len(STATE.get('pool') or [])})",
+                              callback_data="pool_menu:0")],
+        [InlineKeyboardButton(f"{reply_mark} Автоответчик"
+                              f" ({len(STATE.get('replies') or [])})",
+                              callback_data="reply_menu:0")],
         [InlineKeyboardButton("📈 Отписи", callback_data="incoming_menu")],
         [InlineKeyboardButton(f"{px_mark} Прокси: "
                               f"{'вкл' if CFG.get('proxy_enabled') else 'выкл'}",
@@ -1397,23 +1526,313 @@ def accounts_menu_text() -> str:
             sub_mark = " 📥" if acc.get("subscribe_status") == "running" else ""
             s = acc.get("stats") or {}
             src = "✅" if (acc.get("source_chat_id") and acc.get("source_message_id")) else "❌"
-            has_txt = "🅿️" if acc.get("text_entities") else ""
-            pool_n = len(acc.get("text_pool") or [])
-            pool_s = f"🧩{pool_n}" if pool_n else ""
             px = ""
             if CFG.get("proxy_enabled") and proxy_is_active_for_account(acc):
                 p = acc.get("proxy") or {}
                 px = f" 🧦 {p.get('type')}://{p.get('host')}:{p.get('port')}"
             lines.append(
-                f"{mark} **{i}. {acc.get('name', '?')}**{main_mark}{sub_mark}{pool_s}\n"
+                f"{mark} **{i}. {acc.get('name', '?')}**{main_mark}{sub_mark}\n"
                 f"   Групп: {len(acc.get('groups') or [])} | "
                 f"Искл: {len(acc.get('excluded') or [])} | "
                 f"Пробл: {len(acc.get('problem') or [])}\n"
-                f"   Source: {src}{has_txt} | "
+                f"   Source: {src} | "
                 f"Sent: {s.get('sent', 0)} | ❌{s.get('errors', 0)}{px}")
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+#  АКТИВНЫЕ ЗАДАЧИ
+# ---------------------------------------------------------------------------
+def active_tasks_text() -> str:
+    accounts = STATE.get("accounts") or []
+    lines = ["🟢 **Активные задачи**\n"]
+    active_any = False
+    for acc in accounts:
+        running = acc.get("running")
+        sub_running = acc.get("subscribe_status") == "running"
+        if not running and not sub_running:
+            continue
+        active_any = True
+        s = acc.get("stats") or {}
+        lines.append(f"**{acc.get('name')}**")
+        if running:
+            nxt = s.get("next_round") or "—"
+            lines.append(
+                f"  📢 рассылка: ✅{s.get('sent', 0)} | ❌{s.get('errors', 0)} | "
+                f"кругов {s.get('rounds', 0)}")
+            lines.append(f"     групп: {len(acc.get('groups') or [])} | "
+                         f"след. круг: {nxt}")
+        if sub_running:
+            ss = acc.get("subscribe_stats") or {}
+            qlen = len(acc.get("subscribe_queue") or [])
+            lines.append(
+                f"  📥 подписка: ✅{ss.get('subscribed', 0)} | "
+                f"⏭{ss.get('skipped', 0)} | ❌{ss.get('errors', 0)} | в очереди {qlen}")
+    if not active_any:
+        lines.append("_Нет активных задач. Запусти рассылку или подписку._")
+    else:
+        lines.append("\n_Обновляется по кнопке._")
+    return "\n".join(lines)
+
+
+def active_tasks_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Обновить", callback_data="active_tasks")],
+        [InlineKeyboardButton("⏸ Остановить ВСЁ", callback_data="bulk_stop_all")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
+    ])
+
+
+# ---------------------------------------------------------------------------
+#  МАССОВЫЙ ЗАПУСК + ВЫБОР АККАУНТОВ
+# ---------------------------------------------------------------------------
+def _selected_set() -> set:
+    return set((STATE.get("selected_for_bulk") or {}).keys())
+
+
+def bulk_start_text() -> str:
+    accounts = STATE.get("accounts") or []
+    selected = _selected_set()
+    lines = ["🚀 **Массовый запуск**\n",
+             "_Тап по аккаунту — исключить/включить. "
+             "По умолчанию все выбраны._\n"]
+    if not accounts:
+        lines.append("_Нет аккаунтов._")
+    else:
+        for i, acc in enumerate(accounts, 1):
+            aid = acc["id"]
+            # если ключа нет — считаем выбранным (значение по умолчанию)
+            sel_map = STATE.get("selected_for_bulk") or {}
+            checked = sel_map.get(aid, True)
+            box = "✅" if checked else "⬜️"
+            run = "🟢" if acc.get("running") else "⚪️"
+            lines.append(f"{box} {run} {i}. **{acc.get('name')}** "
+                         f"(групп: {len(acc.get('groups') or [])})")
+    return "\n".join(lines)
+
+
+def bulk_start_kb() -> InlineKeyboardMarkup:
+    accounts = STATE.get("accounts") or []
+    sel_map = STATE.get("selected_for_bulk") or {}
+    rows = []
+    for i, acc in enumerate(accounts, 1):
+        aid = acc["id"]
+        checked = sel_map.get(aid, True)
+        box = "✅" if checked else "⬜️"
+        name = (acc.get("name") or "—")[:25]
+        rows.append([InlineKeyboardButton(f"{box} {i}. {name}",
+                                          callback_data=f"bulk_toggle:{aid}")])
+    if accounts:
+        rows.append([
+            InlineKeyboardButton("✅ Выбрать все", callback_data="bulk_select_all"),
+            InlineKeyboardButton("⬜️ Снять все", callback_data="bulk_deselect_all"),
+        ])
+    rows.append([
+        InlineKeyboardButton("🚀 Запустить выбранные", callback_data="bulk_start_go"),
+    ])
+    rows.append([
+        InlineKeyboardButton("⏸ Остановить все", callback_data="bulk_stop_all"),
+    ])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def bulk_start_selected():
+    accounts = STATE.get("accounts") or []
+    sel_map = STATE.get("selected_for_bulk") or {}
+    started = 0
+    skipped = 0
+    for acc in accounts:
+        aid = acc["id"]
+        if not sel_map.get(aid, True):
+            continue
+        if acc.get("running"):
+            skipped += 1
+            continue
+        if not user_clients.get(aid):
+            skipped += 1
+            continue
+        if not acc.get("groups"):
+            skipped += 1
+            continue
+        has_src = bool(acc.get("source_chat_id") and acc.get("source_message_id"))
+        if not (has_src or account_has_content(acc)):
+            skipped += 1
+            continue
+        acc["running"] = True
+        await db_account_upsert(acc)
+        start_mailing_for_account(aid)
+        started += 1
+    await state_save()
+    return started, skipped
+
+
+async def bulk_stop_all():
+    stopped = 0
+    for acc in STATE.get("accounts") or []:
+        if acc.get("running"):
+            acc["running"] = False
+            stopped += 1
+        if acc.get("subscribe_status") == "running":
+            acc["subscribe_status"] = "paused"
+            stopped += 1
+        await db_account_upsert(acc)
+    await state_save()
+    return stopped
+
+
+# ---------------------------------------------------------------------------
+#  ГЛОБАЛЬНЫЙ ПУЛ ТЕКСТОВ
+# ---------------------------------------------------------------------------
+def pool_text_global(page: int = 0) -> str:
+    pool = STATE.get("pool") or []
+    total = len(pool)
+    per_page = TEXTS_PER_PAGE
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    start = page * per_page
+    end = start + per_page
+    page_items = pool[start:end]
+
+    lines = [f"🧩 **Глобальный пул текстов** — всего {total}/{POOL_MAX}\n",
+             f"_Применяется ко ВСЕМ аккаунтам. "
+             f"Страница {page+1}/{pages}._\n"]
+    if not total:
+        lines.append("_Пусто. Добавь варианты — они будут чередоваться при рассылке._")
+    else:
+        for i, item in enumerate(page_items, 1):
+            idx = start + i
+            kind = "🖼" if item.get("media_type") else "📝"
+            t = (item.get("text") or item.get("caption") or "")[:160]
+            ent_n = len(item.get("text_entities") or item.get("caption_entities") or [])
+            lines.append(f"**{idx}.** {kind} (entities: {ent_n})\n{t or '<медиа>'}\n")
+    return "\n".join(lines)
+
+
+def pool_kb_global(page: int = 0) -> InlineKeyboardMarkup:
+    pool = STATE.get("pool") or []
+    total = len(pool)
+    per_page = TEXTS_PER_PAGE
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    start = page * per_page
+    end = start + per_page
+    page_items = pool[start:end]
+
+    rows = []
+    for i, item in enumerate(page_items, 1):
+        idx = start + i
+        t = (item.get("text") or "")[:30]
+        kind = "🖼" if item.get("media_type") else "📝"
+        rows.append([InlineKeyboardButton(
+            f"❌ {idx}. {kind} {t or '<медиа>'}",
+            callback_data=f"pool_del:{start+i-1}:{page}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"pool_menu:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"pool_menu:{page+1}"))
+    if nav:
+        rows.append(nav)
+
+    if total < POOL_MAX:
+        rows.append([InlineKeyboardButton("➕ Добавить текст/медиа в пул",
+                                           callback_data="pool_add")])
+    if total:
+        rows.append([InlineKeyboardButton("💣 Очистить пул",
+                                           callback_data="pool_clear")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def pool_clear_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да, очистить", callback_data="pool_clear_ok")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="pool_menu:0")],
+    ])
+
+
+# ---------------------------------------------------------------------------
+#  АВТООТВЕТЧИК
+# ---------------------------------------------------------------------------
+def reply_text(page: int = 0) -> str:
+    replies = STATE.get("replies") or []
+    total = len(replies)
+    per_page = TEXTS_PER_PAGE
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    start = page * per_page
+    end = start + per_page
+    page_items = replies[start:end]
+
+    onoff = "🟢 ВКЛ" if STATE.get("auto_reply_enabled") else "⚪️ ВЫКЛ"
+    cd = int(STATE.get("auto_reply_cooldown", DEFAULT_REPLY_COOLDOWN) or 0)
+    lines = [f"🤖 **Автоответчик** — {onoff}\n",
+             f"• Кулдаун на пользователя: **{cd}с**\n"
+             f"• Отвечает только когда админ не в сети (>5 мин без активности в боте)\n"
+             f"• Всего шаблонов: {total}. Страница {page+1}/{pages}.\n"]
+    if not total:
+        lines.append("_Пусто. Добавь шаблон — выбирается случайно._")
+    else:
+        for i, item in enumerate(page_items, 1):
+            idx = start + i
+            t = (item.get("text") or "")[:200]
+            ent_n = len(item.get("text_entities") or [])
+            lines.append(f"**{idx}.** (entities: {ent_n})\n{t}\n")
+    return "\n".join(lines)
+
+
+def reply_kb(page: int = 0) -> InlineKeyboardMarkup:
+    replies = STATE.get("replies") or []
+    total = len(replies)
+    per_page = TEXTS_PER_PAGE
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    start = page * per_page
+    end = start + per_page
+    page_items = replies[start:end]
+
+    rows = []
+    onoff = "⚪️ Выключить" if STATE.get("auto_reply_enabled") else "🟢 Включить"
+    rows.append([InlineKeyboardButton(onoff, callback_data="reply_toggle")])
+    rows.append([InlineKeyboardButton("⏱ Кулдаун на пользователя",
+                                       callback_data="reply_cooldown")])
+
+    for i, item in enumerate(page_items, 1):
+        idx = start + i
+        t = (item.get("text") or "")[:30]
+        rows.append([InlineKeyboardButton(
+            f"❌ {idx}. {t}",
+            callback_data=f"reply_del:{start+i-1}:{page}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"reply_menu:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"reply_menu:{page+1}"))
+    if nav:
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton("➕ Добавить шаблон", callback_data="reply_add")])
+    if total:
+        rows.append([InlineKeyboardButton("💣 Очистить шаблоны", callback_data="reply_clear")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def reply_clear_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да, очистить", callback_data="reply_clear_ok")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="reply_menu:0")],
+    ])
+
+
+# ---------------------------------------------------------------------------
+#  АККАУНТ (детали)
+# ---------------------------------------------------------------------------
 def account_kb(acc_id: str) -> InlineKeyboardMarkup:
     acc = get_account(acc_id)
     running = acc.get("running", False)
@@ -1422,7 +1841,6 @@ def account_kb(acc_id: str) -> InlineKeyboardMarkup:
     sub_queue_len = len(acc.get("subscribe_queue") or [])
     excl_len = len(acc.get("excluded") or [])
     prob_len = len(acc.get("problem") or [])
-    pool_len = len(acc.get("text_pool") or [])
     proxy_on = CFG.get("proxy_enabled")
     proxy_set = proxy_is_active_for_account(acc)
 
@@ -1431,10 +1849,6 @@ def account_kb(acc_id: str) -> InlineKeyboardMarkup:
                               callback_data=f"acc_toggle:{acc_id}")],
         [InlineKeyboardButton("📎 Источник (премиум)",
                               callback_data=f"acc_source:{acc_id}")],
-        [InlineKeyboardButton(f"🧩 Пул текстов ({pool_len})",
-                              callback_data=f"acc_pool:{acc_id}:0")],
-        [InlineKeyboardButton(f"🔄 Ротация: каждые {acc.get('rotate_every', 17)}",
-                              callback_data=f"acc_rotate:{acc_id}")],
         [InlineKeyboardButton("📝 Базовый текст", callback_data=f"acc_text:{acc_id}"),
          InlineKeyboardButton("🖼 Медиа", callback_data=f"acc_media:{acc_id}")],
         [InlineKeyboardButton("⏱ Тайминги", callback_data=f"acc_timing:{acc_id}")],
@@ -1471,7 +1885,7 @@ def account_text(acc_id: str) -> str:
     if not acc:
         return "Не найден."
     s = acc.get("stats") or {}
-    pool = acc.get("text_pool") or []
+    pool_n = len(STATE.get("pool") or [])
     txt = (acc.get("text") or "").strip()
     has_ent = "🅿️" if acc.get("text_entities") else ""
     media = acc.get("media_type")
@@ -1506,7 +1920,7 @@ def account_text(acc_id: str) -> str:
         f"• Групп: {len(acc.get('groups') or [])} | "
         f"🚫 {len(acc.get('excluded') or [])} | "
         f"⚠️ {len(acc.get('problem') or [])}\n"
-        f"• Пул текстов: {len(pool)} вариантов, ротация каждые {acc.get('rotate_every', 17)} отправок\n"
+        f"• Глобальный пул: {pool_n} вариантов, ротация каждые {acc.get('rotate_every', 17)} отправок\n"
         f"• Интервал: {acc.get('interval', 1800)}с\n"
         f"• Задержка: {acc.get('delay_min', 5)}–{acc.get('delay_max', 15)}с (+рандом)\n"
         f"• Печатает: {acc.get('typing_seconds', DEFAULT_TYPING_SECONDS)}с\n"
@@ -1514,81 +1928,13 @@ def account_text(acc_id: str) -> str:
         f"📎 Источник (copy): {src_line}\n"
         f"📊 Sent: {s.get('sent', 0)} | Err: {s.get('errors', 0)} | Кругов: {s.get('rounds', 0)}\n"
         f"📥 Подписка: {sub_status} | ✅{sub_stats.get('subscribed', 0)}\n\n"
-        f"📝 Базовый текст {has_ent}:\n{preview}"
+        f"📝 Базовый текст {has_ent} (если пул пуст):\n{preview}"
     )
 
 
-def pool_kb(acc_id: str, page: int = 0) -> InlineKeyboardMarkup:
-    acc = get_account(acc_id)
-    pool = acc.get("text_pool") or []
-    total = len(pool)
-    per_page = TEXTS_PER_PAGE
-    pages = max(1, (total + per_page - 1) // per_page)
-    page = max(0, min(page, pages - 1))
-    start = page * per_page
-    end = start + per_page
-    page_items = pool[start:end]
-
-    rows = []
-    for i, item in enumerate(page_items, 1):
-        idx = start + i
-        t = (item.get("text") or "")[:30]
-        kind = "🖼" if item.get("media_type") else "📝"
-        rows.append([InlineKeyboardButton(
-            f"❌ {idx}. {kind} {t or '<медиа>'}",
-            callback_data=f"acc_pool_del:{acc_id}:{start+i-1}:{page}")])
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"acc_pool:{acc_id}:{page-1}"))
-    nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="noop"))
-    if page < pages - 1:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"acc_pool:{acc_id}:{page+1}"))
-    if nav:
-        rows.append(nav)
-
-    rows.append([InlineKeyboardButton("➕ Добавить текст в пул",
-                                       callback_data=f"acc_pool_add:{acc_id}")])
-    if total:
-        rows.append([InlineKeyboardButton("💣 Очистить пул",
-                                           callback_data=f"acc_pool_clear:{acc_id}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"acc_open:{acc_id}")])
-    return InlineKeyboardMarkup(rows)
-
-
-def pool_text(acc_id: str, page: int = 0) -> str:
-    acc = get_account(acc_id)
-    pool = acc.get("text_pool") or []
-    total = len(pool)
-    per_page = TEXTS_PER_PAGE
-    pages = max(1, (total + per_page - 1) // per_page)
-    page = max(0, min(page, pages - 1))
-    start = page * per_page
-    end = start + per_page
-    page_items = pool[start:end]
-
-    lines = [f"🧩 **Пул текстов** ({acc.get('name')}) — всего {total}\n",
-             f"_Ротация: каждые {acc.get('rotate_every', 17)} отправок. "
-             f"Страница {page+1}/{pages}._\n"]
-    if not total:
-        lines.append("_Пусто. Добавь до 8 вариантов — так текст не будет повторяться подряд._")
-    else:
-        for i, item in enumerate(page_items, 1):
-            idx = start + i
-            kind = "🖼" if item.get("media_type") else "📝"
-            t = (item.get("text") or item.get("caption") or "")[:160]
-            ent_n = len(item.get("text_entities") or item.get("caption_entities") or [])
-            lines.append(f"**{idx}.** {kind} (entities: {ent_n})\n{t or '<медиа>'}\n")
-    return "\n".join(lines)
-
-
-def pool_clear_confirm_kb(acc_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Да, очистить", callback_data=f"acc_pool_clear_ok:{acc_id}")],
-        [InlineKeyboardButton("❌ Отмена", callback_data=f"acc_pool:{acc_id}:0")],
-    ])
-
-
+# ---------------------------------------------------------------------------
+#  ПРОЧИЕ КБ (без изменений)
+# ---------------------------------------------------------------------------
 def proxy_global_kb() -> InlineKeyboardMarkup:
     on = bool(CFG.get("proxy_enabled"))
     return InlineKeyboardMarkup([
@@ -2027,10 +2373,118 @@ def stats_menu_text() -> str:
     return "\n".join(lines)
 
 
+# ===========================================================================
+#  ОБРАБОТКА PENDING-СООБЩЕНИЙ
+# ===========================================================================
+async def _store_from_message(acc: dict, message, acc_id: str) -> dict:
+    msg_text = message.text or message.caption or ""
+    msg_entities = message.entities or message.caption_entities or []
+    entities_json = entities_to_json(msg_entities)
+
+    media_kind = None
+    ext = "bin"
+    if message.photo:
+        media_kind, ext = "photo", "jpg"
+    elif message.video:
+        media_kind, ext = "video", "mp4"
+    elif message.animation:
+        media_kind, ext = "animation", "mp4"
+    elif message.document:
+        name = (message.document.file_name or "file.bin")
+        media_kind, ext = "document", (name.rsplit(".", 1)[-1] or "bin")
+    elif message.audio:
+        name = (message.audio.file_name or "audio.mp3")
+        media_kind, ext = "audio", (name.rsplit(".", 1)[-1] or "mp3")
+    elif message.voice:
+        media_kind, ext = "voice", "ogg"
+
+    if media_kind:
+        path = os.path.join(MEDIA_DIR, f"media_{acc_id}_{int(time.time()*1000)}.{ext}")
+        try:
+            await message.download(file_name=path)
+            return {
+                "text": "",
+                "text_entities": [],
+                "media_path": path,
+                "media_type": media_kind,
+                "caption": msg_text,
+                "caption_entities": entities_json,
+            }
+        except Exception as e:
+            log.warning(f"[{acc.get('name')}] download media упал: {e}")
+
+    return {
+        "text": msg_text,
+        "text_entities": entities_json,
+        "media_path": None,
+        "media_type": None,
+        "caption": "",
+        "caption_entities": [],
+    }
+
+
 async def _handle_pending(client, message, uid, act):
     action = act.get("action")
     raw_text = message.text or ""
     text = raw_text.strip()
+
+    if action == "pool_add":
+        try:
+            item = await _store_from_message({}, message, "pool")
+            if not item:
+                pending.pop(uid, None)
+                await message.reply("❌ Пустое сообщение.")
+                return
+            await db_pool_add(item)
+            STATE["pool"] = await db_pool_load()
+            pending.pop(uid, None)
+            try:
+                await message.react(emoji="👍")
+            except Exception:
+                pass
+            await message.reply(
+                f"✅ В пуле теперь {len(STATE['pool'])} вариантов.",
+                reply_markup=pool_kb_global(0))
+        except Exception as e:
+            log.exception("pool_add")
+            pending.pop(uid, None)
+            await message.reply(f"❌ {e}")
+        return
+
+    if action == "reply_add":
+        if not raw_text:
+            await message.reply("❌ Пустой текст.")
+            return
+        item = {
+            "text": raw_text,
+            "text_entities": entities_to_json(message.entities or []),
+        }
+        await db_replies_add(item)
+        STATE["replies"] = await db_replies_load()
+        pending.pop(uid, None)
+        try:
+            await message.react(emoji="👍")
+        except Exception:
+            pass
+        await message.reply(
+            f"✅ Шаблонов автоответа: {len(STATE['replies'])}.",
+            reply_markup=reply_kb(0))
+        return
+
+    if action == "reply_cooldown":
+        try:
+            v = int(text)
+            if v < 60:
+                raise ValueError("мин. 60")
+            if v > 86400:
+                raise ValueError("макс 86400")
+            STATE["auto_reply_cooldown"] = v
+            await state_save()
+            pending.pop(uid, None)
+            await message.reply(f"✅ Кулдаун: {v}с.", reply_markup=reply_kb(0))
+        except Exception as e:
+            await message.reply(f"❌ {e}")
+        return
 
     if action == "acc_source_forward":
         acc_id = act.get("acc_id")
@@ -2040,50 +2494,26 @@ async def _handle_pending(client, message, uid, act):
             return
         try:
             item = await _store_from_message(acc, message, acc_id)
-            acc["source_chat_id"] = None
-            acc["source_message_id"] = None
             if not item:
                 pending.pop(uid, None)
                 await message.reply("❌ Не удалось сохранить.")
                 return
-            await _store_pool_item(acc, item)
+            acc["source_chat_id"] = None
+            acc["source_message_id"] = None
+            await db_account_upsert(acc)
+            if len(STATE.get("pool") or []) < POOL_MAX:
+                await db_pool_add(item)
+                STATE["pool"] = await db_pool_load()
             pending.pop(uid, None)
             try:
                 await message.react(emoji="👍")
             except Exception:
                 pass
             await message.reply(
-                f"✅ Добавлено в пул. Всего вариантов: {len(acc.get('text_pool') or [])}.",
+                f"✅ Добавлено в глобальный пул. Всего: {len(STATE.get('pool') or [])}.",
                 reply_markup=account_kb(acc_id))
         except Exception as e:
             log.exception("acc_source_forward")
-            pending.pop(uid, None)
-            await message.reply(f"❌ {e}")
-        return
-
-    if action == "acc_pool_add":
-        acc_id = act.get("acc_id")
-        acc = get_account(acc_id)
-        if not acc:
-            pending.pop(uid, None)
-            return
-        try:
-            item = await _store_from_message(acc, message, acc_id)
-            if not item:
-                pending.pop(uid, None)
-                await message.reply("❌ Пустое сообщение.")
-                return
-            await _store_pool_item(acc, item)
-            pending.pop(uid, None)
-            try:
-                await message.react(emoji="👍")
-            except Exception:
-                pass
-            await message.reply(
-                f"✅ В пуле теперь {len(acc.get('text_pool') or [])} вариантов.",
-                reply_markup=pool_kb(acc_id, 0))
-        except Exception as e:
-            log.exception("acc_pool_add")
             pending.pop(uid, None)
             await message.reply(f"❌ {e}")
         return
@@ -2098,7 +2528,7 @@ async def _handle_pending(client, message, uid, act):
             if v > 100:
                 raise ValueError("макс 100")
             acc["rotate_every"] = v
-            save_json(STATE_FILE, STATE)
+            await db_account_upsert(acc)
             await message.reply(
                 f"✅ Ротация: каждые {v} отправок.",
                 reply_markup=account_kb(acc_id))
@@ -2121,7 +2551,7 @@ async def _handle_pending(client, message, uid, act):
                 parse_mode=enums.ParseMode.MARKDOWN)
             return
         acc["proxy"] = p
-        save_json(STATE_FILE, STATE)
+        await db_account_upsert(acc)
         pending.pop(uid, None)
         await message.reply(
             "✅ Прокси сохранён.\n"
@@ -2152,11 +2582,11 @@ async def _handle_pending(client, message, uid, act):
                 return
             name = f"{me.first_name}" + (f" @{me.username}" if me.username else "")
             sname = f"string_session_{int(datetime.now().timestamp())}"
-            acc = add_account(name, sname)
+            acc = await add_account_async(name, sname)
             acc["user_id"] = me.id
             acc["username"] = me.username
             acc["session_string"] = cleaned
-            save_json(STATE_FILE, STATE)
+            await db_account_upsert(acc)
             user_clients[acc["id"]] = new_c
             ME_IDS[acc["id"]] = me.id
             attach_incoming_listener(new_c, acc["id"])
@@ -2188,7 +2618,7 @@ async def _handle_pending(client, message, uid, act):
             return
         acc["source_chat_id"] = chat_id
         acc["source_message_id"] = msg_id
-        save_json(STATE_FILE, STATE)
+        await db_account_upsert(acc)
         try:
             await message.react(emoji="👍")
         except Exception:
@@ -2245,10 +2675,10 @@ async def _handle_pending(client, message, uid, act):
             return
         me = await new_c.get_me()
         name = f"{me.first_name}" + (f" @{me.username}" if me.username else "")
-        acc = add_account(name, sname)
+        acc = await add_account_async(name, sname)
         acc["user_id"] = me.id
         acc["username"] = me.username
-        save_json(STATE_FILE, STATE)
+        await db_account_upsert(acc)
         user_clients[acc["id"]] = new_c
         ME_IDS[acc["id"]] = me.id
         attach_incoming_listener(new_c, acc["id"])
@@ -2272,10 +2702,10 @@ async def _handle_pending(client, message, uid, act):
             return
         me = await new_c.get_me()
         name = f"{me.first_name}" + (f" @{me.username}" if me.username else "")
-        acc = add_account(name, sname)
+        acc = await add_account_async(name, sname)
         acc["user_id"] = me.id
         acc["username"] = me.username
-        save_json(STATE_FILE, STATE)
+        await db_account_upsert(acc)
         user_clients[acc["id"]] = new_c
         ME_IDS[acc["id"]] = me.id
         attach_incoming_listener(new_c, acc["id"])
@@ -2320,7 +2750,7 @@ async def _handle_pending(client, message, uid, act):
                 existing_q_keys.add(str(ref))
                 added += 1
         acc["subscribe_status"] = "idle"
-        save_json(STATE_FILE, STATE)
+        await db_account_upsert(acc)
         try:
             await message.react(emoji="👍")
         except Exception:
@@ -2355,7 +2785,7 @@ async def _handle_pending(client, message, uid, act):
             return
         acc["subscribe_delay_min"] = lo
         acc["subscribe_delay_max"] = hi
-        save_json(STATE_FILE, STATE)
+        await db_account_upsert(acc)
         try:
             await message.react(emoji="👍")
         except Exception:
@@ -2381,7 +2811,7 @@ async def _handle_pending(client, message, uid, act):
         acc["caption_entities"] = []
         acc["source_chat_id"] = None
         acc["source_message_id"] = None
-        save_json(STATE_FILE, STATE)
+        await db_account_upsert(acc)
         try:
             await message.react(emoji="👍")
         except Exception:
@@ -2414,7 +2844,7 @@ async def _handle_pending(client, message, uid, act):
         acc["text_entities"] = []
         acc["source_chat_id"] = None
         acc["source_message_id"] = None
-        save_json(STATE_FILE, STATE)
+        await db_account_upsert(acc)
         try:
             await message.react(emoji="👍")
         except Exception:
@@ -2432,7 +2862,7 @@ async def _handle_pending(client, message, uid, act):
             if v < 60:
                 raise ValueError("мин. 60")
             acc["interval"] = v
-            save_json(STATE_FILE, STATE)
+            await db_account_upsert(acc)
             await message.reply(f"✅ Интервал: {v}с.", reply_markup=account_kb(acc["id"]))
         except Exception as e:
             await message.reply(f"❌ {e}")
@@ -2448,7 +2878,7 @@ async def _handle_pending(client, message, uid, act):
             acc["delay_min"] = v
             if acc["delay_max"] < v:
                 acc["delay_max"] = v
-            save_json(STATE_FILE, STATE)
+            await db_account_upsert(acc)
             await message.reply(f"✅ Мин: {v}с.", reply_markup=account_kb(acc["id"]))
         except Exception as e:
             await message.reply(f"❌ {e}")
@@ -2462,7 +2892,7 @@ async def _handle_pending(client, message, uid, act):
             if v < acc["delay_min"]:
                 raise ValueError(f">= {acc['delay_min']}")
             acc["delay_max"] = v
-            save_json(STATE_FILE, STATE)
+            await db_account_upsert(acc)
             await message.reply(f"✅ Макс: {v}с.", reply_markup=account_kb(acc["id"]))
         except Exception as e:
             await message.reply(f"❌ {e}")
@@ -2476,7 +2906,7 @@ async def _handle_pending(client, message, uid, act):
             if v < 1 or v > 60:
                 raise ValueError("1–60")
             acc["typing_seconds"] = v
-            save_json(STATE_FILE, STATE)
+            await db_account_upsert(acc)
             await message.reply(
                 f"✅ «Печатает…»: {v}с (+0–2с рандома).",
                 reply_markup=account_kb(acc["id"]))
@@ -2512,7 +2942,7 @@ async def _handle_pending(client, message, uid, act):
             return
         remove_from_excluded(acc, gid)
         acc["groups"].append(build_group_record(chat, manual=True))
-        save_json(STATE_FILE, STATE)
+        await db_account_upsert(acc)
         await message.reply(f"✅ Добавлено: {chat.title}",
                             reply_markup=account_kb(acc_id))
         return
@@ -2538,7 +2968,7 @@ async def _handle_pending(client, message, uid, act):
         acc["groups"] = new_groups
         for g in removed_records:
             add_to_excluded(acc, g)
-        save_json(STATE_FILE, STATE)
+        await db_account_upsert(acc)
         try:
             await message.react(emoji="👍")
         except Exception:
@@ -2553,6 +2983,9 @@ async def _handle_pending(client, message, uid, act):
     await message.reply("⚠️ Действие устарело, начни заново через /panel.")
 
 
+# ===========================================================================
+#  ХЕНДЛЕРЫ БОТА
+# ===========================================================================
 def register_handlers(bot: Client) -> None:
     admin_id = int(CFG["admin_id"])
     log.info(f"Регистрирую хендлеры для admin_id={admin_id}")
@@ -2561,6 +2994,7 @@ def register_handlers(bot: Client) -> None:
     async def on_admin_message(client, message):
         try:
             uid = message.from_user.id
+            _admin_last_seen["ts"] = time.time()
             text = (message.text or message.caption or "").strip()
             cmd = text.split(maxsplit=1)[0].lower() if text.startswith("/") else ""
             log.info(f"[ADMIN] uid={uid} cmd={cmd!r} pending="
@@ -2641,6 +3075,7 @@ def register_handlers(bot: Client) -> None:
         if uid not in authed:
             await cb.answer("🔒 /auth <PIN>", show_alert=False)
             return
+        _admin_last_seen["ts"] = time.time()
         data = cb.data or ""
         try:
             if data == "menu":
@@ -2649,6 +3084,149 @@ def register_handlers(bot: Client) -> None:
                 await cb.answer()
             elif data == "accounts_menu":
                 await cb.message.edit_text(accounts_menu_text(), reply_markup=accounts_menu_kb())
+            elif data == "active_tasks":
+                await cb.message.edit_text(active_tasks_text(),
+                                            reply_markup=active_tasks_kb())
+            elif data == "bulk_start_menu":
+                await cb.message.edit_text(bulk_start_text(),
+                                            reply_markup=bulk_start_kb())
+            elif data.startswith("bulk_toggle:"):
+                aid = data.split(":", 1)[1]
+                sel = STATE.setdefault("selected_for_bulk", {})
+                sel[aid] = not sel.get(aid, True)
+                await state_save()
+                await cb.answer("✅" if sel[aid] else "⬜️")
+                await cb.message.edit_text(bulk_start_text(),
+                                            reply_markup=bulk_start_kb())
+            elif data == "bulk_select_all":
+                sel = STATE.setdefault("selected_for_bulk", {})
+                for a in STATE.get("accounts") or []:
+                    sel[a["id"]] = True
+                await state_save()
+                await cb.answer("Все выбраны")
+                await cb.message.edit_text(bulk_start_text(),
+                                            reply_markup=bulk_start_kb())
+            elif data == "bulk_deselect_all":
+                sel = STATE.setdefault("selected_for_bulk", {})
+                for a in STATE.get("accounts") or []:
+                    sel[a["id"]] = False
+                await state_save()
+                await cb.answer("Все сняты")
+                await cb.message.edit_text(bulk_start_text(),
+                                            reply_markup=bulk_start_kb())
+            elif data == "bulk_start_go":
+                started, skipped = await bulk_start_selected()
+                await cb.answer(f"🚀 {started} | ⏭ {skipped}", show_alert=False)
+                await cb.message.edit_text(
+                    f"🚀 Запущено: **{started}**\n⏭ Пропущено: **{skipped}**\n\n"
+                    + active_tasks_text(),
+                    reply_markup=active_tasks_kb())
+            elif data == "bulk_stop_all":
+                n = await bulk_stop_all()
+                await cb.answer(f"Остановлено: {n}", show_alert=False)
+                await cb.message.edit_text(
+                    f"⏸ Остановлено всего: **{n}**\n\n" + active_tasks_text(),
+                    reply_markup=active_tasks_kb())
+
+            elif data.startswith("pool_menu:"):
+                try:
+                    page = int(data.split(":", 1)[1])
+                except Exception:
+                    page = 0
+                await cb.message.edit_text(pool_text_global(page),
+                                            reply_markup=pool_kb_global(page))
+            elif data == "pool_add":
+                if len(STATE.get("pool") or []) >= POOL_MAX:
+                    await cb.answer(f"Максимум {POOL_MAX}", show_alert=True)
+                    return
+                pending[uid] = {"action": "pool_add"}
+                await cb.message.edit_text(
+                    f"➕ Отправь текст (можно с премиум-эмодзи), "
+                    f"или фото/видео с подписью — пойдёт в пул.\n/cancel")
+            elif data.startswith("pool_del:"):
+                parts = data.split(":")
+                if len(parts) < 3:
+                    await cb.answer()
+                    return
+                try:
+                    idx = int(parts[1])
+                    page = int(parts[2])
+                except ValueError:
+                    await cb.answer()
+                    return
+                await db_pool_delete(idx)
+                STATE["pool"] = await db_pool_load()
+                total = len(STATE["pool"])
+                pages = max(1, (total + TEXTS_PER_PAGE - 1) // TEXTS_PER_PAGE)
+                page = max(0, min(page, pages - 1))
+                await cb.answer("Удалено")
+                await cb.message.edit_text(pool_text_global(page),
+                                            reply_markup=pool_kb_global(page))
+            elif data == "pool_clear":
+                if not STATE.get("pool"):
+                    await cb.answer("Пусто")
+                    return
+                await cb.message.edit_text(
+                    "💣 Очистить глобальный пул?",
+                    reply_markup=pool_clear_confirm_kb())
+            elif data == "pool_clear_ok":
+                await db_pool_clear()
+                STATE["pool"] = []
+                await cb.answer("Пул очищен")
+                await cb.message.edit_text(pool_text_global(0),
+                                            reply_markup=pool_kb_global(0))
+
+            elif data.startswith("reply_menu:"):
+                try:
+                    page = int(data.split(":", 1)[1])
+                except Exception:
+                    page = 0
+                await cb.message.edit_text(reply_text(page), reply_markup=reply_kb(page))
+            elif data == "reply_toggle":
+                STATE["auto_reply_enabled"] = not bool(STATE.get("auto_reply_enabled"))
+                await state_save()
+                await cb.answer("ВКЛ" if STATE["auto_reply_enabled"] else "ВЫКЛ")
+                await cb.message.edit_text(reply_text(0), reply_markup=reply_kb(0))
+            elif data == "reply_cooldown":
+                pending[uid] = {"action": "reply_cooldown"}
+                await cb.message.edit_text(
+                    f"⏱ Кулдаун (сек) на пользователя. "
+                    f"Сейчас: {STATE.get('auto_reply_cooldown')}\n/cancel")
+            elif data == "reply_add":
+                pending[uid] = {"action": "reply_add"}
+                await cb.message.edit_text(
+                    "➕ Отправь текст шаблона автоответа (можно с премиум-эмодзи).\n/cancel")
+            elif data.startswith("reply_del:"):
+                parts = data.split(":")
+                if len(parts) < 3:
+                    await cb.answer()
+                    return
+                try:
+                    idx = int(parts[1])
+                    page = int(parts[2])
+                except ValueError:
+                    await cb.answer()
+                    return
+                await db_replies_delete(idx)
+                STATE["replies"] = await db_replies_load()
+                total = len(STATE["replies"])
+                pages = max(1, (total + TEXTS_PER_PAGE - 1) // TEXTS_PER_PAGE)
+                page = max(0, min(page, pages - 1))
+                await cb.answer("Удалено")
+                await cb.message.edit_text(reply_text(page), reply_markup=reply_kb(page))
+            elif data == "reply_clear":
+                if not STATE.get("replies"):
+                    await cb.answer("Пусто")
+                    return
+                await cb.message.edit_text(
+                    "💣 Очистить шаблоны автоответа?",
+                    reply_markup=reply_clear_confirm_kb())
+            elif data == "reply_clear_ok":
+                await db_replies_clear()
+                STATE["replies"] = []
+                await cb.answer("Очищено")
+                await cb.message.edit_text(reply_text(0), reply_markup=reply_kb(0))
+
             elif data == "sub_main":
                 await cb.message.edit_text(sub_main_text(), reply_markup=sub_main_kb())
             elif data == "stats_menu":
@@ -2659,7 +3237,7 @@ def register_handlers(bot: Client) -> None:
                                             reply_markup=proxy_global_kb())
             elif data == "proxy_global_toggle":
                 CFG["proxy_enabled"] = not bool(CFG.get("proxy_enabled"))
-                save_json(CONFIG_FILE, CFG)
+                await state_save()
                 await cb.answer(f"Прокси: {'ВКЛ' if CFG['proxy_enabled'] else 'ВЫКЛ'}")
                 await cb.message.edit_text(proxy_global_text(),
                                             reply_markup=proxy_global_kb())
@@ -2709,15 +3287,15 @@ def register_handlers(bot: Client) -> None:
                     acc["running"] = False
                 else:
                     if not acc.get("groups"):
-                        await cb.answer()
+                        await cb.answer("Нет групп", show_alert=True)
                         return
                     has_src = bool(acc.get("source_chat_id") and acc.get("source_message_id"))
                     if not (has_src or account_has_content(acc)):
-                        await cb.answer()
+                        await cb.answer("Нет контента", show_alert=True)
                         return
                     acc["running"] = True
                     start_mailing_for_account(acc_id)
-                save_json(STATE_FILE, STATE)
+                await db_account_upsert(acc)
                 await cb.answer()
                 await cb.message.edit_text(account_text(acc_id), reply_markup=account_kb(acc_id))
 
@@ -2746,78 +3324,10 @@ def register_handlers(bot: Client) -> None:
                     acc["proxy"] = {"enabled": False, "type": "socks5",
                                     "host": "", "port": 0,
                                     "username": "", "password": "", "secret": ""}
-                    save_json(STATE_FILE, STATE)
+                    await db_account_upsert(acc)
                 await cb.answer("Прокси очищен")
                 await cb.message.edit_text(account_proxy_text(acc_id),
                                             reply_markup=account_proxy_kb(acc_id))
-
-            elif data.startswith("acc_pool:"):
-                parts = data.split(":")
-                acc_id = parts[1]
-                page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
-                if not get_account(acc_id):
-                    await cb.answer()
-                    return
-                await cb.message.edit_text(pool_text(acc_id, page),
-                                            reply_markup=pool_kb(acc_id, page))
-            elif data.startswith("acc_pool_add:"):
-                acc_id = data.split(":", 1)[1]
-                acc = get_account(acc_id)
-                if not acc:
-                    await cb.answer()
-                    return
-                if len(acc.get("text_pool") or []) >= 8:
-                    await cb.answer("Максимум 8 вариантов", show_alert=True)
-                    return
-                pending[uid] = {"action": "acc_pool_add", "acc_id": acc_id}
-                await cb.message.edit_text(
-                    "➕ Отправь текст (можно с премиум-эмодзи), "
-                    "или фото/видео с подписью — пойдёт в пул.\n/cancel")
-            elif data.startswith("acc_pool_del:"):
-                parts = data.split(":")
-                if len(parts) < 4:
-                    await cb.answer()
-                    return
-                acc_id = parts[1]
-                try:
-                    idx = int(parts[2])
-                    page = int(parts[3])
-                except ValueError:
-                    await cb.answer()
-                    return
-                acc = get_account(acc_id)
-                if not acc:
-                    await cb.answer()
-                    return
-                pool = acc.get("text_pool") or []
-                if 0 <= idx < len(pool):
-                    pool.pop(idx)
-                    save_json(STATE_FILE, STATE)
-                total = len(pool)
-                pages = max(1, (total + TEXTS_PER_PAGE - 1) // TEXTS_PER_PAGE)
-                page = max(0, min(page, pages - 1))
-                await cb.answer("Удалено")
-                await cb.message.edit_text(pool_text(acc_id, page),
-                                            reply_markup=pool_kb(acc_id, page))
-            elif data.startswith("acc_pool_clear:"):
-                acc_id = data.split(":", 1)[1]
-                acc = get_account(acc_id)
-                if not acc or not acc.get("text_pool"):
-                    await cb.answer("Пусто")
-                    return
-                await cb.message.edit_text(
-                    "💣 Очистить пул текстов?",
-                    reply_markup=pool_clear_confirm_kb(acc_id))
-            elif data.startswith("acc_pool_clear_ok:"):
-                acc_id = data.split(":", 1)[1]
-                acc = get_account(acc_id)
-                if acc:
-                    acc["text_pool"] = []
-                    acc["pool_index"] = 0
-                    save_json(STATE_FILE, STATE)
-                await cb.answer("Пул очищен")
-                await cb.message.edit_text(pool_text(acc_id, 0),
-                                            reply_markup=pool_kb(acc_id, 0))
 
             elif data.startswith("acc_rotate:"):
                 acc_id = data.split(":", 1)[1]
@@ -2851,15 +3361,14 @@ def register_handlers(bot: Client) -> None:
                 await cb.message.edit_text(
                     f"📎 **Источник (copy_message)**\n\n"
                     f"Текущий: `{cur}`\n\n"
-                    f"«Переслать сообщение боту» добавит содержимое в **пул текстов** "
-                    f"как ещё один вариант.",
+                    f"«Переслать сообщение боту» добавит содержимое в **глобальный пул**.",
                     reply_markup=kb)
             elif data.startswith("acc_source_forward:"):
                 acc_id = data.split(":", 1)[1]
                 pending[uid] = {"action": "acc_source_forward", "acc_id": acc_id}
                 await cb.message.edit_text(
                     "📨 Перешли сюда сообщение с премиум-эмодзи — "
-                    "добавлю в пул текстов.\n/cancel")
+                    "добавлю в глобальный пул.\n/cancel")
             elif data.startswith("acc_source_manual:"):
                 acc_id = data.split(":", 1)[1]
                 pending[uid] = {"action": "acc_source_manual", "acc_id": acc_id}
@@ -2871,7 +3380,7 @@ def register_handlers(bot: Client) -> None:
                 if acc:
                     acc["source_chat_id"] = None
                     acc["source_message_id"] = None
-                    save_json(STATE_FILE, STATE)
+                    await db_account_upsert(acc)
                 await cb.answer()
                 await cb.message.edit_text(account_text(acc_id), reply_markup=account_kb(acc_id))
 
@@ -2906,9 +3415,8 @@ def register_handlers(bot: Client) -> None:
                 ])
                 await cb.message.edit_text(
                     f"⏱ Тайминги **{acc.get('name')}**\n\n"
-                    f"Пауза между отправками — рандом: "
-                    f"{acc.get('delay_min', 5)}–{acc.get('delay_max', 15)}с "
-                    f"с множителем 1.0–1.6, плюс периодически длинные паузы "
+                    f"Пауза: {acc.get('delay_min', 5)}–{acc.get('delay_max', 15)}с "
+                    f"×1.0–1.6, плюс длинные паузы "
                     f"({LONG_PAUSE_MIN}–{LONG_PAUSE_MAX}с) каждые "
                     f"{LONG_PAUSE_EVERY_MIN}–{LONG_PAUSE_EVERY_MAX} сообщений.",
                     reply_markup=kb)
@@ -2943,7 +3451,7 @@ def register_handlers(bot: Client) -> None:
                 manual = [g for g in (acc.get("groups") or [])
                           if g.get("manual") and g["id"] not in scanned]
                 acc["groups"] = found + manual
-                save_json(STATE_FILE, STATE)
+                await db_account_upsert(acc)
                 await cb.message.edit_text(
                     f"✅ Найдено групп: {len(found)}\n"
                     f"Всего в списке: {len(acc['groups'])}\n"
@@ -2983,7 +3491,7 @@ def register_handlers(bot: Client) -> None:
                 acc["groups"] = [g for g in groups if g.get("id") != gid]
                 if rec:
                     add_to_excluded(acc, rec)
-                save_json(STATE_FILE, STATE)
+                await db_account_upsert(acc)
                 total = len(acc["groups"])
                 pages = max(1, (total + GROUPS_PER_PAGE - 1) // GROUPS_PER_PAGE)
                 page = max(0, min(page, pages - 1))
@@ -3026,7 +3534,7 @@ def register_handlers(bot: Client) -> None:
                 acc["groups"] = []
                 for g in removed:
                     add_to_excluded(acc, g)
-                save_json(STATE_FILE, STATE)
+                await db_account_upsert(acc)
                 await cb.answer(f"Очищено: {len(removed)}")
                 await cb.message.edit_text(groups_list_text(acc_id, 0),
                                             reply_markup=groups_list_kb(acc_id, 0))
@@ -3073,7 +3581,7 @@ def register_handlers(bot: Client) -> None:
                             "manual": True,
                         })
                     remove_from_excluded(acc, gid)
-                    save_json(STATE_FILE, STATE)
+                    await db_account_upsert(acc)
                     await cb.answer("Возвращено")
                 else:
                     await cb.answer("Не найдено")
@@ -3089,7 +3597,7 @@ def register_handlers(bot: Client) -> None:
                     await cb.answer()
                     return
                 acc["excluded"] = []
-                save_json(STATE_FILE, STATE)
+                await db_account_upsert(acc)
                 await cb.answer("Исключения очищены")
                 await cb.message.edit_text(excluded_text(acc_id, 0),
                                             reply_markup=excluded_kb(acc_id, 0))
@@ -3122,7 +3630,7 @@ def register_handlers(bot: Client) -> None:
                     await cb.answer()
                     return
                 clear_problem(acc, gid)
-                save_json(STATE_FILE, STATE)
+                await db_account_upsert(acc)
                 total = len(acc.get("problem") or [])
                 pages = max(1, (total + PROBLEM_PER_PAGE - 1) // PROBLEM_PER_PAGE)
                 page = max(0, min(page, pages - 1))
@@ -3136,7 +3644,7 @@ def register_handlers(bot: Client) -> None:
                     await cb.answer()
                     return
                 acc["problem"] = []
-                save_json(STATE_FILE, STATE)
+                await db_account_upsert(acc)
                 await cb.answer("Очищено")
                 await cb.message.edit_text(problem_text(acc_id, 0),
                                             reply_markup=problem_kb(acc_id, 0))
@@ -3153,7 +3661,7 @@ def register_handlers(bot: Client) -> None:
                 acc["groups"] = [g for g in (acc.get("groups") or [])
                                  if str(g.get("id")) not in prob_ids]
                 acc["problem"] = []
-                save_json(STATE_FILE, STATE)
+                await db_account_upsert(acc)
                 await cb.answer(f"Перенесено: {len(prob)}")
                 await cb.message.edit_text(account_text(acc_id),
                                             reply_markup=account_kb(acc_id))
@@ -3170,7 +3678,7 @@ def register_handlers(bot: Client) -> None:
                 acc_id = data.split(":", 1)[1]
                 if get_account(acc_id):
                     STATE["main_account_id"] = acc_id
-                    save_json(STATE_FILE, STATE)
+                    await state_save()
                 await cb.answer()
                 await cb.message.edit_text(account_text(acc_id), reply_markup=account_kb(acc_id))
             elif data.startswith("acc_remove:"):
@@ -3202,7 +3710,7 @@ def register_handlers(bot: Client) -> None:
                                     os.remove(p)
                             except Exception:
                                 pass
-                    remove_account(acc_id)
+                    await remove_account_async(acc_id)
                 await cb.answer()
                 await cb.message.edit_text(accounts_menu_text(),
                                             reply_markup=accounts_menu_kb())
@@ -3236,7 +3744,7 @@ def register_handlers(bot: Client) -> None:
                     await cb.answer()
                     return
                 acc["subscribe_status"] = "running"
-                save_json(STATE_FILE, STATE)
+                await db_account_upsert(acc)
                 start_subscribe(acc_id)
                 await cb.answer()
                 await cb.message.edit_text(subscribe_menu_text(acc_id),
@@ -3246,7 +3754,7 @@ def register_handlers(bot: Client) -> None:
                 acc = get_account(acc_id)
                 if acc:
                     acc["subscribe_status"] = "paused"
-                    save_json(STATE_FILE, STATE)
+                    await db_account_upsert(acc)
                 await cb.answer()
                 await cb.message.edit_text(subscribe_menu_text(acc_id),
                                             reply_markup=subscribe_menu_kb(acc_id))
@@ -3256,7 +3764,7 @@ def register_handlers(bot: Client) -> None:
                 if acc:
                     acc["subscribe_queue"] = []
                     acc["subscribe_status"] = "idle"
-                    save_json(STATE_FILE, STATE)
+                    await db_account_upsert(acc)
                 await cb.answer()
                 await cb.message.edit_text(subscribe_menu_text(acc_id),
                                             reply_markup=subscribe_menu_kb(acc_id))
@@ -3270,23 +3778,45 @@ def register_handlers(bot: Client) -> None:
                 pass
 
 
+# ===========================================================================
+#  ЗАПУСК
+# ===========================================================================
+def load_cfg_from_env() -> dict:
+    cfg = {}
+    env_map = {
+        "API_ID": ("api_id", int),
+        "API_HASH": ("api_hash", str),
+        "BOT_TOKEN": ("bot_token", str),
+        "ADMIN_ID": ("admin_id", int),
+        "PIN": ("pin", str),
+    }
+    for env, (key, typ) in env_map.items():
+        v = os.getenv(env)
+        if v is None or v == "":
+            continue
+        try:
+            cfg[key] = typ(v)
+        except Exception:
+            log.warning(f"Некорректное значение {env}={v!r}")
+    cfg.setdefault("proxy_enabled", False)
+    cfg.setdefault("pin", DEFAULT_PIN)
+    return cfg
+
+
 async def main():
     global CFG, STATE, bot_client
 
-    CFG = load_cfg()
-    if not cfg_ok(CFG):
+    CFG = load_cfg_from_env()
+    if not all(CFG.get(k) for k in ("api_id", "api_hash", "bot_token", "admin_id")):
         print("Не заданы переменные: API_ID, API_HASH, BOT_TOKEN, ADMIN_ID")
         return
-    CFG.setdefault("pin", DEFAULT_PIN)
-    save_json(CONFIG_FILE, CFG)
 
     log.info(f"ADMIN_ID={CFG['admin_id']} (type={type(CFG['admin_id']).__name__})")
-    log.info(f"PIN={'*' * len(str(CFG['pin']))}, proxy_enabled={CFG.get('proxy_enabled')}")
-
-    STATE = load_state()
-    bootstrap_default_session()
 
     await db_init()
+    await state_load()
+
+    await bootstrap_default_session()
     await start_userbot_clients()
 
     bot_client = Client(
@@ -3306,6 +3836,8 @@ async def main():
         await bot_client.send_message(
             CFG["admin_id"],
             f"🤖 Бот запущен.\n• Аккаунтов: {len(accounts)}\n"
+            f"• Пул текстов: {len(STATE.get('pool') or [])}\n"
+            f"• Автоответчик: {'ВКЛ' if STATE.get('auto_reply_enabled') else 'ВЫКЛ'}\n"
             f"🧦 Прокси: {'ВКЛ' if CFG.get('proxy_enabled') else 'ВЫКЛ'}\n"
             f"Для доступа: `/auth <PIN>`",
             parse_mode=enums.ParseMode.MARKDOWN)
